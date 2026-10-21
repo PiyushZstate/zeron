@@ -573,3 +573,57 @@ async fn catalogs_for_cloud_devices_are_answered_here() {
     );
     core.shutdown().await;
 }
+
+/// Deleting a Cloud chat deletes its machine; deleting any other chat
+/// touches no Cloud session.
+#[tokio::test]
+async fn deleting_a_cloud_chat_deletes_its_machine() {
+    let (edge_url, seen) = mock_edge().await;
+    let dir = tempfile::tempdir().unwrap();
+    let core = EngineCore::assemble(
+        dir.path(),
+        Arc::new(default_registry()),
+        HarnessId::Mock,
+        Some(EdgeConfig::with_static_token(edge_url, "dev-user")),
+    )
+    .unwrap();
+    let client = memory_client(core.rpc_service());
+    let cwd = dir.path().display().to_string();
+    for (chat, device) in [
+        ("cloud-chat", "cloud-session-1".to_string()),
+        ("mac-chat", core.workspace.device_id().to_string()),
+    ] {
+        core.workspace
+            .create_chat(chat, None, Some(&device), None, Some(cwd.clone()))
+            .unwrap();
+    }
+    let org = core.workspace.org_id().to_string();
+    let deletes = |seen: &Seen| {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(request, _)| request.starts_with("DELETE "))
+            .map(|(request, _)| request.clone())
+            .collect::<Vec<_>>()
+    };
+
+    for chat in ["mac-chat", "cloud-chat"] {
+        client
+            .call_as::<serde_json::Value>(
+                methods::MUTATE,
+                serde_json::json!({ "op": "deleteChat", "chatId": chat }),
+            )
+            .await
+            .unwrap();
+    }
+    let expected = format!("DELETE /cloud/{org}/sessions/cloud-chat");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !deletes(&seen).contains(&expected) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{expected} not called: {:?}", deletes(&seen)));
+    assert_eq!(deletes(&seen), vec![expected], "only the Cloud chat's machine");
+    core.shutdown().await;
+}

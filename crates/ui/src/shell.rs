@@ -11135,22 +11135,25 @@ impl Shell {
         }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
+            let chat = self.state.read(cx).chats.iter().find(|c| c.id == chat_id);
             let title = transcript::single_line(
-                &self
-                    .state
-                    .read(cx)
-                    .chats
-                    .iter()
-                    .find(|c| c.id == chat_id)
+                &chat
                     .and_then(|c| c.title.clone())
                     .unwrap_or_else(|| "New session".into()),
             );
+            // A Cloud chat's machine goes with it (the engine deletes it).
+            let on_cloud = chat.is_some_and(|c| zeron_proto::is_cloud_device(&c.device_id, ""));
+            let body = if on_cloud {
+                format!(
+                    "\u{201C}{title}\u{201D} and its Cloud machine will be permanently deleted, \
+                     with anything not pushed from it. This can\u{2019}t be undone."
+                )
+            } else {
+                format!("\u{201C}{title}\u{201D} will be permanently deleted. This can\u{2019}t be undone.")
+            };
             let card = popover::dialog_card(&theme)
                 .child(popover::dialog_title(&theme, "Delete session?"))
-                .child(div().mt(px(6.0)).child(popover::dialog_body(
-                    &theme,
-                    format!("\u{201C}{title}\u{201D} will be permanently deleted. This can\u{2019}t be undone."),
-                )))
+                .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, body)))
                 .child(
                     div()
                         .mt(px(16.0))

@@ -868,6 +868,28 @@ impl EngineRpc {
         CloudClient::new(edge.url.clone(), org_id, edge.token.clone())
     }
 
+    /// A deleted Cloud chat takes its machine with it (and whatever is
+    /// uncommitted there): otherwise the sandbox outlives every way to reach
+    /// it. Best-effort and in the background — the chat is already gone. A
+    /// chat with no machine of its own (a side chat in its parent's) has no
+    /// session to delete, and the edge says so.
+    fn delete_cloud_machines(&self, chat_ids: Vec<String>) {
+        if chat_ids.is_empty() {
+            return;
+        }
+        let cloud = self.cloud();
+        tokio::spawn(async move {
+            for chat_id in chat_ids {
+                match cloud.delete_session(&chat_id).await {
+                    Ok(_) => tracing::info!(chat = %chat_id, "deleted chat's Cloud machine"),
+                    Err(err) => {
+                        tracing::warn!(chat = %chat_id, error = %err, "Cloud machine not deleted")
+                    }
+                }
+            }
+        });
+    }
+
     /// The logical Cloud device (no engine; the edge writes its row with the
     /// `cloud-account` capability), as opposed to a session's device.
     fn is_cloud_account_device(&self, device_id: &str) -> bool {
@@ -1512,7 +1534,19 @@ impl EngineRpc {
                 .map_err(failed)
                 .map(drop),
             MutateParams::DeleteSpace { space_id } => {
+                let cloud_chats: Vec<String> = self
+                    .workspace
+                    .read_chats()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|chat| {
+                        chat.space_id.as_deref() == Some(space_id.as_str())
+                            && zeron_proto::is_cloud_device(&chat.device_id, "")
+                    })
+                    .map(|chat| chat.id)
+                    .collect();
                 let deleted = self.workspace.delete_space(&space_id).map_err(failed)?;
+                self.delete_cloud_machines(cloud_chats);
                 // Best-effort teardown of live runs we host for the deleted chats
                 // (the doc rows are already tombstoned; a straggler run would only
                 // write into an orphaned session doc).
@@ -1595,9 +1629,18 @@ impl EngineRpc {
                     .map(drop)
             }
             MutateParams::DeleteChat { chat_id } => {
+                let on_cloud = self
+                    .workspace
+                    .chat(&chat_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|chat| zeron_proto::is_cloud_device(&chat.device_id, ""));
                 self.voice.retire_chat(&chat_id);
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
+                if on_cloud {
+                    self.delete_cloud_machines(vec![chat_id]);
+                }
                 Ok(())
             }
             MutateParams::RenameDevice { device_id, name } => self

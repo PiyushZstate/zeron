@@ -163,7 +163,15 @@ impl ArchivedPage {
         viewport: gpui::Size<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let count = self.delete_all_confirm.as_ref()?.len();
+        let ids = self.delete_all_confirm.as_ref()?;
+        let count = ids.len();
+        let on_cloud = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .filter(|c| ids.contains(&c.id) && zeron_proto::is_cloud_device(&c.device_id, ""))
+            .count();
         let theme = Theme::of(cx).for_popup();
         // Same card as the sidebar's single "Delete session?" confirmation.
         let card = popover::dialog_card(&theme)
@@ -174,7 +182,7 @@ impl ArchivedPage {
             .child(
                 div()
                     .mt(px(6.0))
-                    .child(popover::dialog_body(&theme, delete_all_body(count))),
+                    .child(popover::dialog_body(&theme, delete_all_body(count, on_cloud))),
             )
             .child(
                 div()
@@ -563,13 +571,19 @@ impl Render for ArchivedPage {
     }
 }
 
-fn delete_all_body(count: usize) -> String {
-    match count {
-        1 => "1 archived session will be permanently deleted. This can\u{2019}t be undone.".into(),
-        n => format!(
-            "{n} archived sessions will be permanently deleted. This can\u{2019}t be undone."
-        ),
-    }
+fn delete_all_body(count: usize, on_cloud: usize) -> String {
+    let sessions = match count {
+        1 => "1 archived session".to_string(),
+        n => format!("{n} archived sessions"),
+    };
+    // Cloud chats' machines go with them (the engine deletes each).
+    let machines = match on_cloud {
+        0 => String::new(),
+        1 if count == 1 => " and its Cloud machine".into(),
+        1 => ", and 1 Cloud machine,".into(),
+        n => format!(", and {n} Cloud machines,"),
+    };
+    format!("{sessions}{machines} will be permanently deleted. This can\u{2019}t be undone.")
 }
 
 fn delete_all_failure(failed: usize) -> String {
@@ -737,8 +751,15 @@ mod tests {
 
     #[test]
     fn delete_all_copy_handles_one_and_many() {
-        assert!(delete_all_body(1).starts_with("1 archived session will"));
-        assert!(delete_all_body(146).starts_with("146 archived sessions will"));
+        assert!(delete_all_body(1, 0).starts_with("1 archived session will"));
+        assert!(delete_all_body(146, 0).starts_with("146 archived sessions will"));
+        assert!(delete_all_body(1, 1).starts_with("1 archived session and its Cloud machine will"));
+        assert!(
+            delete_all_body(3, 1).starts_with("3 archived sessions, and 1 Cloud machine, will")
+        );
+        assert!(
+            delete_all_body(3, 2).starts_with("3 archived sessions, and 2 Cloud machines, will")
+        );
     }
 
     #[test]

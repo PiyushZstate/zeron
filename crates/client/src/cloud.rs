@@ -171,6 +171,42 @@ impl Client {
         .map_err(Failure::into_error)
     }
 
+    /// `DELETE /cloud/{org}/sessions/{chatId}` — the session's machine and
+    /// anything uncommitted on it.
+    pub async fn cloud_delete_session(&self, chat_id: &str) -> Result<CloudSession> {
+        if self.inner.is_demo() {
+            return Err(ClientError::Unsupported(
+                "No Cloud machines in the demo.".into(),
+            ));
+        }
+        self.cloud_call::<CloudSession>(
+            reqwest::Method::DELETE,
+            &["cloud", "sessions", chat_id],
+            &[],
+            None,
+            "Delete the Cloud agent",
+        )
+        .await
+        .map_err(Failure::into_error)
+    }
+
+    /// Deleted Cloud chats take their machines with them, in the background:
+    /// the chats are already gone. A chat with no machine of its own (a side
+    /// chat in its parent's) has no session, and the edge says so.
+    pub(crate) fn delete_cloud_machines(&self, chat_ids: Vec<String>) {
+        if chat_ids.is_empty() || self.inner.is_demo() {
+            return;
+        }
+        let client = self.clone();
+        crate::runtime::handle().spawn(async move {
+            for chat_id in chat_ids {
+                if let Err(err) = client.cloud_delete_session(&chat_id).await {
+                    tracing::warn!(chat = %chat_id, error = %err, "Cloud machine not deleted");
+                }
+            }
+        });
+    }
+
     // ── GitHub (through the vault) ──────────────────────────────────────────
 
     /// `GET /vault/{org}/github/repos[?q=]` — the repositories Cloud reaches.

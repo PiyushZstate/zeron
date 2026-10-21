@@ -808,7 +808,15 @@ impl Client {
 
     /// Remove the chat row (the doc itself stays on the edge).
     pub fn delete_session(&self, chat_id: &str) -> Result<()> {
+        let on_cloud = self
+            .inner
+            .workspace
+            .chat(chat_id)
+            .is_some_and(|chat| zeron_proto::is_cloud_device(&chat.device_id, ""));
         self.chat_write(chat_id, |doc| doc.delete_chat(chat_id))?;
+        if on_cloud {
+            self.delete_cloud_machines(vec![chat_id.to_owned()]);
+        }
         let core = lock(&self.inner.sessions).remove(chat_id);
         // A view may still hold the session: close its room now (it flushes
         // once), so nothing re-saves the snapshot deleted below.
@@ -1056,9 +1064,20 @@ impl Client {
 
     /// Delete a project and cascade its chats' rows.
     pub fn delete_project(&self, space_id: &str) -> Result<()> {
-        let deleted = self
-            .inner
-            .registry_write(|doc| doc.delete_space(space_id))?;
+        let mut cloud_chats = Vec::new();
+        let deleted = self.inner.registry_write(|doc| {
+            cloud_chats = doc
+                .read_chats()?
+                .into_iter()
+                .filter(|chat| {
+                    chat.space_id.as_deref() == Some(space_id)
+                        && zeron_proto::is_cloud_device(&chat.device_id, "")
+                })
+                .map(|chat| chat.id)
+                .collect();
+            doc.delete_space(space_id)
+        })?;
+        self.delete_cloud_machines(cloud_chats);
         let mut sessions = lock(&self.inner.sessions);
         for chat_id in deleted.chat_ids {
             sessions.remove(&chat_id);
