@@ -13,6 +13,12 @@ const REFUSED: [string, string][] = [
   ["POST", "/cloud/o/enable"],
   ["DELETE", "/cloud/o"],
   ["GET", "/cloud/o/usage"],
+  // Sessions: only starting and managing delegates (below), never the list
+  // or a retry.
+  ["GET", "/cloud/o/sessions"],
+  ["POST", "/cloud/o/sessions/c1/retry"],
+  ["GET", "/cloud/o/projects"],
+  ["POST", "/cloud/o/billing/checkout"],
   ["GET", "/vault/o"],
   ["PUT", "/vault/o/credentials/codex"],
   ["POST", "/vault/o/devices/cloud-1/revoke"],
@@ -23,11 +29,9 @@ const REFUSED: [string, string][] = [
   ["POST", "/vault/o/accounts/claude/active"],
   ["DELETE", "/vault/o/accounts/codex/a1"],
   ["GET", "/vault/o/accounts/codex/a1/usage"],
-  // Another device's room: its RPC surface.
-  ["GET", "/device/laptop-1/ws?role=client"],
+  // Another device's room: never as its host, nor its sidecars.
   ["GET", "/device/laptop-1/ws?role=host"],
   ["GET", "/device/laptop-1/ws?role=HOST"],
-  ["POST", "/device/laptop-1/nudge"],
   ["GET", "/device/laptop-1/sidecar/repos"],
   ["POST", "/device/laptop-1/sidecar/repos"],
   ["POST", "/device/laptop-1/status"],
@@ -64,6 +68,16 @@ describe("runner policy", () => {
       ["POST", "/device/cloud-1/nudge"],
       ["POST", "/device/cloud-1/sidecar/repos"],
       ["GET", "/device/laptop-1/status"],
+      // A delegate's machine: a client link and the command nudge, gated per
+      // device by runner-access.ts (runnerDeviceGate).
+      ["GET", "/device/laptop-1/ws?role=client"],
+      ["GET", "/device/laptop-1/ws"],
+      ["POST", "/device/laptop-1/nudge"],
+      // Delegates' sessions, checked per session by the CloudAccount.
+      ["POST", "/cloud/o/sessions"],
+      ["DELETE", "/cloud/o/sessions/c2"],
+      ["POST", "/cloud/o/sessions/c2/wake"],
+      ["POST", "/cloud/o/sessions/c2/sleep"],
       ["GET", "/registry/o/ws"],
       ["GET", "/registry/o/rows"],
       ["POST", "/registry/o/push"],

@@ -291,6 +291,38 @@ impl CloudClient {
             .map_err(Failure::into_error)
     }
 
+    /// `POST /cloud/{orgId}/sessions` from a Cloud machine: a delegate of the
+    /// chat it runs (`parent_chat_id`), on a machine of its own, cloning the
+    /// parent's repository. The edge writes the delegate's chat row.
+    pub async fn create_child_session(
+        &self,
+        chat_id: &str,
+        parent_chat_id: &str,
+        branch: Option<&str>,
+        config: Option<&zeron_proto::ChatConfig>,
+    ) -> Result<CloudSession, EngineError> {
+        require_id(chat_id, "chatId")?;
+        require_id(parent_chat_id, "parentChatId")?;
+        let mut body = serde_json::json!({ "chatId": chat_id, "parentChatId": parent_chat_id });
+        if let Some(branch) = branch {
+            body["branch"] = serde_json::Value::String(branch.to_owned());
+        }
+        if let Some(config) = config {
+            body["config"] = serde_json::to_value(config)
+                .map_err(|e| EngineError::Other(format!("chat config: {e}")))?;
+        }
+        self.target()?
+            .call::<CloudSession>(
+                reqwest::Method::POST,
+                &["cloud", "sessions"],
+                &[],
+                Some(body),
+                "Start a Cloud session",
+            )
+            .await
+            .map_err(Failure::into_error)
+    }
+
     /// `DELETE /cloud/{orgId}/sessions/{chatId}` — the sandbox and anything
     /// uncommitted in it; the transcript stays.
     pub async fn delete_session(&self, chat_id: &str) -> Result<CloudSession, EngineError> {

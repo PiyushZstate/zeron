@@ -158,6 +158,36 @@ session. Enforced at the edge:
 
 User bearers are unaffected by all of the above.
 
+#### Delegation
+
+The one widening: a session's machine may start and manage **delegates** of the chat it runs
+(Zeron MCP `create_chat { cloud: true }`), one level deep. A delegate is a Cloud session of
+its own, on its own machine, recorded with `parentChatId` = the parent's chat.
+
+- **Start** (`POST /cloud/{org}/sessions {chatId, parentChatId, branch?, config?}` with a
+  runner bearer → `CloudAccount.createChildSession`): `parentChatId` must be the chat the
+  runner's device runs (`byDevice`), and that chat must not itself be a delegate (403
+  `too_deep`). The delegate takes the parent's project and repository — a machine never names
+  another repository — and `config.harness` must be Codex or Claude Code. The usual limits
+  hold: credits, and `CLOUD_MAX_AWAKE` machines at once. A runner request without
+  `parentChatId` is refused (a machine never acts as the user).
+- **Its chat row** is written by the edge, as the user (`chats/{chatId}`: the new machine as
+  host, `parentChatId`, the parent's `spaceId`, `roomGen: 2`, the asked-for `config`): a
+  runner may write only rows it hosts, and only the edge knows which machine it just made.
+- **Manage** (`DELETE /cloud/{org}/sessions/{chatId}`, `POST …/{wake|sleep}`): only sessions
+  whose `parentChatId` is its chat. Retry, the session list, projects, billing and Cloud
+  on/off stay the user's.
+- **See and reach**: the registry shows the runner its delegates' chat and session rows
+  (`RunnerScope.children`), and lets it rename, archive or delete them — never re-home them.
+  `/chat2/{chatId}/*` and `/blob/{chatId}/*` admit it when it hosts the chat's parent
+  (`/chat-host` answers `parentHost`). `/device/{id}/*` admits a client socket (never the host
+  role) and the command nudge for a device hosting one of its delegates
+  (`runnerDeviceGate`, via the registry's `/device-parents`). No other main chat — on the
+  laptop or another session — becomes visible.
+
+A stolen runner key therefore reaches at most: starting machines on the repository its
+session already has (bounded by credits and the awake limit), and its own delegates.
+
 ### Workflows (Cloudflare Workflows)
 
 Every provider call is a `step.do` with retries; provider configuration errors (e.g. an API

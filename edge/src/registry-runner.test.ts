@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Op, Row } from "./registry-core";
-import { chatHost, runnerCanSee, runnerOpRefusal } from "./registry-runner";
+import { chatHost, parentOf, runnerCanSee, runnerOpRefusal } from "./registry-runner";
 
 const CLOUD = "cloud-1";
 const LAPTOP = "laptop-1";
@@ -75,5 +75,40 @@ describe("runner registry reads", () => {
     expect(chatHost(row("chats", "c1", {}, true))).toBeUndefined();
     expect(chatHost(row("sessions", "c1", { deviceId: CLOUD }))).toBeUndefined();
     expect(chatHost(undefined)).toBeUndefined();
+  });
+});
+
+describe("delegates (child chats on other machines)", () => {
+  const OTHER = "cloud-2";
+  const children = new Set(["child"]);
+  const child = row("chats", "child", { deviceId: OTHER, parentChatId: "main", title: "t" });
+
+  it("sees its children's chat and session rows, never another main chat", () => {
+    const scope = { spaces: new Set<string>(), children };
+    expect(runnerCanSee(CLOUD, child, scope)).toBe(true);
+    expect(runnerCanSee(CLOUD, row("sessions", "child", { deviceId: OTHER }), scope)).toBe(true);
+    expect(runnerCanSee(CLOUD, row("chats", "other-main", { deviceId: OTHER }), scope)).toBe(false);
+    expect(runnerCanSee(CLOUD, row("sessions", "other-main", { deviceId: OTHER }), scope)).toBe(false);
+    expect(runnerCanSee(CLOUD, row("spaces", "s9", { deviceId: LAPTOP }), scope)).toBe(false);
+    expect(runnerCanSee(CLOUD, child)).toBe(false); // no scope: hosted rows only
+  });
+
+  it("may rename, archive or delete a child, nothing else", () => {
+    expect(runnerOpRefusal(CLOUD, child, upsert("chats", "child", { title: "x" }), children)).toBeNull();
+    expect(runnerOpRefusal(CLOUD, child, upsert("chats", "child", { archived: true }), children)).toBeNull();
+    expect(runnerOpRefusal(CLOUD, child, del("chats", "child"), children)).toBeNull();
+    expect(runnerOpRefusal(CLOUD, row("sessions", "child", { deviceId: OTHER }), del("sessions", "child"), children)).toBeNull();
+    expect(runnerOpRefusal(CLOUD, child, upsert("chats", "child", { deviceId: CLOUD }), children)).toMatch(/only rename/);
+    expect(runnerOpRefusal(CLOUD, child, upsert("chats", "child", { parentChatId: null }), children)).toMatch(/only rename/);
+    expect(runnerOpRefusal(CLOUD, child, upsert("chats", "child", { config: {} }), children)).toMatch(/only rename/);
+    expect(runnerOpRefusal(CLOUD, row("sessions", "child", { deviceId: OTHER }), upsert("sessions", "child", { status: "idle" }), children)).toMatch(/another device/);
+    // Not its child: refused as before.
+    expect(runnerOpRefusal(CLOUD, child, upsert("chats", "child", { title: "x" }))).toMatch(/another device/);
+  });
+
+  it("reads a chat's parent", () => {
+    expect(parentOf(child)).toBe("main");
+    expect(parentOf(row("chats", "main", { deviceId: CLOUD }))).toBeUndefined();
+    expect(parentOf(row("chats", "gone", {}, true))).toBeUndefined();
   });
 });

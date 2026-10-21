@@ -69,11 +69,15 @@ The creation result includes the effective `kind`, `chatId`, `deviceId`,
 
 Children record `Chat.parent_chat_id` (proto) ⇄ `parentChatId` on the registry
 row (`Mutate createChat { parentChatId? }`). Any chat may delegate to any provider.
-Children may themselves delegate, up to 3 levels below a top-level chat.
-`create_chat` and `create_chats` reject a parent already at that depth, including
-an explicit `parent` override. Standalone sessions have no parent. A chat that
-has a parent only creates side chats of its own (no `kind: chat`, no other
-`parent`), so the depth count can't be restarted from inside a delegation.
+Delegation is one level deep: a chat that has a parent creates no chats at all,
+and a new chat's parent (the origin, or an explicit `parent`) must be top-level.
+Standalone sessions have no parent.
+
+`cloud: true` runs the child on a Cloud machine of its own (Codex or Claude
+Code), cloning the project's GitHub repository; from a Cloud chat, the parent's
+repository. Without it, a child of a Cloud chat shares the parent's machine. A
+Cloud machine starts children only for the chat it runs, and sees and manages
+only those children (docs/design/cloud-device.md, "Delegation").
 
 For children, `parent` (id, prefix, or title) overrides the origin (`ZERON_CHAT_ID`).
 `list_chats { parent }` returns children, and chat summaries carry `parentChatId`.

@@ -226,7 +226,10 @@ export const handleCloudRoute = async (
   const orgId = parts[1];
   if (!orgId || !ID_RE.test(orgId)) return jsonError(404, "not_found", "Not found.");
   if (auth.orgId !== orgId) return jsonError(403, "forbidden", "Wrong organization.");
-  const caller = { orgId, userId: auth.userId };
+  // A runner acts for the chat its machine hosts (runner-policy.ts admits
+  // only session routes; the CloudAccount checks each is its own delegate).
+  const caller =
+    auth.kind === "runner" && auth.deviceId ? { orgId, userId: auth.userId, deviceId: auth.deviceId } : { orgId, userId: auth.userId };
   const ns = env.CLOUD_ACCOUNTS;
   const rest = parts.slice(2);
 
@@ -308,6 +311,20 @@ export const handleCloudRoute = async (
       if (!isEdgeOrigin(edgeUrl)) return jsonError(500, "misconfigured", "Bad CLOUD_EDGE_URL.");
       const body = await readJsonBody(request, MAX_RUNNER_BODY);
       if (!isObject(body)) return jsonError(400, "bad_request", "Body must be a JSON object.");
+      if (auth.kind === "runner") {
+        // A delegate: the project and repository are the parent's.
+        const { chatId, parentChatId, branch, config } = body;
+        if (parentChatId === undefined) {
+          return jsonError(403, "forbidden", "A Cloud machine starts sessions only for the chat it hosts.");
+        }
+        if (typeof chatId !== "string" || !ID_RE.test(chatId)) return jsonError(400, "bad_request", "Bad chatId.");
+        if (typeof parentChatId !== "string" || !ID_RE.test(parentChatId)) return jsonError(400, "bad_request", "Bad parentChatId.");
+        if (branch !== undefined && (typeof branch !== "string" || branch.length > 255)) return jsonError(400, "bad_request", "Bad branch.");
+        if (config !== undefined && !isChildConfig(config)) {
+          return jsonError(400, "bad_request", "Expected config {harness: codex | claude-code, …}.");
+        }
+        return rpc(() => stub.createChildSession(caller, chatId, parentChatId, edgeUrl, branch, config));
+      }
       const { chatId, spaceId, repo, branch } = body;
       if (typeof chatId !== "string" || !ID_RE.test(chatId)) return jsonError(400, "bad_request", "Bad chatId.");
       if (typeof spaceId !== "string" || !ID_RE.test(spaceId)) return jsonError(400, "bad_request", "Bad spaceId.");
@@ -358,3 +375,10 @@ export const autoWakeCloudDevice = (
       .catch((e: unknown) => console.warn("cloud auto-wake failed", String(e)))
   );
 };
+
+/** A delegate's agent settings: Cloud runs Codex and Claude Code; the rest is
+ * the host's to validate (it ignores what it doesn't know). Bounded. */
+const isChildConfig = (config: unknown): config is Record<string, unknown> =>
+  isObject(config) &&
+  (config.harness === "codex" || config.harness === "claude-code") &&
+  JSON.stringify(config).length <= 4096;

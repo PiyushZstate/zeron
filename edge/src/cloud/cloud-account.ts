@@ -113,6 +113,9 @@ import { SandboxError, effectiveTtl, type SandboxUsage } from "./sandbox-provide
 export interface CloudCaller {
   readonly orgId: string;
   readonly userId: string;
+  /** A Cloud machine acting for the chat it hosts (runner bearer): it may
+   * only start and manage that chat's child sessions. Absent for the user. */
+  readonly deviceId?: string;
 }
 
 /** The user action whose lifecycle failed (the UI's Retry). */
@@ -337,6 +340,9 @@ interface SessionRecord {
   /** When the machine last started running (provision or wake): unmetered
    * time since the last reconcile counts against the balance. */
   awakeSince?: number;
+  /** A delegate: the chat whose machine started this session. One level
+   * only — a child never starts children of its own. */
+  parentChatId?: string;
 }
 
 const ACCOUNT_KEY = "account";
@@ -839,10 +845,14 @@ export class CloudAccount extends DurableObject<Env> {
     spaceId: string,
     repo: RepoInput,
     edgeUrl: string,
-    baseBranch?: string
+    baseBranch?: string,
+    parentChatId?: string
   ): Promise<CloudResult<CloudSessionView>> {
     const off = this.accountOf(caller);
     if (off) return off;
+    if (caller.deviceId !== undefined && parentChatId === undefined) {
+      return fail(403, "forbidden", "A Cloud machine starts only sessions for the chat it hosts.");
+    }
     if (!ID_RE.test(chatId)) return fail(400, "bad_request", "Malformed chatId.");
     if (!ID_RE.test(spaceId)) return fail(400, "bad_request", "Malformed spaceId.");
     if (baseBranch !== undefined && !isBranch(baseBranch)) return fail(400, "bad_request", "Malformed branch.");
@@ -883,7 +893,8 @@ export class CloudAccount extends DurableObject<Env> {
       provider: providerName,
       activeRuns: 0,
       clients: 0,
-      lastTtlExtendAt: now
+      lastTtlExtendAt: now,
+      ...(parentChatId !== undefined ? { parentChatId } : {})
     };
     this.sessions.set(chatId, s);
     this.byDevice.set(s.deviceId, chatId);
@@ -891,6 +902,90 @@ export class CloudAccount extends DurableObject<Env> {
     // while the machine is still booting, and must queue, not 404.
     await this.claimDeviceRoom(s.deviceId, caller.userId);
     return this.beginProvision(caller, s, edgeUrl);
+  }
+
+  /**
+   * A Cloud machine starts a delegate for the chat it hosts: a session of its
+   * own on a machine of its own, on the parent's project and repository (a
+   * machine never names another repository), from `branch` or the parent's
+   * base. One level only — a delegate never starts delegates. The child's
+   * chat row is written here, as the user: a machine may only write rows it
+   * hosts, and the edge alone knows which machine it just made.
+   */
+  async createChildSession(
+    caller: CloudCaller,
+    chatId: string,
+    parentChatId: string,
+    edgeUrl: string,
+    branch?: string,
+    config?: Record<string, unknown>
+  ): Promise<CloudResult<CloudSessionView>> {
+    const off = this.accountOf(caller);
+    if (off) return off;
+    const parentOfCaller = caller.deviceId === undefined ? undefined : this.byDevice.get(caller.deviceId);
+    if (parentOfCaller === undefined || parentOfCaller !== parentChatId) {
+      return fail(403, "forbidden", "A Cloud machine starts sessions only for the chat it hosts.");
+    }
+    const parent = this.sessions.get(parentChatId);
+    if (!parent) return fail(404, "unknown_session", "No Cloud session for the parent chat.");
+    if (parent.parentChatId !== undefined) {
+      return fail(403, "too_deep", "A delegated chat can't start chats of its own.");
+    }
+    const existing = this.sessions.get(chatId);
+    if (existing && existing.parentChatId !== parentChatId) {
+      return fail(409, "conflict", "That chat already has a Cloud session.");
+    }
+    const started = existing
+      ? this.okSession(existing)
+      : await this.createSession(
+          caller,
+          chatId,
+          parent.spaceId,
+          { fullName: parent.repo.fullName, cloneUrl: parent.repo.cloneUrl, defaultBranch: parent.repo.defaultBranch },
+          edgeUrl,
+          branch ?? parent.baseBranch,
+          parentChatId
+        );
+    if (!started.ok) return started;
+    const s = this.sessions.get(chatId);
+    if (s) await this.writeChildChatRow(s, config, branch ?? parent.baseBranch);
+    return started;
+  }
+
+  /** The delegate's chat row: hosted by its new machine, under its parent,
+   * in the parent's project — only the fields known now (no nulls), so the
+   * host's own later writes win field by field. Idempotent: an existing row
+   * on this machine is left alone. */
+  private async writeChildChatRow(s: SessionRecord, config: Record<string, unknown> | undefined, branch: string | undefined): Promise<void> {
+    const { orgId, userId } = this.acct;
+    if (!orgId || !userId || !s.parentChatId) return;
+    const room = this.env.REGISTRY_ROOMS.get(this.env.REGISTRY_ROOMS.idFromName(`reg1/${orgId}/${userId}`));
+    const headers = { [AUTH_USER_HEADER]: userId };
+    const host = await room.fetch(new Request(`https://registry/chat-host?chat=${encodeURIComponent(s.chatId)}`, { headers }));
+    if (host.ok && ((await host.json()) as { deviceId?: unknown }).deviceId === s.deviceId) return;
+    const set: Record<string, unknown> = {
+      id: s.chatId,
+      deviceId: s.deviceId,
+      archived: false,
+      cwd: s.repo.path,
+      createdAt: Date.now(),
+      spaceId: s.spaceId,
+      parentChatId: s.parentChatId,
+      roomGen: 2,
+      ...(config ? { config } : {}),
+      ...(branch ? { branch } : {})
+    };
+    const push = await room.fetch(
+      new Request(`https://registry/push?device=${REGISTRY_WRITER}`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({
+          batch: `cloud-child-${s.chatId}-${crypto.randomUUID()}`,
+          ops: [{ kind: "chats", id: s.chatId, op: "upsert", set, hlc: encodeHlc(Date.now(), 0, REGISTRY_WRITER) }]
+        })
+      })
+    );
+    if (!push.ok) console.warn("cloud: writing a delegate's chat row failed", s.chatId, push.status);
   }
 
   /**
@@ -1020,7 +1115,16 @@ export class CloudAccount extends DurableObject<Env> {
 
   private session(caller: CloudCaller, chatId: string): SessionRecord | CloudResult<never> {
     if (this.acct.orgId !== undefined && !this.matches(caller)) return fail(403, "forbidden", "Not your Cloud.");
-    return this.sessions.get(chatId) ?? fail(404, "unknown_session", "No Cloud session for that chat.");
+    const s = this.sessions.get(chatId);
+    if (!s) return fail(404, "unknown_session", "No Cloud session for that chat.");
+    // A machine manages only the sessions it started (its delegates).
+    if (caller.deviceId !== undefined) {
+      const parent = this.byDevice.get(caller.deviceId);
+      if (parent === undefined || s.parentChatId !== parent) {
+        return fail(403, "forbidden", "A Cloud machine manages only the sessions it started.");
+      }
+    }
+    return s;
   }
 
   async wakeSession(caller: CloudCaller, chatId: string): Promise<CloudResult<CloudSessionView>> {

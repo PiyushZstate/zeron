@@ -577,6 +577,9 @@ struct FetchToolBlobParams {
 struct CloudHost {
     device_id: String,
     cwd: Option<String>,
+    /// The edge wrote the chat's row (a delegate started from a Cloud
+    /// machine, which may only write rows it hosts).
+    row_written: bool,
 }
 
 /// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
@@ -1036,16 +1039,21 @@ impl EngineRpc {
         parent_chat_id: Option<&str>,
         branch: Option<&str>,
         cloud: bool,
+        config: Option<&ChatConfig>,
     ) -> Result<Option<CloudHost>, RpcError> {
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         let on_cloud = |device_id: &str| device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX);
-        if let Some(parent) = parent_chat_id
+        // A side chat of a Cloud chat shares its machine (and files), unless
+        // it asks for a Cloud session of its own.
+        if !cloud
+            && let Some(parent) = parent_chat_id
             && let Some(parent) = self.workspace.chat(parent).map_err(failed)?
             && on_cloud(&parent.device_id)
         {
             return Ok(Some(CloudHost {
                 device_id: parent.device_id,
                 cwd: parent.cwd,
+                row_written: false,
             }));
         }
         if !cloud {
@@ -1057,6 +1065,32 @@ impl EngineRpc {
             return Ok(Some(CloudHost {
                 device_id: existing.device_id,
                 cwd: existing.cwd,
+                // A Cloud machine may not write a delegate's row (the edge did).
+                row_written: crate::runner::session().is_some(),
+            }));
+        }
+        // On a Cloud machine: a delegate of the chat this machine runs, on a
+        // machine of its own (the edge clones the parent's repository and
+        // writes the delegate's row — a machine writes only rows it hosts).
+        if let Some(session) = crate::runner::session() {
+            let parent = parent_chat_id.ok_or_else(|| {
+                RpcError::Failed("A Cloud machine starts Cloud chats only as children of its chat.".into())
+            })?;
+            if parent != session.chat_id {
+                return Err(RpcError::Failed(
+                    "A Cloud machine starts Cloud chats only as children of the chat it runs.".into(),
+                ));
+            }
+            let started = self
+                .cloud()
+                .create_child_session(chat_id, parent, branch, config)
+                .await
+                .map_err(|e| RpcError::Failed(format!("Couldn't start a Cloud session: {e}")))?;
+            self.await_chat_row(chat_id).await?;
+            return Ok(Some(CloudHost {
+                device_id: started.device_id,
+                cwd: started.path,
+                row_written: true,
             }));
         }
         let space_id =
@@ -1088,7 +1122,26 @@ impl EngineRpc {
         Ok(Some(CloudHost {
             device_id: session.device_id,
             cwd: session.path,
+            row_written: false,
         }))
+    }
+
+    /// Wait for a chat row written elsewhere (the edge, for a delegate) to
+    /// reach this engine's registry, so what follows — a first prompt, a
+    /// title — finds it.
+    async fn await_chat_row(&self, chat_id: &str) -> Result<(), RpcError> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if self.workspace.chat(chat_id).ok().flatten().is_some() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(RpcError::Failed(
+                    "The Cloud session started, but its chat hasn't synced here yet; try again shortly.".into(),
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     fn updater(&self) -> Result<&zeron_update::Updater, RpcError> {
@@ -2995,9 +3048,15 @@ impl RpcService for EngineRpc {
                         parent_chat_id.as_deref(),
                         branch.as_deref().filter(|b| !b.is_empty()),
                         *cloud,
+                        config.as_ref(),
                     ))
                     .await?
                 {
+                    if host.row_written {
+                        return RpcReply::value(&serde_json::json!({
+                            "ok": true, "deviceId": host.device_id, "cwd": host.cwd,
+                        }));
+                    }
                     let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
                     // The machine's checkout, not the project's folder on the
                     // computer it lives on.

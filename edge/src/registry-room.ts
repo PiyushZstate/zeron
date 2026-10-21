@@ -24,7 +24,7 @@
  * auto-response pair; the daily alarm does tombstone GC + the R2 backup.
  */
 import { applyOp, validateOp, type Op, type Row } from "./registry-core";
-import { chatHost, runnerCanSee, runnerOpRefusal } from "./registry-runner";
+import { chatHost, parentOf, runnerCanSee, runnerOpRefusal, type RunnerScope } from "./registry-runner";
 import { AUTH_USER_HEADER, RUNNER_ACCOUNT_HEADER, RUNNER_DEVICE_HEADER, apnsConfig, type Env } from "./env";
 import { isDeadToken, sendApns, type ApnsEnvironment } from "./apns";
 import {
@@ -190,24 +190,52 @@ export class RegistryRoom implements DurableObject {
    * (plus all devices, and the projects of the chats it hosts) for a runner. */
   private visible(rows: Row[], runner: string | undefined, _account: string | undefined): Row[] {
     if (runner === undefined) return rows;
-    const spaces = this.hostedChatSpaces(runner);
-    return rows.filter((row) => runnerCanSee(runner, row, spaces));
+    const scope = this.runnerScope(runner);
+    return rows.filter((row) => runnerCanSee(runner, row, scope));
   }
 
-  /** The projects (`spaceId`s) of the live chats `device` hosts. */
-  private hostedChatSpaces(device: string): Set<string> {
+  /** What `device` reaches beyond its own rows: the projects of the live
+   * chats it hosts, and the live chats whose parent it hosts (delegates it
+   * started on other machines). */
+  private runnerScope(device: string): RunnerScope {
     const spaces = new Set<string>();
+    const hosted = new Set<string>();
+    const parents: [string, string][] = [];
+    for (const raw of this.ctx.storage.sql.exec<{ id: string; fields: string }>(
+      "SELECT id, fields FROM rows WHERE kind = 'chats' AND deleted = 0"
+    )) {
+      try {
+        const fields = JSON.parse(raw.fields) as Record<string, unknown>;
+        if (fields.deviceId === device) {
+          hosted.add(raw.id);
+          if (typeof fields.spaceId === "string") spaces.add(fields.spaceId);
+        }
+        if (typeof fields.parentChatId === "string") parents.push([raw.id, fields.parentChatId]);
+      } catch {
+        /* a malformed row names no project and no parent */
+      }
+    }
+    const children = new Set(parents.filter(([, parent]) => hosted.has(parent)).map(([id]) => id));
+    return { spaces, children };
+  }
+
+  /** The hosts of the parents of the live chats `device` hosts: the runners
+   * that delegated work to it (the Worker's device-room gate). */
+  private parentHosts(device: string): string[] {
+    const hosts = new Set<string>();
     for (const raw of this.ctx.storage.sql.exec<{ fields: string }>(
       "SELECT fields FROM rows WHERE kind = 'chats' AND deleted = 0"
     )) {
       try {
         const fields = JSON.parse(raw.fields) as Record<string, unknown>;
-        if (fields.deviceId === device && typeof fields.spaceId === "string") spaces.add(fields.spaceId);
+        if (fields.deviceId !== device || typeof fields.parentChatId !== "string") continue;
+        const host = chatHost(this.loadRow("chats", fields.parentChatId));
+        if (host) hosts.add(host);
       } catch {
-        /* a malformed row names no project */
+        /* a malformed row delegates nothing */
       }
     }
-    return spaces;
+    return [...hosts];
   }
 
   private rowsSince(cursor: number): Row[] {
@@ -350,7 +378,20 @@ export class RegistryRoom implements DurableObject {
     // reachable through the Worker, which asks the caller's own room.
     if (url.pathname === "/chat-host" && request.method === "GET") {
       const chat = url.searchParams.get("chat") ?? "";
-      return json({ deviceId: chatHost(this.loadRow("chats", chat)) ?? null });
+      const row = this.loadRow("chats", chat);
+      const parent = parentOf(row);
+      return json({
+        deviceId: chatHost(row) ?? null,
+        // A delegate's parent host may reach it too (its runner started it).
+        parentHost: (parent && chatHost(this.loadRow("chats", parent))) ?? null
+      });
+    }
+
+    // The Worker's device-room gate for runners: which runners delegated
+    // work to this device (host the parents of the chats it hosts)?
+    if (url.pathname === "/device-parents" && request.method === "GET") {
+      const device = url.searchParams.get("device") ?? "";
+      return json({ hosts: this.parentHosts(device) });
     }
 
     if (url.pathname === "/push" && request.method === "POST") {
@@ -537,11 +578,13 @@ export class RegistryRoom implements DurableObject {
     const sessionsBefore = new Map<string, Row | undefined>();
     let applied = 0;
     const rejected: RejectedOp[] = [];
+    // Children as the batch starts: a delegate the runner may manage.
+    const children = runner === undefined ? undefined : this.runnerScope(runner).children;
     for (const op of ops) {
       const key = `${op.kind} ${op.id}`;
       const before = touched.get(key) ?? this.loadRow(op.kind, op.id);
       if (runner !== undefined) {
-        const refusal = runnerOpRefusal(runner, before, op);
+        const refusal = runnerOpRefusal(runner, before, op, children);
         if (refusal !== null) {
           rejected.push({ kind: op.kind, id: op.id, error: refusal });
           continue;

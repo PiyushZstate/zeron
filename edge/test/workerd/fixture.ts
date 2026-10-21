@@ -10,7 +10,7 @@ import {
 } from "../../src/cloud/routes";
 import type { Env } from "../../src/env";
 import { deviceParam, forward } from "../../src/forward";
-import { runnerChatGate } from "../../src/runner-access";
+import { runnerChatGate, runnerDeviceGate } from "../../src/runner-access";
 import { previewRoute } from "../../src/preview-route";
 import { runnerRefusal } from "../../src/runner-policy";
 import { handleVaultRoute } from "../../src/vault-routes";
@@ -129,6 +129,10 @@ export default {
     if (parts[0] === "device" && parts[1] && id.test(parts[1])) {
       const deviceId = parts[1];
       const room = `d2/${deviceId}`;
+      if (parts[2] === "ws" || parts[2] === "nudge") {
+        const refusedDevice = await runnerDeviceGate(env, auth, deviceId);
+        if (refusedDevice) return refusedDevice;
+      }
       if (parts[2] === "ws") {
         const role = url.searchParams.get("role") === "host" ? "host" : "client";
         return forward(env.DEVICE_ROOMS, room, request, auth, "/ws", `?role=${role}&connId=${crypto.randomUUID()}`);

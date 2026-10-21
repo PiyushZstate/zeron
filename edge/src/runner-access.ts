@@ -36,18 +36,62 @@ export const runnerChatGate = async (
 
   const room = env.REGISTRY_ROOMS.get(env.REGISTRY_ROOMS.idFromName(`reg1/${auth.orgId}/${auth.userId}`));
   let host: unknown;
+  let parentHost: unknown;
   try {
     const reply = await room.fetch(`https://registry/chat-host?chat=${encodeURIComponent(chatId)}`, {
       headers: { [AUTH_USER_HEADER]: auth.userId }
     });
     if (!reply.ok) throw new Error(`registry ${reply.status}`);
-    host = ((await reply.json()) as { deviceId?: unknown }).deviceId;
+    ({ deviceId: host, parentHost } = (await reply.json()) as { deviceId?: unknown; parentHost?: unknown });
   } catch (e) {
     console.warn("runner chat gate: registry unavailable", String(e));
     return json({ error: "unavailable", message: "Couldn't check the chat's host; retry." }, 503);
   }
-  if (host !== auth.deviceId) return notHost();
+  // Its own chat, or a delegate it started on another machine (it hosts the
+  // delegate's parent).
+  if (host !== auth.deviceId && parentHost !== auth.deviceId) return notHost();
   if (allowed.size >= MAX_CACHE) allowed.clear();
   allowed.set(key, now + POSITIVE_TTL_MS);
+  return undefined;
+};
+
+const deviceAllowed = new Map<string, number>();
+
+/**
+ * Gate for a runner on ANOTHER device's room (`/device/{id}/*` — that
+ * device's RPC surface: queues, interrupts, files). Allowed only when the
+ * device hosts a chat whose parent the runner hosts: the runner started that
+ * delegate and manages it. Its own room and read-only liveness never reach
+ * here (runner-policy.ts). Cached like the chat gate: positive answers only.
+ */
+export const runnerDeviceGate = async (
+  env: Pick<Env, "REGISTRY_ROOMS">,
+  auth: Verified,
+  deviceId: string,
+  now = Date.now()
+): Promise<Response | undefined> => {
+  if (auth.kind !== "runner" || deviceId === auth.deviceId) return undefined;
+  const refused = () => json({ error: "forbidden", message: "A runner may only reach the machines of chats it started." }, 403);
+  if (!auth.orgId || !auth.deviceId) return refused();
+  const key = `${auth.orgId}/${auth.userId}/${auth.deviceId}/${deviceId}`;
+  const until = deviceAllowed.get(key);
+  if (until !== undefined && until > now) return undefined;
+  deviceAllowed.delete(key);
+
+  const room = env.REGISTRY_ROOMS.get(env.REGISTRY_ROOMS.idFromName(`reg1/${auth.orgId}/${auth.userId}`));
+  let hosts: unknown;
+  try {
+    const reply = await room.fetch(`https://registry/device-parents?device=${encodeURIComponent(deviceId)}`, {
+      headers: { [AUTH_USER_HEADER]: auth.userId }
+    });
+    if (!reply.ok) throw new Error(`registry ${reply.status}`);
+    hosts = ((await reply.json()) as { hosts?: unknown }).hosts;
+  } catch (e) {
+    console.warn("runner device gate: registry unavailable", String(e));
+    return json({ error: "unavailable", message: "Couldn't check the device's chats; retry." }, 503);
+  }
+  if (!Array.isArray(hosts) || !hosts.includes(auth.deviceId)) return refused();
+  if (deviceAllowed.size >= MAX_CACHE) deviceAllowed.clear();
+  deviceAllowed.set(key, now + POSITIVE_TTL_MS);
   return undefined;
 };

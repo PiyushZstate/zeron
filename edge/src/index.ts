@@ -69,7 +69,7 @@ import {
 import { handleAdminRoute, runCloudCron } from "./cloud/billing";
 import { sandboxProvider } from "./cloud/providers";
 import { FakeProvider } from "./cloud/providers/fake";
-import { runnerChatGate } from "./runner-access";
+import { runnerChatGate, runnerDeviceGate } from "./runner-access";
 import { runnerRefusal } from "./runner-policy";
 import { handleVaultRoute } from "./vault-routes";
 import installSh from "./install.sh";
@@ -345,6 +345,12 @@ export default {
     // ── device rooms ────────────────────────────────────────────────────────
     if (parts[0] === "device" && parts[1] && ID_RE.test(parts[1])) {
       const deviceId = parts[1];
+      // Another device's link or nudge: only a delegate's machine (the
+      // policy already admitted nothing else but liveness).
+      if (parts[2] === "ws" || parts[2] === "nudge") {
+        const refusedDevice = await runnerDeviceGate(env, auth, deviceId);
+        if (refusedDevice) return refusedDevice;
+      }
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
           return json({ error: "expected websocket" }, 426);

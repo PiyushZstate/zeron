@@ -24,11 +24,8 @@ use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
 
 /// Default and ceiling for the blocking waits.
 const MAX_BATCH: usize = 32;
-/// How many levels of chats an agent may delegate through: a top-level chat
-/// spawns depth 1, that one may spawn depth 2, and so on up to this. Deep
-/// enough for claude → gpt → claude, shallow enough to stop a runaway loop of
-/// agents spawning agents.
-const MAX_DELEGATION_DEPTH: usize = 3;
+/// Cloud runs these agents (Codex and Claude Code): a Cloud chat's harness.
+const CLOUD_HARNESSES: &[HarnessId] = &[HarnessId::ClaudeCode, HarnessId::Codex];
 const DEFAULT_WAIT: Duration = Duration::from_secs(600);
 const MAX_WAIT: Duration = Duration::from_secs(3600);
 
@@ -121,7 +118,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a standalone session with kind chat, or a child with kind side. Omitted kind defaults to side with an origin/parent, standalone otherwise. Any connected provider works (see list_harnesses), whichever provider you run on; children may delegate through side chats of their own, up to 3 levels deep. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.",
+            description: "Create a standalone session with kind chat, or a child with kind side. Omitted kind defaults to side with an origin/parent, standalone otherwise. Any connected provider works (see list_harnesses), whichever provider you run on. Delegation is one level deep: a chat that has a parent cannot create chats. With cloud, the chat runs on a Cloud machine of its own (Codex or Claude Code), from a Cloud chat or a project with a GitHub repository. Select a project and/or device; catalogs are validated on that host. Optionally send a first prompt and wait for the reply. For parallel delegation use create_chats, or launch with wait=false and wait only after all chats have started.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -136,6 +133,7 @@ fn catalog() -> Vec<ToolDef> {
                     "title": { "type": "string", "description": "Sidebar title. Otherwise the engine titles it from the first exchange." },
                     "branch": { "type": "string", "description": "Branch label to record on the chat." },
                     "cwd": { "type": "string", "description": "Working directory override (an existing worktree path). Defaults to the project folder." },
+                    "cloud": { "type": "boolean", "default": false, "description": "Run on a Cloud machine of its own (cloning the project's GitHub repository) instead of the project's device. From a Cloud chat, the child clones the same repository; without cloud it shares this machine." },
                     "prompt": { "type": "string", "description": "First message to send right away." },
                     "wait": { "type": "boolean", "default": false, "description": "With prompt: block until the first turn finishes and return the reply." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
@@ -524,6 +522,8 @@ struct CreateChatArgs {
     title: Option<String>,
     branch: Option<String>,
     cwd: Option<String>,
+    #[serde(default)]
+    cloud: bool,
     prompt: Option<String>,
     #[serde(default)]
     wait: bool,
@@ -898,19 +898,6 @@ impl Tools {
         Ok(summary)
     }
 
-    /// Refuse a child of `parent` when that would nest chats deeper than
-    /// [`MAX_DELEGATION_DEPTH`].
-    async fn ensure_delegation_depth(&self, parent: &str) -> anyhow::Result<()> {
-        let parent = self.zeron.resolve_chat(parent).await?;
-        let chats = self.zeron.chats().await?;
-        let depth = chain_depth(&parent, &chats);
-        anyhow::ensure!(
-            depth < MAX_DELEGATION_DEPTH,
-            "Delegation is limited to {MAX_DELEGATION_DEPTH} levels of chats (this chat is already {depth} deep). Do the work in this chat, or ask the chat that started you to create the next one."
-        );
-        Ok(())
-    }
-
     async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
         // Parent: the explicit `parent` argument, else the chat this server
         // speaks for. Resolved so a prefix/title works and a typo fails loud.
@@ -943,21 +930,24 @@ impl Tools {
             ChatKind::Chat
         };
 
-        // A delegate (a chat that has a parent itself) only creates its own
-        // children: naming a shallower parent, or none, would restart the
-        // depth count and let agents spawn agents without bound.
+        // Delegation is one level deep: a chat that has a parent never
+        // creates chats, and a new chat's parent is a top-level chat.
         if let Some(origin) = self.zeron.origin().chat_id.as_deref()
             && !zeron_proto::voice::is_orchestrator_chat(origin)
         {
             let origin = self.zeron.resolve_chat(origin).await?;
             anyhow::ensure!(
-                origin.parent_chat_id.is_none()
-                    || parent_chat_id.as_deref() == Some(origin.id.as_str()),
-                "A delegated chat can only create side chats of its own. Leave out parent and kind, or ask the chat that started you."
+                origin.parent_chat_id.is_none(),
+                "A delegated chat can't create chats of its own. Do the work in this chat, or ask the chat that started you."
             );
         }
         if let Some(parent) = parent_chat_id.as_deref() {
-            self.ensure_delegation_depth(parent).await?;
+            let parent = self.zeron.resolve_chat(parent).await?;
+            anyhow::ensure!(
+                parent.parent_chat_id.is_none(),
+                "{} is itself a delegated chat: only top-level chats have side chats.",
+                parent.title.as_deref().unwrap_or(&parent.id)
+            );
         }
         let (space, device_id) = self
             .zeron
@@ -965,6 +955,16 @@ impl Tools {
             .await?;
         let harnesses = self.zeron.harnesses_on(Some(&device_id)).await?;
         let harness = match args.harness.as_deref() {
+            // Cloud runs its own agents, with your Cloud accounts.
+            Some(raw) if args.cloud => {
+                let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
+                anyhow::ensure!(
+                    CLOUD_HARNESSES.contains(&id),
+                    "Cloud runs Codex and Claude Code only"
+                );
+                id
+            }
+            None if args.cloud => CLOUD_HARNESSES[0],
             Some(raw) => {
                 let id: HarnessId = parse_enum("harness", raw).map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(
@@ -975,7 +975,8 @@ impl Tools {
             }
             None => default_harness(&harnesses).with_context(|| format!("device {device_id}"))?,
         };
-        if let Some(model) = args.model.as_deref() {
+        // A Cloud machine's catalog is checked when it runs, not here.
+        if let Some(model) = args.model.as_deref().filter(|_| !args.cloud) {
             let models = self.zeron.models_on(harness, Some(&device_id)).await?;
             anyhow::ensure!(
                 models.iter().any(|m| m.id == model),
@@ -1035,6 +1036,7 @@ impl Tools {
         // in agreement.
         if space.is_none()
             && cwd.is_none()
+            && !args.cloud
             && self.zeron.devices().await?.iter().any(|d| {
                 d.id == device_id
                     && d.capabilities
@@ -1050,7 +1052,22 @@ impl Tools {
         if let Some(cwd) = &cwd {
             mutate["cwd"] = json!(cwd);
         }
-        self.zeron.mutate(mutate).await?;
+        if args.cloud {
+            mutate["cloud"] = json!(true);
+        }
+        let created = self.zeron.mutate(mutate).await?;
+        // A Cloud chat's machine and checkout come back from the engine.
+        let (device_id, cwd) = if args.cloud {
+            (
+                created["deviceId"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("the engine didn't name the Cloud machine")?,
+                created["cwd"].as_str().map(str::to_owned).or(cwd),
+            )
+        } else {
+            (device_id, cwd)
+        };
         if let Some(title) = args
             .title
             .as_deref()
@@ -1545,24 +1562,6 @@ impl Tools {
     }
 }
 
-/// Number of ancestors above `chat` (0 for a top-level chat). Bounded so a
-/// corrupt parent cycle cannot spin.
-fn chain_depth(chat: &Chat, chats: &[Chat]) -> usize {
-    let mut depth = 0;
-    let mut next = chat.parent_chat_id.as_deref();
-    while let Some(id) = next {
-        depth += 1;
-        if depth > 64 {
-            break;
-        }
-        next = chats
-            .iter()
-            .find(|c| c.id == id)
-            .and_then(|c| c.parent_chat_id.as_deref());
-    }
-    depth
-}
-
 /// claude-code when it is ready here, else the first ready harness — a
 /// provider that is installed but signed out only when nothing else is.
 fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
@@ -1724,10 +1723,19 @@ mod tests {
                     RpcReply::Value(json!({ "id": "v:1", "title": params["title"] }))
                 }
                 methods::MUTATE | methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE => {
+                    // A Cloud chat gets a machine of its own from the engine.
+                    let cloud_create = method == methods::MUTATE
+                        && params["op"] == "createChat"
+                        && params["cloud"] == true;
                     self.writes
                         .lock()
                         .unwrap()
                         .push((method.to_owned(), params));
+                    if cloud_create {
+                        return Ok(RpcReply::Value(json!({
+                            "ok": true, "deviceId": "cloud-child", "cwd": "/home/user/app",
+                        })));
+                    }
                     if method == methods::QUEUE_COMMAND
                         && let Some(barrier) = &self.dispatch_barrier
                     {
@@ -2178,46 +2186,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn any_chat_may_delegate_until_the_depth_limit() {
+    async fn delegation_is_one_level_deep() {
         let world = Arc::new(World {
             beta_parent: Some("chat-alpha-1".into()),
             deep: true,
             ..Default::default()
         });
-        // Alpha → Beta → Gamma → Delta. A side chat used to be barred from
-        // creating chats at all; now it delegates like any other, to a limit.
-        for (from, depth) in [("chat-alpha-1", 0), ("chat-beta-2", 1), ("chat-gamma-3", 2)] {
-            let created = tools(world.clone(), origin(from))
-                .call("create_chat", json!({}))
-                .await
-                .unwrap_or_else(|e| panic!("depth-{depth} chat may delegate: {e}"));
-            assert_eq!(created["parentChatId"], from);
-        }
-        let too_deep = tools(world.clone(), origin("chat-delta-4"))
+        // A top-level chat delegates.
+        let created = tools(world.clone(), origin("chat-alpha-1"))
             .call("create_chat", json!({}))
             .await
-            .unwrap_err();
-        assert!(too_deep.contains("limited to 3 levels"), "{too_deep}");
+            .unwrap();
+        assert_eq!(created["parentChatId"], "chat-alpha-1");
+        // A chat that has a parent creates nothing: no side chat, no
+        // standalone chat, no child of another chat.
+        for (from, args) in [
+            ("chat-beta-2", json!({})),
+            ("chat-beta-2", json!({"kind":"chat"})),
+            ("chat-beta-2", json!({"parent":"Alpha"})),
+            ("chat-delta-4", json!({})),
+        ] {
+            let refused = tools(world.clone(), origin(from))
+                .call("create_chat", args)
+                .await
+                .unwrap_err();
+            assert!(
+                refused.contains("can't create chats of its own"),
+                "{refused}"
+            );
+        }
 
-        // Naming a too-deep parent explicitly is refused the same way, and the
-        // batch form reports it per item.
+        // Naming a delegate as the parent is refused too, and the batch form
+        // reports it per item.
         let root = tools(world.clone(), Origin::default());
         assert!(
-            root.call("create_chat", json!({"parent":"Delta"}))
+            root.call("create_chat", json!({"parent":"Beta"}))
                 .await
                 .unwrap_err()
-                .contains("limited to 3 levels")
+                .contains("itself a delegated chat")
         );
         let batch = root
             .call(
                 "create_chats",
-                json!({"requests":[{"parent":"Delta"}, {"parent":"Alpha"}]}),
+                json!({"requests":[{"parent":"Beta"}, {"parent":"Alpha"}]}),
             )
             .await
             .unwrap();
         let results = batch["results"].as_array().unwrap();
         assert_eq!(results[0]["isError"], true);
         assert_ne!(results[1]["isError"], true);
+        assert!(
+            world
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, w)| w["parentChatId"] != "chat-beta-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cloud_child_runs_on_its_own_machine_with_clouds_agents() {
+        let world = Arc::new(World::default());
+        let alpha = tools(world.clone(), origin("chat-alpha-1"));
+        let created = alpha
+            .call("create_chat", json!({"cloud": true}))
+            .await
+            .unwrap();
+        // The engine names the new machine and its checkout.
+        assert_eq!(created["deviceId"], "cloud-child");
+        assert_eq!(
+            created["harness"], "claude-code",
+            "Cloud's first agent by default"
+        );
+        let sent = world
+            .writes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(method, w)| method == methods::MUTATE && w["op"] == "createChat")
+            .map(|(_, w)| w.clone())
+            .unwrap();
+        assert_eq!(sent["cloud"], true);
+        assert_eq!(sent["parentChatId"], "chat-alpha-1");
+        // Only Cloud's agents.
+        let refused = alpha
+            .call("create_chat", json!({"cloud": true, "harness": "cursor"}))
+            .await
+            .unwrap_err();
+        assert!(refused.contains("Codex and Claude Code"), "{refused}");
     }
 
     #[tokio::test]
@@ -2282,57 +2339,48 @@ mod tests {
             }], "warnings": []})),
             ..Default::default()
         });
-        let side = tools(world.clone(), origin("chat-beta-2"));
-        let listed = side
+        let top = tools(world.clone(), origin("chat-alpha-1"));
+        let listed = top
             .call("list_harnesses", json!({"device":"Worker"}))
             .await
             .unwrap();
         assert_eq!(listed["harnesses"][0]["signedIn"], true);
         assert_eq!(listed["harnesses"][0]["connected"], true);
         assert_eq!(listed["harnesses"][1]["connected"], false);
-        let created = side
+        let created = top
             .call("create_chat", json!({"kind":"side", "device":"Worker"}))
             .await
             .unwrap();
         assert_eq!(created["kind"], "side");
-        assert_eq!(created["parentChatId"], "chat-beta-2");
+        assert_eq!(created["parentChatId"], "chat-alpha-1");
         assert_eq!(created["deviceId"], "dev-remote");
         assert_eq!(created["harness"], "codex");
         assert!(created.get("warning").is_none(), "{created}");
-        // A delegate cannot step out of its own lineage: no standalone chat,
-        // no child of a shallower chat.
-        for args in [
-            json!({"kind":"chat", "device":"Worker"}),
-            json!({"parent":"Alpha", "device":"Worker"}),
-        ] {
-            let refused = side.call("create_chat", args).await.unwrap_err();
-            assert!(refused.contains("side chats of its own"), "{refused}");
+        // Delegates create nothing, whatever the kind or host; the batch
+        // form reports it per item.
+        for from in ["chat-beta-2", "chat-delta-4"] {
+            let batch = tools(world.clone(), origin(from))
+                .call(
+                    "create_chats",
+                    json!({"requests":[
+                        {"kind":"side", "device":"Worker"},
+                        {"kind":"chat", "device":"Worker"},
+                        {"parent":"Alpha", "device":"Worker"}
+                    ]}),
+                )
+                .await
+                .unwrap();
+            for result in batch["results"].as_array().unwrap() {
+                assert_eq!(result["isError"], true);
+                assert!(
+                    result["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("can't create chats of its own"),
+                    "{result}"
+                );
+            }
         }
-        let deepest = tools(world.clone(), origin("chat-delta-4"));
-        let batch = deepest
-            .call(
-                "create_chats",
-                json!({"requests":[
-                    {"kind":"side", "device":"Worker"},
-                    {"kind":"chat", "device":"Worker"}
-                ]}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(batch["results"][0]["isError"], true);
-        assert!(
-            batch["results"][0]["error"]
-                .as_str()
-                .unwrap()
-                .contains("limited to 3 levels")
-        );
-        assert_eq!(batch["results"][1]["isError"], true);
-        assert!(
-            batch["results"][1]["error"]
-                .as_str()
-                .unwrap()
-                .contains("side chats of its own")
-        );
         let reads = world.reads.lock().unwrap();
         assert!(
             reads

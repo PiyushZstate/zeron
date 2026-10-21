@@ -23,7 +23,17 @@ export const runnerRefusal = (auth: Verified, method: string, url: URL): string 
   if (auth.kind !== "runner") return undefined;
   const parts = url.pathname.split("/").filter(Boolean);
   const root = parts[0] ?? "";
-  if (root === "auth" || root === "cloud") return "runner tokens cannot manage the account";
+  if (root === "auth") return "runner tokens cannot manage the account";
+  if (root === "cloud") {
+    // Delegation: a runner starts, wakes, sleeps and deletes Cloud sessions
+    // for the chat it hosts — the CloudAccount checks each is its own child.
+    // Everything else under /cloud is the user's.
+    const sessions = parts[2] === "sessions";
+    if (sessions && parts.length === 3 && method === "POST") return undefined;
+    if (sessions && parts.length === 4 && method === "DELETE") return undefined;
+    if (sessions && parts.length === 5 && method === "POST" && (parts[4] === "wake" || parts[4] === "sleep")) return undefined;
+    return "runner tokens cannot manage the account";
+  }
   if (LEGACY_ROOTS.has(root)) return "runner tokens cannot use the legacy rooms";
   switch (root) {
     case "vault":
@@ -34,8 +44,12 @@ export const runnerRefusal = (auth: Verified, method: string, url: URL): string 
     case "device":
       if (parts[1] === auth.deviceId) return undefined;
       // Another device's room is that device's RPC surface (terminals,
-      // files, sidecars): read-only liveness only.
+      // files, sidecars): read-only liveness, and — for the machine of a
+      // delegate it started (checked by runnerDeviceGate) — a client link
+      // and the command nudge. Never the host role.
       if (parts[2] === "status" && parts.length === 3 && method === "GET") return undefined;
+      if (parts[2] === "ws" && parts.length === 3 && (url.searchParams.get("role") ?? "client") === "client") return undefined;
+      if (parts[2] === "nudge" && parts.length === 3 && method === "POST") return undefined;
       return "a runner may only use its own device room";
     case "registry":
       // Row sync only; stats (push targets/log), APNs targets (notification
