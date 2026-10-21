@@ -1064,6 +1064,12 @@ impl Pickers {
         }
         let draft_owner = state.read(cx).selected_chat.clone();
         let space_owner = state.read(cx).selected_space.clone();
+        // A Cloud project runs nowhere else — from the first frame too, not
+        // only after a project switch (see the state observer).
+        let starts_on_cloud = state
+            .read(cx)
+            .selected_space_row()
+            .is_some_and(|space| zeron_proto::is_cloud_device(&space.device_id, ""));
         let device_owner = state.read(cx).effective_device_id();
         let catalog_owner = Self::catalog_device(state.read(cx));
         Self {
@@ -1084,7 +1090,14 @@ impl Pickers {
             compact_motion: compact::CompactMotion::default(),
             compact_keyboard: false,
             effort_bounds: None,
-            config: DraftConfig::default(),
+            config: DraftConfig {
+                checkout: if starts_on_cloud {
+                    CheckoutKind::Cloud
+                } else {
+                    CheckoutKind::default()
+                },
+                ..DraftConfig::default()
+            },
             title,
             defaults,
             data_dir,
@@ -1933,21 +1946,37 @@ impl Pickers {
         }
         // Cloud picked: the branches the session can start from are the
         // repository's on GitHub (the machine clones it), not this folder's.
-        let cloud = if self.config.checkout == CheckoutKind::Cloud {
-            match self.cloud_repo(cx) {
-                Some(repo) => Some(repo),
-                None => {
-                    // The project's repository is no longer one Cloud reaches.
-                    self.config.checkout = CheckoutKind::Local;
-                    self.config.branch = None;
-                    None
+        // A project that lives on Cloud has no folder anywhere to read (its
+        // device is Cloud itself, with no engine to answer): it always lists
+        // GitHub's branches — by the project's own repository name while
+        // Cloud's repository list is still loading.
+        let on_cloud = zeron_proto::is_cloud_device(&space.device_id, "");
+        let cloud: Option<(String, Option<String>)> =
+            if self.config.checkout == CheckoutKind::Cloud || on_cloud {
+                match self.cloud_repo(cx) {
+                    Some(repo) => Some((repo.full_name, Some(repo.default_branch))),
+                    None if on_cloud => match space.github_repo.clone() {
+                        Some(name) => Some((name, None)),
+                        None => return,
+                    },
+                    None => {
+                        // The project's repository is no longer one Cloud reaches.
+                        self.config.checkout = CheckoutKind::Local;
+                        self.config.branch = None;
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         let key = match &cloud {
-            Some(repo) => format!("cloud:{}", repo.full_name),
+            // The default branch joins the key: once Cloud's repository list
+            // lands, the rows reload with it first and tagged.
+            Some((name, default)) => format!(
+                "cloud:{}:{}",
+                name.to_ascii_lowercase(),
+                default.as_deref().unwrap_or("")
+            ),
             None => space.id.clone(),
         };
         let fresh = self.refs_space.as_deref() == Some(key.as_str());
@@ -1976,14 +2005,14 @@ impl Pickers {
         self.refs_space = Some(key);
         self.refs_task = Some(cx.spawn(async move |this, cx| {
             let result = match cloud {
-                Some(repo) => {
+                Some((repo, default_branch)) => {
                     engine
                         .client()
                         .call(
                             methods::LIST_CLOUD_BRANCHES,
                             serde_json::json!({
-                                "repo": repo.full_name,
-                                "defaultBranch": repo.default_branch,
+                                "repo": repo,
+                                "defaultBranch": default_branch,
                             }),
                         )
                         .await
@@ -6923,6 +6952,55 @@ mod tests {
             "capabilities": capabilities,
         }))
         .unwrap()
+    }
+
+    /// A project on Cloud has no folder to read — its device is Cloud itself,
+    /// which has no engine — so its refs are GitHub's, even before Cloud's
+    /// repository list has loaded.
+    #[gpui::test]
+    fn a_cloud_project_lists_github_branches_before_its_repositories_load(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+        let (_replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+        let pickers = cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.local_device_id = Some("mac".into());
+                state.spaces.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "cloud-project", "deviceId": "cloud-account", "path": "acme/app",
+                        "gitDetected": true, "githubRepo": "acme/app",
+                        "createdAt": "2026-09-01T00:00:00Z",
+                    }))
+                    .unwrap(),
+                );
+                state.selected_space = Some("cloud-project".into());
+                state.set_test_engine(EngineHandle::from_test_client(zeron_rpc::RpcClient::new(
+                    out, inbound,
+                )));
+                state
+            });
+            let pickers = cx.new(|cx| Pickers::new(state, cx));
+            pickers.update(cx, |pickers, cx| pickers.ensure_refs(true, cx));
+            pickers
+        });
+        cx.run_until_parked();
+        let sent = requests.try_recv().expect("a refs request went out");
+        assert!(sent.contains("ListCloudBranches") && sent.contains("acme/app"), "{sent}");
+        cx.update(|cx| {
+            assert_ne!(
+                pickers.read(cx).config.checkout,
+                CheckoutKind::Local,
+                "a Cloud project never falls back to a checkout it doesn't have"
+            );
+        });
     }
 
     #[gpui::test]
