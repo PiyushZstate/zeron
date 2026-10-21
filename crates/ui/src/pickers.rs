@@ -2720,9 +2720,21 @@ impl Pickers {
     }
 
     /// Whether a new session will run on Cloud (its own machine), not on the
-    /// project's device.
+    /// project's device. A project that lives on Cloud runs there even before
+    /// Cloud's repository list has loaded (the engine takes the repository
+    /// from the project itself).
     pub fn runs_on_cloud(&self, cx: &App) -> bool {
-        self.config.checkout == CheckoutKind::Cloud && self.cloud_repo(cx).is_some()
+        self.config.checkout == CheckoutKind::Cloud
+            && (self.cloud_repo(cx).is_some() || self.cloud_project(cx))
+    }
+
+    /// The selected project lives on Cloud: no folder anywhere but a Cloud
+    /// machine's, so no checkout to pick.
+    fn cloud_project(&self, cx: &App) -> bool {
+        self.state
+            .read(cx)
+            .selected_space_row()
+            .is_some_and(|space| zeron_proto::is_cloud_device(&space.device_id, ""))
     }
 
     /// The checkout menu's rows: this folder or a new worktree (Cloud is a
@@ -2746,7 +2758,7 @@ impl Pickers {
     /// The on-send checkout action for a new session in the selected
     /// project (Cloud only while Cloud still reaches the repository).
     pub fn session_checkout_plan(&self, cx: &App) -> CheckoutPlan {
-        if self.config.checkout == CheckoutKind::Cloud && self.cloud_repo(cx).is_none() {
+        if self.config.checkout == CheckoutKind::Cloud && !self.runs_on_cloud(cx) {
             return CheckoutPlan::CurrentCheckout { branch: None };
         }
         self.checkout_plan()
@@ -6995,11 +7007,19 @@ mod tests {
         let sent = requests.try_recv().expect("a refs request went out");
         assert!(sent.contains("ListCloudBranches") && sent.contains("acme/app"), "{sent}");
         cx.update(|cx| {
-            assert_ne!(
-                pickers.read(cx).config.checkout,
-                CheckoutKind::Local,
-                "a Cloud project never falls back to a checkout it doesn't have"
+            let pickers = pickers.read(cx);
+            assert_eq!(
+                pickers.config.checkout,
+                CheckoutKind::Cloud,
+                "a Cloud project starts on Cloud and never falls back to a checkout"
             );
+            // No "Current checkout / New worktree" chip, and a send runs on
+            // Cloud, before Cloud's repository list has loaded.
+            assert!(pickers.runs_on_cloud(cx));
+            assert!(matches!(
+                pickers.session_checkout_plan(cx),
+                CheckoutPlan::Cloud { .. }
+            ));
         });
     }
 
