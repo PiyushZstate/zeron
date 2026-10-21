@@ -38,6 +38,9 @@ DOCKERFILE
 fi
 
 echo "building zeron $VERSION for linux-x86_64"
+# RUSTUP_TOOLCHAIN: the image's own stable, not rust-toolchain.toml — its
+# rustfmt/clippy components (unneeded for a build) make rustup update the
+# toolchain in place, which fails on the image's overlay filesystem.
 docker run --rm --platform linux/amd64 \
   -v "$ROOT:/src" \
   -v zeron-linux-dev-target:/target \
@@ -45,6 +48,7 @@ docker run --rm --platform linux/amd64 \
   -v zeron-linux-dev-git:/opt/cargo/git \
   -e CARGO_TARGET_DIR=/target \
   -e CARGO_PROFILE_RELEASE_LTO=off \
+  -e RUSTUP_TOOLCHAIN=stable \
   -w /src "$IMAGE" \
   sh -c "cargo build --release -p zeron && cp /target/release/zeron /src/target/package-dev/zeron.linux-x86_64 && cp /target/release/zeron-engine /src/target/package-dev/zeron-engine.linux-x86_64"
 
