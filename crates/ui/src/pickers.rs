@@ -777,6 +777,9 @@ pub struct Pickers {
     /// Space the branch draft/cache belong to (see the state observer).
     space_owner: Option<String>,
     device_owner: Option<String>,
+    /// The device whose harness/model catalogs are loaded (see
+    /// [`Self::catalog_device`]).
+    catalog_owner: Option<String>,
     target_generation: u64,
     menu_geometry: HashMap<PickerKind, popover::MenuGeometry>,
     model_trigger_bounds: Option<gpui::Bounds<gpui::Pixels>>,
@@ -998,12 +1001,15 @@ impl Pickers {
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
             }
-            // Catalogs are per-DEVICE (fetched from the space's host), so a
-            // project switch on the same device keeps them. A device switch
-            // revalidates against the new host with the loaded rows still on
-            // screen, so the model chip never blanks; in-flight loads for
-            // the old host are discarded by the generation bump and restart.
-            if device_changed {
+            // Catalogs are per-DEVICE (fetched from the host that runs the
+            // agents), so a project switch on the same device keeps them. A
+            // device switch revalidates against the new host with the loaded
+            // rows still on screen, so the model chip never blanks; in-flight
+            // loads for the old host are discarded by the generation bump and
+            // restart.
+            let catalog = Self::catalog_device(state.read(cx));
+            if catalog != this.catalog_owner {
+                this.catalog_owner = catalog;
                 this.target_generation = this.target_generation.wrapping_add(1);
                 this.load_task = None;
                 this.harnesses_revalidating = false;
@@ -1059,10 +1065,12 @@ impl Pickers {
         let draft_owner = state.read(cx).selected_chat.clone();
         let space_owner = state.read(cx).selected_space.clone();
         let device_owner = state.read(cx).effective_device_id();
+        let catalog_owner = Self::catalog_device(state.read(cx));
         Self {
             state,
             space_owner,
             device_owner,
+            catalog_owner,
             target_generation: 0,
             menu_geometry: HashMap::new(),
             model_trigger_bounds: None,
@@ -1205,8 +1213,20 @@ impl Pickers {
             return Some(cloud);
         }
         let state = self.state.read(cx);
-        let device = state.effective_device_id()?;
+        let device = Self::catalog_device(state)?;
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
+    }
+
+    /// The device that runs the agents the picker offers: an open chat's own
+    /// host — a Cloud chat runs Cloud's agents, a chat on another computer
+    /// that computer's, whatever the new-chat composer targets — else the
+    /// composer's target device.
+    fn catalog_device(state: &AppState) -> Option<String> {
+        state
+            .selected_chat_row()
+            .map(|chat| chat.device_id.clone())
+            .filter(|device| !device.is_empty())
+            .or_else(|| state.effective_device_id())
     }
 
     /// Effective harness: picked, or the chat's config, or the first listed.
@@ -6753,6 +6773,45 @@ mod tests {
                 .child(div().track_focus(&self.neutral))
                 .child(self.pickers.clone())
         }
+    }
+
+    #[gpui::test]
+    fn an_open_chat_offers_the_agents_of_its_own_host(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.local_device_id = Some("mac".into());
+            state.chats.push(serde_json::from_value(serde_json::json!({
+                "id":"cloud-chat", "deviceId":"cloud-machine", "archived":false,
+                "createdAt":"2026-09-01T00:00:00Z",
+            })).unwrap());
+            state
+        });
+        let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        // The new-chat composer targets this Mac: its own catalogs.
+        pickers.read_with(cx, |pickers, cx| assert_eq!(pickers.space_target(cx), None));
+        // An open Cloud chat switches among Cloud's agents, not this Mac's —
+        // the composer's own target stays where it was.
+        state.update(cx, |state, cx| {
+            state.selected_chat = Some("cloud-chat".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        pickers.read_with(cx, |pickers, cx| {
+            assert_eq!(pickers.space_target(cx).as_deref(), Some("cloud-machine"));
+            assert_eq!(pickers.catalog_owner.as_deref(), Some("cloud-machine"));
+        });
+        assert_eq!(
+            state.read_with(cx, |state, _| state.effective_device_id()).as_deref(),
+            Some("mac")
+        );
+        // Back on the new-chat canvas, the Mac's catalogs again.
+        state.update(cx, |state, cx| {
+            state.selected_chat = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        pickers.read_with(cx, |pickers, cx| assert_eq!(pickers.space_target(cx), None));
     }
 
     #[gpui::test]
