@@ -984,10 +984,11 @@ pub struct RelayActivity {
 
 impl RelayActivity {
     /// Wrap the relay-served RPC service so every request a remote device
-    /// makes counts, except the relay's own liveness traffic
-    /// ([`zeron_rpc::is_liveness_probe`]). A watch stream counts once, when
-    /// opened: its continuation frames never re-enter the service, and echo
-    /// keepalives are relay-control frames that never reach it at all.
+    /// makes counts — except the relay's own liveness traffic
+    /// ([`zeron_rpc::is_liveness_probe`]) and requests that only look
+    /// ([`passive`]): an app merely open on a Cloud chat lists, reads and
+    /// watches, and must not keep the machine awake (and billed). Echo
+    /// keepalives are relay-control frames that never reach the service.
     pub fn wrap(&self, inner: Arc<dyn zeron_rpc::RpcService>) -> Arc<dyn zeron_rpc::RpcService> {
         Arc::new(CountingService {
             inner,
@@ -1023,11 +1024,41 @@ impl zeron_rpc::RpcService for CountingService {
         method: &str,
         params: serde_json::Value,
     ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
-        if !zeron_rpc::is_liveness_probe(method, &params) {
+        if !zeron_rpc::is_liveness_probe(method, &params) && !passive(method) {
             self.activity.note();
         }
         self.inner.handle(method, params).await
     }
+}
+
+/// Requests that only look — catalogs, lists, reads, searches, watches,
+/// probes, status — as opposed to someone doing something: sending,
+/// typing in a terminal, writing a file, running an action. Only the latter
+/// keep a Cloud machine from its idle sleep (a turn in flight keeps it awake
+/// on its own).
+pub fn passive(method: &str) -> bool {
+    const LOOKS: &[&str] = &[
+        "List",
+        "Watch",
+        "Get",
+        "Search",
+        "Read",
+        "Probe",
+        "Sync",
+        "Engine",
+        "Local",
+        "Fetch",
+        "Resolve",
+        "Warm",
+        "Check",
+        "Subscribe",
+        "Auth",
+        "Release",
+        "Focus",
+        "UpdateStatus",
+    ];
+    LOOKS.iter().any(|prefix| method.starts_with(prefix))
+        || method == zeron_rpc::methods::SET_VIEWPORT_FOCUS
 }
 
 /// Post `{activeRuns, clients}` to `{edge}/runner/heartbeat` every `every`
@@ -1485,6 +1516,40 @@ mod tests {
             key.verify(forged.as_bytes(), &B64URL.decode(&grant.sig).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn only_doing_something_keeps_a_cloud_machine_awake() {
+        use zeron_rpc::methods;
+        for method in [
+            methods::LIST_REFS,
+            methods::WATCH_DOC_MESSAGES,
+            methods::WATCH_WORKSPACE_GIT_STATUS,
+            methods::READ_WORKSPACE_FILE,
+            methods::SEARCH_WORKSPACE_FILES,
+            methods::GET_CHECKOUT_DIFF,
+            methods::LIST_MODELS,
+            methods::SUBSCRIBE_TERMINAL,
+            methods::FETCH_TOOL_BLOB,
+            methods::SET_VIEWPORT_FOCUS,
+            methods::ENGINE_INFO,
+        ] {
+            assert!(passive(method), "{method} only looks");
+        }
+        for method in [
+            methods::QUEUE_MESSAGE,
+            methods::QUEUE_COMMAND,
+            methods::SEND_QUEUED_MESSAGE_NOW,
+            methods::MUTATE,
+            methods::WRITE_TERMINAL,
+            methods::OPEN_TERMINAL,
+            methods::WRITE_WORKSPACE_FILE,
+            methods::RUN_PROJECT_ACTION,
+            methods::SWITCH_REF,
+            methods::UPLOAD_CHUNK,
+        ] {
+            assert!(!passive(method), "{method} is someone doing something");
+        }
     }
 
     #[test]

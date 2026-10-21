@@ -151,7 +151,7 @@
     // while the device is busy). Remove on a paid plan: idle sleep
     // (CLOUD_IDLE_MINUTES) is ours.
     "CLOUD_TTL_SECONDS": "7200",
-    "CLOUD_IDLE_MINUTES": "20",
+    "CLOUD_IDLE_MINUTES": "10",
     // Most sessions per user whose machines may run at once; waking another
     // first sleeps the least recently active idle one.
     "CLOUD_MAX_AWAKE": "5",
@@ -197,7 +197,7 @@
         "AUTH_MODE": "workos",
         "SANDBOX_PROVIDER": "boat",
         "CLOUD_TTL_SECONDS": "7200",
-        "CLOUD_IDLE_MINUTES": "20",
+        "CLOUD_IDLE_MINUTES": "10",
         "CLOUD_MAX_AWAKE": "5",
         "CLOUD_MACHINE": "default",
         "CLOUD_TEMPLATE": "zeron-cloud-dev",

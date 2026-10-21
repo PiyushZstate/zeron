@@ -77,7 +77,7 @@ catalog restricted to Codex + Claude Code, so opening a composer never wakes a s
    repository with its GitHub grant (public repositories need none) and only then drains the
    chat's commands. With `CLOUD_TEMPLATE` set, sandboxes start from that named snapshot (engine
    pre-installed, no identity) instead of installing.
-3. **Sleep.** After `CLOUD_IDLE_MINUTES` without activity (no turn running, no relay requests)
+3. **Sleep.** After `CLOUD_IDLE_MINUTES` without activity (no turn running, no one doing anything on it)
    the session's sandbox is stopped. Archiving a chat lets it sleep.
 4. **Wake.** A send to the chat nudges its host device; a nudge to a sleeping session device
    wakes it, and the queued command runs once the engine reconnects. Merely viewing a sleeping
@@ -233,14 +233,21 @@ never forced.
 **DeleteWorkflow** — revoke the runner and its vault enrollment → `stop` → wait until stopped →
 read and persist final usage (it must report `running: false`; usage is unreadable after
 deletion) → `delete` → `off`. A refused stop leaves `error` + `failedAction: "delete"`; a
-second DELETE resumes. The finished delete tombstones the session's device row in its user's
+second DELETE resumes — and so does the DO on its own: a failed delete retries after 1, 5 and 15
+minutes, then hourly (`deleteRetryAt`), and one stuck mid-way (a lost workflow) resumes after 5
+minutes. Every 10 minutes the DO also checks each machine against its chat (`sweepOrphans`, via the
+registry's `/chat-host`): a machine whose chat row is gone — deleted on any device, the client's
+follow-up DELETE lost, or a row that never landed — is deleted once its session is 15 minutes old.
+A registry it can't read skips the pass; it never deletes on doubt. The finished delete tombstones the session's device row in its user's
 registry: no device lists it, and the dial gate (`WorkspaceHost::peer_liveness`) reads a deleted
 device as dark, so nothing dials it again.
 
 Idle policy: the runner posts `POST /runner/heartbeat {activeRuns, clients}` every 60 s, where
-`clients` counts relay requests it served since the previous heartbeat (open links and watch
-streams alone don't count, so a laptop merely displaying a Cloud chat doesn't keep it awake).
-The DO alarm puts the device to sleep after `CLOUD_IDLE_MINUTES` (default 20) without activity.
+`clients` counts interactive relay requests it served since the previous heartbeat — sends, terminal
+input, file writes, actions — never requests that only look (lists, reads, searches, watches, status:
+`runner::passive`), and never open links or streams, so an app merely displaying a Cloud chat
+doesn't keep its machine awake.
+The DO alarm puts the device to sleep after `CLOUD_IDLE_MINUTES` (default 10) without activity.
 When the provider requires auto-stop (Boat trial: ≤2 h), the DO re-extends the TTL while runs
 are active, and a provider-initiated stop is detected and recorded as sleep.
 
@@ -601,7 +608,7 @@ provider for orphan sandboxes (logged as `{"event":"cloud.orphan", provider, san
 | `BOAT_API_KEY` | main Worker | Boat API. Scoped key with `sandbox.create`, `.read`, `.update`, `.stop`, `.resume`, `.delete` and `exec` |
 | `SANDBOX_PROVIDER` | main Worker var | provider for new sandboxes (`boat`; `fake` for local dev) |
 | `CLOUD_TTL_SECONDS` | main Worker var | unset on a paid plan (no auto-stop); `7200` on a Boat trial |
-| `CLOUD_IDLE_MINUTES` | main Worker var | idle sleep threshold (default 20) |
+| `CLOUD_IDLE_MINUTES` | main Worker var | idle sleep threshold (default 10) |
 | `RUNNER_JWT_PRIVATE_KEY` / `RUNNER_JWT_PUBLIC_KEY` | main Worker | ES256 runner tokens (JWK JSON; add a `kid` to rotate) |
 | `ADMIN_TOKEN` | main Worker | operator usage export (`/admin/cloud/usage`); route 404s when unset |
 | `VAULT_KEK` / `VAULT_KEK_PREVIOUS` | vault | record-encryption key (base64, 32 bytes) and the one being rotated out; keep an offline backup — secrets can't be read back |

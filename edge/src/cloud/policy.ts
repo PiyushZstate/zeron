@@ -163,5 +163,5 @@ export const planEviction = (
 
 export const parseIdleMs = (raw: string | undefined): number => {
   const minutes = Number(raw);
-  return (Number.isFinite(minutes) && minutes > 0 ? minutes : 20) * 60_000;
+  return (Number.isFinite(minutes) && minutes > 0 ? minutes : 10) * 60_000;
 };

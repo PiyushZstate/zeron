@@ -287,6 +287,8 @@ interface AccountRecord {
   /** A failed sweep of deleted sessions' devices retries then
    * (`sweepStaleDevices`). */
   sweepDevicesAt?: number;
+  /** The next check for machines whose chat is gone (`sweepOrphans`). */
+  nextOrphanSweepAt?: number;
   /** Logical device ids of earlier times Cloud was on (each turn-off
    * revokes one). Connections still authorized for them move to the new
    * one on enable. Survives turning Cloud off. */
@@ -343,6 +345,10 @@ interface SessionRecord {
   /** A delegate: the chat whose machine started this session. One level
    * only — a child never starts children of its own. */
   parentChatId?: string;
+  /** Failed deletes so far, and when the next one runs on its own: a
+   * machine nobody can reach must not stay billed until someone retries. */
+  deleteAttempts?: number;
+  deleteRetryAt?: number;
 }
 
 const ACCOUNT_KEY = "account";
@@ -353,6 +359,13 @@ const CREDIT_CHECK_MS = 5 * 60_000;
 const SESSION_PREFIX = "session:";
 /** A delete that crashed mid-way may be retried after this long. */
 const DELETE_STUCK_MS = 5 * 60_000;
+/** Waits before retrying a failed delete on its own; the last repeats. */
+const DELETE_RETRY_MS = [60_000, 5 * 60_000, 15 * 60_000, 60 * 60_000];
+/** How often machines are checked against their chats, and how old a
+ * session must be before a missing chat row counts as deleted (the laptop
+ * writes the row after the session starts). */
+const ORPHAN_SWEEP_MS = 10 * 60_000;
+const ORPHAN_GRACE_MS = 15 * 60_000;
 /** The writer the edge's own registry ops are attributed to (and clocked by). */
 const REGISTRY_WRITER = "cloud-edge";
 /** Mirrors `zeron_proto::CLOUD_SESSION_CAPABILITY` (a session machine's device). */
@@ -432,6 +445,13 @@ export class CloudAccount extends DurableObject<Env> {
     const due: number[] = [];
     for (const s of this.sessions.values()) {
       if (s.state === "ready" && s.idleCheckAt !== undefined) due.push(s.idleCheckAt);
+      if (s.deleteRetryAt !== undefined) due.push(s.deleteRetryAt);
+      if (s.state === "deleting") due.push((s.deletingSince ?? 0) + DELETE_STUCK_MS);
+    }
+    // While any machine exists, it is checked against its chat.
+    if (this.sessions.size > 0) {
+      this.acct.nextOrphanSweepAt ??= Date.now() + ORPHAN_SWEEP_MS;
+      due.push(this.acct.nextOrphanSweepAt);
     }
     if (this.acct.nextReconcileAt !== undefined) due.push(this.acct.nextReconcileAt);
     if (this.acct.sweepDevicesAt !== undefined) due.push(this.acct.sweepDevicesAt);
@@ -652,7 +672,7 @@ export class CloudAccount extends DurableObject<Env> {
     error: string,
     message: string
   ): Promise<CloudResult<CloudSessionView>> {
-    if (s.state === "deleting") s.pendingDelete = true;
+    if (s.state === "deleting") this.noteDeleteFailure(s);
     s.state = "error";
     s.error = message;
     s.failedAction = action;
@@ -902,6 +922,68 @@ export class CloudAccount extends DurableObject<Env> {
     // while the machine is still booting, and must queue, not 404.
     await this.claimDeviceRoom(s.deviceId, caller.userId);
     return this.beginProvision(caller, s, edgeUrl);
+  }
+
+  /** A delete failed: it stays pending, and retries on its own with backoff. */
+  private noteDeleteFailure(s: SessionRecord): void {
+    s.pendingDelete = true;
+    const attempts = (s.deleteAttempts ?? 0) + 1;
+    s.deleteAttempts = attempts;
+    s.deleteRetryAt = Date.now() + DELETE_RETRY_MS[Math.min(attempts, DELETE_RETRY_MS.length) - 1]!;
+  }
+
+  /** The account as caller, for deletes nobody is waiting on. */
+  private systemCaller(): CloudCaller | undefined {
+    const { orgId, userId } = this.acct;
+    return orgId && userId ? { orgId, userId } : undefined;
+  }
+
+  /** Failed deletes whose retry is due, and deletes stuck mid-way (a lost
+   * workflow): run them again. */
+  private async retryDeletes(now: number): Promise<void> {
+    const caller = this.systemCaller();
+    if (!caller) return;
+    for (const s of [...this.sessions.values()]) {
+      const due = s.pendingDelete && s.deleteRetryAt !== undefined && now >= s.deleteRetryAt;
+      const stuck = s.state === "deleting" && now - (s.deletingSince ?? 0) >= DELETE_STUCK_MS;
+      if (due || stuck) {
+        this.ledger("delete", s, { detail: stuck ? "resuming a stuck delete" : `retry ${s.deleteAttempts ?? 1}` });
+        await this.beginDelete(caller, s);
+      }
+    }
+  }
+
+  /**
+   * Machines whose chat is gone — deleted on any device, from any client,
+   * even if the delete call that should have followed never arrived — are
+   * deleted here. A session younger than the grace period may still be
+   * waiting for its row. Registry trouble skips a pass, never deletes.
+   */
+  private async sweepOrphans(now: number): Promise<void> {
+    const caller = this.systemCaller();
+    const { orgId, userId } = this.acct;
+    if (!caller || !orgId || !userId) return;
+    const room = this.env.REGISTRY_ROOMS.get(this.env.REGISTRY_ROOMS.idFromName(`reg1/${orgId}/${userId}`));
+    for (const s of [...this.sessions.values()]) {
+      if (s.state === "deleting" || s.pendingDelete || now - s.createdAt < ORPHAN_GRACE_MS) continue;
+      let host: unknown;
+      try {
+        const reply = await room.fetch(
+          new Request(`https://registry/chat-host?chat=${encodeURIComponent(s.chatId)}`, {
+            headers: { [AUTH_USER_HEADER]: userId }
+          })
+        );
+        if (!reply.ok) throw new Error(`HTTP ${reply.status}`);
+        host = ((await reply.json()) as { deviceId?: unknown }).deviceId;
+      } catch (e) {
+        console.warn("cloud: orphan sweep skipped; registry unavailable", String(e));
+        return;
+      }
+      if (host === null || host === undefined) {
+        this.ledger("delete", s, { detail: "its chat is gone" });
+        await this.beginDelete(caller, s);
+      }
+    }
   }
 
   /**
@@ -1185,6 +1267,7 @@ export class CloudAccount extends DurableObject<Env> {
     const params = this.lifecycleParams(s);
     s.state = "deleting";
     s.deletingSince = Date.now();
+    s.deleteRetryAt = undefined;
     s.generation++; // in-flight workflows' reports are void from here on
     s.runnerKey = undefined;
     s.enrollHash = undefined;
@@ -1402,6 +1485,11 @@ export class CloudAccount extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     const now = Date.now();
+    await this.retryDeletes(now);
+    if (this.acct.nextOrphanSweepAt !== undefined && now >= this.acct.nextOrphanSweepAt) {
+      this.acct.nextOrphanSweepAt = now + ORPHAN_SWEEP_MS;
+      await this.sweepOrphans(now);
+    }
     for (const s of [...this.sessions.values()]) {
       if (s.state !== "ready" || s.idleCheckAt === undefined || now < s.idleCheckAt) continue;
       const decision = idleDecision({
@@ -1802,7 +1890,7 @@ export class CloudAccount extends DurableObject<Env> {
     const s = this.current(chatId, generation);
     if (!s) return false;
     s.state = "error";
-    s.pendingDelete = true;
+    this.noteDeleteFailure(s);
     s.error = message;
     s.failedAction = "delete";
     this.ledger("error", s, { detail: message });
@@ -1814,6 +1902,7 @@ export class CloudAccount extends DurableObject<Env> {
     const s = this.current(chatId, generation);
     if (!s) return false;
     const kind = s.workflow?.kind;
+    if (kind === "delete") this.noteDeleteFailure(s);
     s.state = "error";
     s.error = message;
     s.failedAction = kind ? ACTION_OF[kind] : undefined;

@@ -59,9 +59,9 @@ describe("TTL extension and config parsing", () => {
     expect(parseTtlSeconds("null")).toBeNull();
     expect(parseTtlSeconds("7200")).toBe(7200);
     expect(parseTtlSeconds("-1")).toBeNull();
-    expect(parseIdleMs(undefined)).toBe(20 * 60_000);
+    expect(parseIdleMs(undefined)).toBe(10 * 60_000);
     expect(parseIdleMs("5")).toBe(5 * 60_000);
-    expect(parseIdleMs("nope")).toBe(20 * 60_000);
+    expect(parseIdleMs("nope")).toBe(10 * 60_000);
   });
   it("derives deterministic workflow ids per (device, generation)", () => {
     expect(workflowInstanceId("provision", "cloud-abc", 3)).toBe("prov-cloud-abc-3");
