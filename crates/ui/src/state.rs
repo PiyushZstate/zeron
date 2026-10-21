@@ -525,7 +525,11 @@ impl EngineHandle {
                 device_id: "local".into(),
                 workspace_scope: WorkspaceScope::Local,
                 cursor_sdk_version: None,
-                capabilities: Vec::new(),
+                // What a current engine advertises.
+                capabilities: zeron_proto::capabilities::CURRENT
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect(),
             },
             deferred_state: None,
         }
@@ -3259,7 +3263,11 @@ impl AppState {
         }
         !self.unsaved_side_chat
             && self.selected_chat.as_ref().is_some_and(|id| {
-                !self.pending_sends.contains_key(id) && !self.chat_turn_running(id)
+                !self.pending_sends.contains_key(id)
+                    && !self.chat_turn_running(id)
+                    // An older host would resume the chat's stored session
+                    // under the new provider.
+                    && self.chat_host_supports(id, zeron_proto::capabilities::PROVIDER_SWITCH_V1)
             })
     }
 

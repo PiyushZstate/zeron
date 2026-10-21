@@ -6896,6 +6896,8 @@ mod tests {
         }))
         .unwrap();
         let state = cx.new(|cx| AppState::side_chat_state(&parent, chat, unsaved, cx));
+        // The chat's host switches providers (an older one couldn't).
+        state.update(cx, |state, _| state.devices = vec![host_device(true)]);
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
         pickers.update(cx, |pickers, _| {
             pickers.harnesses = Loadable::Ready(vec![
@@ -6908,6 +6910,43 @@ mod tests {
             );
         });
         (state, pickers)
+    }
+
+    fn host_device(switches: bool) -> zeron_proto::Device {
+        let capabilities: Vec<&str> = if switches {
+            vec![zeron_proto::capabilities::PROVIDER_SWITCH_V1]
+        } else {
+            vec![]
+        };
+        serde_json::from_value(serde_json::json!({
+            "id": "local", "name": "Host", "platform": "macos",
+            "capabilities": capabilities,
+        }))
+        .unwrap()
+    }
+
+    #[gpui::test]
+    fn a_host_without_provider_switching_keeps_the_chat_on_its_provider(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            let (state, pickers) = side_chat_picker(false, cx);
+            state.update(cx, |state, _| state.devices = vec![host_device(false)]);
+            pickers.update(cx, |pickers, cx| {
+                assert!(pickers.harness_locked(cx), "an older host can't switch");
+                assert_eq!(
+                    pickers
+                        .rail_descriptors(cx)
+                        .into_iter()
+                        .map(|d| d.id)
+                        .collect::<Vec<_>>(),
+                    vec![HarnessId::ClaudeCode]
+                );
+            });
+            state.update(cx, |state, _| state.devices = vec![host_device(true)]);
+            assert!(!pickers.read(cx).harness_locked(cx));
+        });
     }
 
     #[gpui::test]

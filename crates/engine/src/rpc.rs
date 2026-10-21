@@ -868,6 +868,27 @@ impl EngineRpc {
         CloudClient::new(edge.url.clone(), org_id, edge.token.clone())
     }
 
+    /// Whether the engine hosting `chat_id` can switch its provider: this one
+    /// can; a peer (a Cloud machine included) says so on its device row.
+    fn host_switches_providers(&self, chat_id: &str) -> bool {
+        let Some(device_id) = self
+            .workspace
+            .chat(chat_id)
+            .ok()
+            .flatten()
+            .map(|chat| chat.device_id)
+        else {
+            return true;
+        };
+        device_id == self.workspace.device_id()
+            || self.workspace.read_devices().is_ok_and(|devices| {
+                devices.iter().any(|device| {
+                    device.id == device_id
+                        && device.supports(zeron_proto::capabilities::PROVIDER_SWITCH_V1)
+                })
+            })
+    }
+
     /// A deleted Cloud chat takes its machine with it (and whatever is
     /// uncommitted there): otherwise the sandbox outlives every way to reach
     /// it. Best-effort and in the background — the chat is already gone. A
@@ -1620,6 +1641,11 @@ impl EngineRpc {
                 if switching && self.sessions.turn_in_flight(&chat_id) {
                     return Err(RpcError::Failed(
                         "Wait for the current turn to finish before switching provider".into(),
+                    ));
+                }
+                if switching && !self.host_switches_providers(&chat_id) {
+                    return Err(RpcError::Failed(
+                        "This chat's computer needs a newer Zeron to switch provider".into(),
                     ));
                 }
                 self.voice.retire_chat(&chat_id);
