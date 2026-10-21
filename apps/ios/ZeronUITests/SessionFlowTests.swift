@@ -513,6 +513,46 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertEqual(app.state, .runningForeground)
     }
 
+    /// Between turns, on a host that switches providers, the model menu moves
+    /// the chat to another provider; an older host's chat keeps its own.
+    func testModelMenuSwitchesProviderWhereTheHostCan() {
+        let app = launch(["-route", "chat:chat-tabs"])
+        let input = app.textViews["composer-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        input.tap()
+        let chip = app.buttons["composer-chip-model"]
+        XCTAssertTrue(chip.waitForExistence(timeout: 5))
+        let before = chip.label
+        chip.tap()
+        // The demo's chat-tabs runs Codex on the Mac.
+        let claude = app.collectionViews.buttons["Claude Code"]
+        XCTAssertTrue(claude.waitForExistence(timeout: 5), "other providers are offered")
+        snapshot(app, "switch-provider-menu")
+        claude.tap()
+        // The submenu's first row is its own header: pick a Claude model.
+        let model = app.collectionViews.buttons
+            .matching(NSPredicate(format: "label BEGINSWITH 'Fable' OR label BEGINSWITH 'Opus' OR label BEGINSWITH 'Sonnet'"))
+            .firstMatch
+        XCTAssertTrue(model.waitForExistence(timeout: 5), "the provider's models load")
+        let picked = model.label.components(separatedBy: ",")[0]
+        model.tap()
+        // The chip names the Claude Code model now.
+        let switched = NSPredicate(format: "label == %@", picked)
+        expectation(for: switched, evaluatedWith: chip)
+        waitForExpectations(timeout: 5)
+        XCTAssertNotEqual(chip.label, before)
+
+        // The studio's engine predates provider switching.
+        let older = launch(["-route", "chat:chat-blog"])
+        let field = older.textViews["composer-input"]
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        field.tap()
+        older.buttons["composer-chip-model"].tap()
+        XCTAssertTrue(older.collectionViews.buttons.element(boundBy: 0).waitForExistence(timeout: 5))
+        XCTAssertFalse(older.staticTexts["Switch provider"].exists, "an older host keeps its provider")
+        XCTAssertFalse(older.collectionViews.buttons["Codex"].exists)
+    }
+
     /// Regression: a drag that starts at the tail re-latched follow at once,
     /// so the list sprang back to the bottom on release while streaming.
     func testScrollingUpWhileStreamingStaysPut() {

@@ -317,6 +317,7 @@ pub(crate) fn devices(self_id: &str, self_name: &str, now: i64) -> Vec<Device> {
             capabilities: if caps {
                 capability::ALL_QUEUE
                     .iter()
+                    .chain([&capability::PROVIDER_SWITCH_V1])
                     .map(|c| (*c).to_owned())
                     .collect()
             } else {

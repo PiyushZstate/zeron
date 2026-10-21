@@ -390,6 +390,7 @@ impl ClientInner {
                 .and_then(zeron_proto::version_triple)
                 .is_some_and(|v| v >= QUEUED_ATTACHMENTS_MIN),
             mid_turn_steering,
+            provider_switch: has(capability::PROVIDER_SWITCH_V1),
         }
     }
 
@@ -803,6 +804,22 @@ impl Client {
     }
 
     pub fn set_session_config(&self, chat_id: &str, config: &ChatConfig) -> Result<()> {
+        // A provider change needs a host that switches: an older one would
+        // resume the chat's stored session under the new provider.
+        if let Some(chat) = self.inner.workspace.chat(chat_id)
+            && chat
+                .config
+                .as_ref()
+                .is_some_and(|current| current.harness != config.harness)
+            && !self
+                .inner
+                .host_capabilities(&chat.device_id, None)
+                .provider_switch
+        {
+            return Err(ClientError::Unsupported(
+                "This chat's computer needs a newer Zeron to switch provider.".into(),
+            ));
+        }
         self.chat_write(chat_id, |doc| doc.set_chat_config(chat_id, config))
     }
 

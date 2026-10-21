@@ -8880,6 +8880,10 @@ public struct HostCapabilities: Equatable, Hashable {
      * The chat's harness steers mid-turn (unknown until a live catalog).
      */
     public var midTurnSteering: Bool?
+    /**
+     * The host moves the chat to another provider between turns.
+     */
+    public var providerSwitch: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -8889,7 +8893,10 @@ public struct HostCapabilities: Equatable, Hashable {
          */queuedAttachments: Bool, 
         /**
          * The chat's harness steers mid-turn (unknown until a live catalog).
-         */midTurnSteering: Bool?) {
+         */midTurnSteering: Bool?, 
+        /**
+         * The host moves the chat to another provider between turns.
+         */providerSwitch: Bool) {
         self.messageQueue = messageQueue
         self.queueActions = queueActions
         self.queueAttachments = queueAttachments
@@ -8897,6 +8904,7 @@ public struct HostCapabilities: Equatable, Hashable {
         self.queueEditLease = queueEditLease
         self.queuedAttachments = queuedAttachments
         self.midTurnSteering = midTurnSteering
+        self.providerSwitch = providerSwitch
     }
 
     
@@ -8921,7 +8929,8 @@ public struct FfiConverterTypeHostCapabilities: FfiConverterRustBuffer {
                 cleanAttachmentText: FfiConverterBool.read(from: &buf), 
                 queueEditLease: FfiConverterBool.read(from: &buf), 
                 queuedAttachments: FfiConverterBool.read(from: &buf), 
-                midTurnSteering: FfiConverterOptionBool.read(from: &buf)
+                midTurnSteering: FfiConverterOptionBool.read(from: &buf), 
+                providerSwitch: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -8933,6 +8942,7 @@ public struct FfiConverterTypeHostCapabilities: FfiConverterRustBuffer {
         FfiConverterBool.write(value.queueEditLease, into: &buf)
         FfiConverterBool.write(value.queuedAttachments, into: &buf)
         FfiConverterOptionBool.write(value.midTurnSteering, into: &buf)
+        FfiConverterBool.write(value.providerSwitch, into: &buf)
     }
 }
 

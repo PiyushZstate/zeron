@@ -14,6 +14,13 @@ final class CoreSessionSource: SessionSource {
     private var hostDevice = "" {
         didSet { if hostDevice != oldValue { connectVisuals() } }
     }
+    /// Between turns, on a host that switches providers, the model menu
+    /// offers the other providers too.
+    private var canSwitchProvider = false
+    /// The host's providers, read ahead: a menu whose top level waits on the
+    /// host doesn't open until it answers.
+    private var hostHarnesses: [HarnessInfo] = []
+    private var harnessesDevice = ""
     private weak var engine: TranscriptView?
 
     init(app: AppModel, client: CoreClient, handle: SessionHandle, chatId: String) {
@@ -51,6 +58,18 @@ final class CoreSessionSource: SessionSource {
         let c = handle.composer()
         let row = app?.row(chatId)
         hostDevice = c.host.deviceId
+        canSwitchProvider = c.host.capabilities.providerSwitch && !c.live.turnRunning
+        if canSwitchProvider, harnessesDevice != hostDevice {
+            let device = hostDevice
+            harnessesDevice = device
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let list = await self.client.listHarnesses(deviceId: device)
+                guard self.hostDevice == device, !list.isEmpty else { return }
+                self.hostHarnesses = list
+                self.onChange?()
+            }
+        }
         var next = SessionChrome()
         next.title = c.title
         let project = row?.project?.name ?? "No project"
@@ -214,7 +233,7 @@ final class CoreSessionSource: SessionSource {
         let harness = row.harness ?? "claude-code"
         switch id {
         case "model":
-            return UIMenu(title: "Model", children: [UIDeferredMenuElement { [weak self] done in
+            var children: [UIMenuElement] = [UIDeferredMenuElement { [weak self] done in
                 guard let self else { return done([]) }
                 Task { @MainActor in
                     let models = (try? await self.client.listModels(deviceId: self.hostDevice, harness: harness)) ?? fallbackModels(harness: harness)
@@ -224,7 +243,15 @@ final class CoreSessionSource: SessionSource {
                         }
                     })
                 }
-            }])
+            }]
+            if canSwitchProvider {
+                // On top: a long model list would otherwise bury it.
+                let others = otherProviders(current: harness, cloud: row.isCloud)
+                if !others.isEmpty {
+                    children.insert(UIMenu(title: "Switch provider", options: .displayInline, children: others), at: 0)
+                }
+            }
+            return UIMenu(title: "Model", children: children)
         case "effort":
             return UIMenu(title: "Reasoning effort", children: [UIDeferredMenuElement { [weak self] done in
                 guard let self else { return done([]) }
@@ -246,6 +273,34 @@ final class CoreSessionSource: SessionSource {
             ])
         default:
             return nil
+        }
+    }
+
+    /// One submenu per other provider the host offers, listing its models;
+    /// a pick moves the chat to that provider and model. Cloud runs Claude
+    /// Code and Codex.
+    private func otherProviders(current: String, cloud: Bool) -> [UIMenuElement] {
+        let harnesses = cloud
+            ? fallbackHarnesses().filter { ["claude-code", "codex"].contains($0.id) }
+            : (hostHarnesses.isEmpty ? fallbackHarnesses() : hostHarnesses).filter(\.offered)
+        return harnesses.filter { $0.id != current }.map { h in
+            UIMenu(title: h.label, image: BrandMarks.image(for: h.id, side: 16), children: [UIDeferredMenuElement { [weak self] done in
+                guard let self else { return done([]) }
+                Task { @MainActor in
+                    let models = (try? await self.client.listModels(deviceId: self.hostDevice, harness: h.id)) ?? fallbackModels(harness: h.id)
+                    done(models.map { m in
+                        UIAction(title: m.label, subtitle: m.description) { [weak self] _ in
+                            self?.setConfig {
+                                $0.harness = h.id
+                                $0.model = m.id
+                                // The old provider's effort and options don't carry over.
+                                $0.reasoning = nil
+                                $0.modelOptions = [:]
+                            }
+                        }
+                    })
+                }
+            }])
         }
     }
 
