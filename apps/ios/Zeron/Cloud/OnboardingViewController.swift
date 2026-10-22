@@ -68,6 +68,11 @@ final class OnboardingViewController: UIViewController {
 
     @MainActor private var cloud: CloudStore { app.cloud }
 
+    /// The edge has answered that this account has no Cloud: its steps
+    /// (GitHub) and lines (Cloud agents) are left out. Unknown counts as
+    /// offered until the status arrives.
+    @MainActor private var cloudWithheld: Bool { cloud.info != nil && !cloud.available }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = Palette.background
@@ -125,6 +130,8 @@ final class OnboardingViewController: UIViewController {
     private var refresher: (() -> Void)?
 
     private func refresh() {
+        // The status arrived while on a Cloud-only step: move past it.
+        if step == .github, cloudWithheld { return go(.agents) }
         refresher?()
         renderFooter()
     }
@@ -136,6 +143,7 @@ final class OnboardingViewController: UIViewController {
     }
 
     private func render(animated: Bool) {
+        if step == .github, cloudWithheld { step = .agents }
         refresher = nil
         renderProgress()
         let content: UIView
@@ -209,7 +217,8 @@ final class OnboardingViewController: UIViewController {
             return
         }
         footer.isHidden = false
-        if let previous = step.previous {
+        if var previous = step.previous {
+            if previous == .github, cloudWithheld { previous = .sync }
             footer.addArrangedSubview(ghost("Back") { [weak self] in self?.go(previous) })
         } else if !app.isSignedIn {
             // Back to the welcome page.
@@ -427,7 +436,11 @@ final class OnboardingViewController: UIViewController {
             check.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
             check.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
         ])
-        let header = CloudUI.header("You're all set", "Pick a project and start a session — on any of your computers, or on Cloud.", alignment: .center)
+        let header = CloudUI.header(
+            "You're all set",
+            cloudWithheld ? "Pick a project and start a session on any of your computers." : "Pick a project and start a session — on any of your computers, or on Cloud.",
+            alignment: .center
+        )
         let summary = UIStackView()
         summary.axis = .vertical
         summary.backgroundColor = Palette.elevated
@@ -438,12 +451,16 @@ final class OnboardingViewController: UIViewController {
             summary.arrangedSubviews.forEach { $0.removeFromSuperview() }
             let style = ["System", "Light", "Dark"][min(2, max(0, UserDefaults.standard.integer(forKey: "appearance")))]
             let agents = CloudStore.agents.filter { self.cloud.activeAccount($0) != nil }.map(\.name)
-            let lines = [
+            var lines = [
                 ("Appearance", WallpaperStore.isSet ? "\(style) · Wallpaper" : style),
                 ("Sync", AccountProfile.load().email.map { "Signed in as \($0)" } ?? "Signed in"),
-                ("GitHub", self.cloud.githubConnected ? "Connected" : "Not yet · Settings → Cloud"),
-                ("Cloud agents", agents.isEmpty ? "Not yet · Settings → Providers" : Self.join(agents)),
             ]
+            if !self.cloudWithheld {
+                lines += [
+                    ("GitHub", self.cloud.githubConnected ? "Connected" : "Not yet · Settings → Cloud"),
+                    ("Cloud agents", agents.isEmpty ? "Not yet · Settings → Providers" : Self.join(agents)),
+                ]
+            }
             for (ix, (label, value)) in lines.enumerated() {
                 if ix > 0 {
                     let line = UIView()

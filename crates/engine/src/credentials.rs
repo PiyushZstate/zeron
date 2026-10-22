@@ -39,12 +39,14 @@
 //!   grant goes away.
 //! - **GitHub**: a `github` grant — a one-hour GitHub App installation token
 //!   for the installation on the session repository's owner (the user's own
-//!   GitHub token never leaves the vault) — becomes `GH_TOKEN` +
-//!   `GITHUB_TOKEN`, a git credential store at
+//!   GitHub token never leaves the vault) — becomes a git credential store at
 //!   `{data_dir}/cloud/git-credentials` (0600) wired once via
 //!   `git config --global credential.https://github.com.helper`, and
-//!   `~/.config/gh/hosts.yml` for interactive terminals (only when absent or
-//!   already Zeron-managed). Refreshed in the background ~10 min before expiry.
+//!   `~/.config/gh/hosts.yml` for `gh` (only when absent or already
+//!   Zeron-managed). Refreshed in the background ~10 min before expiry. Never
+//!   `GH_TOKEN`/`GITHUB_TOKEN`: a run's environment is fixed at spawn, `gh`
+//!   prefers it over hosts.yml, and the token expires within the hour, so a
+//!   warm session's `gh` would start failing while `git push` kept working.
 //!   Pushes and pull requests therefore act as the App.
 //!
 //! Grants are cached per provider until 5 min before expiry; a network failure
@@ -469,10 +471,9 @@ impl CredentialBroker {
         harness: HarnessId,
         request: &mut RunRequest,
     ) -> Result<(), String> {
-        if let Some(token) = self.github_token().await {
-            request.env.insert("GH_TOKEN".into(), token.clone());
-            request.env.insert("GITHUB_TOKEN".into(), token);
-        }
+        // GitHub: the credential store and hosts.yml (refreshed in place),
+        // never the run's environment (fixed at spawn, outlived by the token).
+        let _ = self.github_token().await;
         match harness {
             HarnessId::Codex => match self.codex_home().await {
                 Some(home) => {

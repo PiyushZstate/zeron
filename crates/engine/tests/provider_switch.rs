@@ -210,6 +210,31 @@ impl Rig {
         self.seen.lock().unwrap()[before].1.clone()
     }
 
+    /// [`turn`](Self::turn) as a real send runs it: the send path writes the
+    /// user's message to the transcript before it dispatches.
+    async fn sent_turn(&self, harness: HarnessId, prompt: &str, message_id: &str) -> RunRequest {
+        self.core
+            .doc_host
+            .open("main")
+            .unwrap()
+            .doc()
+            .push_message(&SessionMessageEntry {
+                id: message_id.into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: format!("{message_id}-t"),
+                    text: prompt.into(),
+                }],
+                created_at: 0,
+                device_id: "phone".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+                duration_ms: None,
+            })
+            .unwrap();
+        self.turn(harness, prompt, message_id).await
+    }
+
     fn row(&self) -> zeron_proto::Chat {
         self.core.workspace.chat("main").unwrap().unwrap()
     }
@@ -357,6 +382,36 @@ async fn switching_provider_drops_the_foreign_resume_id_and_replays_the_history_
     assert!(codex.prompt.contains("and done"), "{}", codex.prompt);
     assert!(!codex.prompt.contains("What fruit did I mention?"), "{}", codex.prompt);
     assert_eq!(rig.seams().len(), 3);
+}
+
+/// Regression: the send path writes the triggering message before dispatch.
+/// The outgoing provider was marked as having seen it, so a switch back
+/// handed that provider the other's reply without the question it answered,
+/// and the seam landed between the question and its reply.
+#[tokio::test]
+async fn a_switch_back_replays_the_message_that_triggered_the_first_switch() {
+    let rig = rig(None);
+    rig.sent_turn(CLAUDE, "Remember PINEAPPLE", "u1").await;
+    let switched = rig.sent_turn(CODEX, "Which fruit was it?", "u2").await;
+    assert!(switched.prompt.contains("PINEAPPLE"), "{}", switched.prompt);
+
+    let back = rig.sent_turn(CLAUDE, "and now?", "u3").await;
+    assert_eq!(back.resume.as_deref(), Some("claude-session"));
+    for needle in ["Which fruit was it?", "Codex answer"] {
+        assert!(back.prompt.contains(needle), "missing {needle:?}: {}", back.prompt);
+    }
+    assert!(!back.prompt.contains("PINEAPPLE"), "Claude already saw it: {}", back.prompt);
+
+    // Each seam sits directly above the message that triggered it.
+    let entries = rig.entries();
+    let above = |message: &str| {
+        let at = entries.iter().position(|e| e.id == message).unwrap();
+        entries[at - 1]
+            .parts
+            .iter()
+            .any(|p| matches!(p, MessagePart::Switch { .. }))
+    };
+    assert!(above("u2") && above("u3"), "{entries:#?}");
 }
 
 #[tokio::test]

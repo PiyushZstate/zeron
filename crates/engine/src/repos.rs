@@ -688,7 +688,8 @@ impl Repos {
             )));
         }
         std::fs::create_dir_all(repos_dir)?;
-        self.git(&["clone", trimmed, &target.to_string_lossy()], None)
+        // `--`: a URL is never read as an option (`--upload-pack=…`).
+        self.git(&["clone", "--", trimmed, &target.to_string_lossy()], None)
             .await?;
         self.register(&target.to_string_lossy())?;
         self.to_repo(&target).await

@@ -275,7 +275,8 @@ final class AgentAccountsViewController: UITableViewController {
             cell.accessibilityIdentifier = row.id
             return cell
         case .waiting:
-            let cell = plainCell(text: "Finish signing in in the browser…", detail: signIn?.message, symbol: nil, tint: Palette.secondary)
+            let detail = [signIn?.message, "Tap to cancel"].compactMap { $0 }.joined(separator: " · ")
+            let cell = plainCell(text: "Finish signing in in the browser…", detail: detail, symbol: nil, tint: Palette.secondary)
             let spinner = UIActivityIndicatorView(style: .medium)
             spinner.startAnimating()
             cell.accessoryView = spinner
@@ -306,6 +307,11 @@ final class AgentAccountsViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
+        if case .waiting = items[indexPath.row] {
+            // Cancels on the computer too (the poll loop notices).
+            cancelSignIn()
+            return
+        }
         guard case let .add(row) = items[indexPath.row], signIn == nil, busy == nil else { return }
         if row.id == "add-key" {
             askForKey()
@@ -316,7 +322,19 @@ final class AgentAccountsViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, shouldHighlightRowAt indexPath: IndexPath) -> Bool {
         if case .add = items[indexPath.row] { return signIn == nil && busy == nil }
+        if case .waiting = items[indexPath.row] { return true }
         return false
+    }
+
+    private func cancelSignIn() {
+        deviceSignIn.cancel()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        // Leaving the page ends a computer's sign-in rather than polling for
+        // ten minutes behind it.
+        if isMovingFromParent || isBeingDismissed { cancelSignIn() }
     }
 
     override func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
@@ -464,6 +482,7 @@ final class DeviceSignIn: NSObject, ASWebAuthenticationPresentationContextProvid
         message: @escaping (String?) -> Void
     ) async throws -> [DeviceAccountInfo]? {
         self.host = host
+        cancelled = false
         cancelled = false
         let done = ProviderSignIn.doneURL
         let start = try await client.deviceLoginStart(deviceId: device, harness: harness, provider: provider, doneUrl: done)

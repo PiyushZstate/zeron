@@ -1714,11 +1714,35 @@ impl EngineRpc {
                     .ok()
                     .flatten()
                     .is_some_and(|chat| zeron_proto::is_cloud_device(&chat.device_id, ""));
+                // A Cloud chat's children on Cloud go with it: its delegates
+                // (each on a machine of its own, which would otherwise outlive
+                // the parent) and its side chats (on its machine, now gone).
+                let children: Vec<String> = if on_cloud {
+                    self.workspace
+                        .read_chats()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|chat| {
+                            chat.parent_chat_id.as_deref() == Some(chat_id.as_str())
+                                && zeron_proto::is_cloud_device(&chat.device_id, "")
+                        })
+                        .map(|chat| chat.id)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 self.voice.retire_chat(&chat_id);
                 self.workspace.delete_chat(&chat_id).map_err(failed)?;
                 self.doc_host.purge_chat(&chat_id);
+                for child in &children {
+                    self.voice.retire_chat(child);
+                    if let Err(err) = self.workspace.delete_chat(child) {
+                        tracing::warn!(chat = %child, error = %err, "deleting a Cloud chat's child failed");
+                    }
+                    self.doc_host.purge_chat(child);
+                }
                 if on_cloud {
-                    self.delete_cloud_machines(vec![chat_id]);
+                    self.delete_cloud_machines(std::iter::once(chat_id).chain(children).collect());
                 }
                 Ok(())
             }

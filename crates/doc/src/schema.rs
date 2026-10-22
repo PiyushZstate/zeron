@@ -537,6 +537,21 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// [`push_message`](Self::push_message), but inserted before the last
+    /// `from_end` entries of the messages list (clamped to its start).
+    pub fn insert_message_before_last(&self, from_end: usize, entry: &SessionMessageEntry) -> Result<(), DocError> {
+        let messages = self.doc.get_list("messages");
+        let at = messages.len().saturating_sub(from_end);
+        let map = messages.insert_container(at, LoroMap::new())?;
+        write_entry_scalar_fields(&map, entry)?;
+        let parts = map.insert_container("parts", LoroList::new())?;
+        for part in &entry.parts {
+            push_part(&parts, part)?;
+        }
+        self.doc.commit();
+        Ok(())
+    }
+
     /// Read all entries (continuations NOT joined — see `join_continuation_entries`).
     ///
     /// Malformed entries are SKIPPED, not fatal: a torn intermediate state

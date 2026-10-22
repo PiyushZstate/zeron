@@ -322,11 +322,14 @@ impl Engine {
         tracing::info!("background engine shutting down");
         server.abort();
         boot.abort();
+        // Before the data dir is released (with the runtime): no refresh may
+        // be mid-exchange when the next engine takes over the session file.
+        engine.refresh_task.abort();
+        engine.auth.quiesce_refresh(Duration::from_secs(10)).await;
         let runtime = engine.runtime.lock().await.take();
         if let Some(runtime) = runtime {
             runtime.shutdown().await;
         }
-        engine.refresh_task.abort();
         outcome
     }
 }

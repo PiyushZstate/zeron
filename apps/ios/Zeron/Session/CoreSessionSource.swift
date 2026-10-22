@@ -67,14 +67,22 @@ final class CoreSessionSource: SessionSource {
         hostDevice = c.host.deviceId
         hostSwitchesProviders = c.host.capabilities.providerSwitch
         turnRunning = c.live.turnRunning
-        canSwitchProvider = hostSwitchesProviders && !turnRunning
+        // Not mid-turn, and not while a message is still on its way (its
+        // turn is about to start on the current provider).
+        let sendPending = c.sendState == .sending || c.sendState == .queued
+        canSwitchProvider = hostSwitchesProviders && !turnRunning && !sendPending
         if canSwitchProvider, harnessesDevice != hostDevice {
             let device = hostDevice
             harnessesDevice = device
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let list = await self.client.listHarnesses(deviceId: device)
-                guard self.hostDevice == device, !list.isEmpty else { return }
+                guard self.hostDevice == device else { return }
+                // Nothing back (offline, slow): ask again on the next refresh.
+                guard !list.isEmpty else {
+                    self.harnessesDevice = ""
+                    return
+                }
                 self.hostHarnesses = list
                 self.onChange?()
             }
@@ -304,7 +312,11 @@ final class CoreSessionSource: SessionSource {
         // No model of its own: it runs the default, so that's the one ticked.
         let current = row.model ?? defaultModel(for: row)?.id
         return ModelPickerViewController.sheet(tabs: tabs, harness: harness, model: current, host: host, note: note) { [weak self] pickedHarness, model in
-            self?.setConfig {
+            guard let self else { return }
+            // Re-checked at the pick: a turn may have started since the
+            // sheet opened with other providers' tabs.
+            if pickedHarness != (self.app?.row(self.chatId)?.harness ?? harness), !self.canSwitchProvider { return }
+            self.setConfig {
                 if pickedHarness != $0.harness {
                     $0.harness = pickedHarness
                     // The old provider's effort and options don't carry over.
@@ -341,9 +353,11 @@ final class CoreSessionSource: SessionSource {
     /// The providers a chat on this host can move to: Cloud runs Claude
     /// Code and Codex; a computer, the agents it offers.
     private func providers(cloud: Bool) -> [HarnessInfo] {
+        // A computer offers what it reports; until it has, only the current
+        // provider (a built-in guess could offer one it doesn't have).
         cloud
-            ? fallbackHarnesses().filter { ["claude-code", "codex"].contains($0.id) }
-            : (hostHarnesses.isEmpty ? fallbackHarnesses() : hostHarnesses).filter(\.offered)
+            ? fallbackHarnesses().filter { AppModel.cloudHarnesses.contains($0.id) }
+            : hostHarnesses.filter(\.offered)
     }
 
     private func setConfig(_ change: (inout ChatConfig) -> Void) {

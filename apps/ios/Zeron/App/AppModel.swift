@@ -580,8 +580,10 @@ final class AppModel {
         }
     }
 
-    var projectOptions: [ProjectOption] {
-        rawProjects.map { ProjectOption(id: $0.id, name: $0.name, path: $0.path, device: $0.deviceId, deviceName: $0.deviceName ?? deviceName($0.deviceId), online: $0.deviceOnline, git: $0.gitDetected, groupKey: $0.groupKey, groupName: $0.groupName, colorIndex: Int($0.colorIndex), isCloud: $0.isCloud, githubRepo: $0.githubRepo) }
+    @MainActor var projectOptions: [ProjectOption] {
+        // A Cloud project runs only on Cloud: hidden when this account isn't
+        // offered Cloud (or no longer is).
+        rawProjects.filter { !$0.isCloud || isDemo || cloud.available }.map { ProjectOption(id: $0.id, name: $0.name, path: $0.path, device: $0.deviceId, deviceName: $0.deviceName ?? deviceName($0.deviceId), online: $0.deviceOnline, git: $0.gitDetected, groupKey: $0.groupKey, groupName: $0.groupName, colorIndex: Int($0.colorIndex), isCloud: $0.isCloud, githubRepo: $0.githubRepo) }
     }
 
     var hostOptions: [HostOption] {
@@ -603,6 +605,9 @@ final class AppModel {
         }
         return out
     }
+
+    /// A Cloud chat created whose first message didn't go out yet.
+    private var unsentCloudChat: (spaceId: String, chatId: String)?
 
     /// The agents Cloud runs.
     static let cloudHarnesses = ["claude-code", "codex"]
@@ -655,9 +660,18 @@ final class AppModel {
     func createCloudSession(draft: NewSessionDraft, text: String, images: [StagedImage]) async throws -> String {
         guard let client, let spaceId = draft.projectId else { throw CoreError.Closed }
         let config = ChatConfig(harness: draft.harness, model: draft.model, reasoning: draft.effort, modelOptions: [:], sandbox: .workspaceWrite)
-        let chatId = try await client.createCloudSession(spaceId: spaceId, config: config, branch: draft.branch, title: nil)
+        // A retry after a failed first send reuses that chat (and machine)
+        // instead of starting a second one.
+        let chatId: String
+        if let unsent = unsentCloudChat, unsent.spaceId == spaceId, client.sessionRow(chatId: unsent.chatId) != nil {
+            chatId = unsent.chatId
+        } else {
+            chatId = try await client.createCloudSession(spaceId: spaceId, config: config, branch: draft.branch, title: nil)
+            unsentCloudChat = (spaceId, chatId)
+        }
         let handle = try client.openSession(chatId: chatId)
         _ = try handle.send(request: SendRequest(text: text, attachments: images.map(\.outgoing), worktree: nil, busy: .queue))
+        unsentCloudChat = nil
         noteDeliveryActivity()
         refreshWorkspace()
         return chatId

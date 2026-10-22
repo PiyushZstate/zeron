@@ -467,6 +467,14 @@ impl SessionsEngine {
         live.is_some_and(|(harness, routable)| routable && !self.steers_mid_turn(harness))
     }
 
+    /// The harness of the chat's live run, while one is in flight.
+    pub fn live_harness(&self, chat_id: &str) -> Option<HarnessId> {
+        if !self.turn_in_flight(chat_id) {
+            return None;
+        }
+        lock(&self.inner.runs).get(chat_id).map(|h| h.runtime_config.harness_id)
+    }
+
     /// Whether an accepted agent update gates the chat's live run, so a new
     /// prompt waits in the queue rather than joining that run's transcript.
     pub fn live_run_update_pending(&self, chat_id: &str) -> bool {
@@ -2070,7 +2078,13 @@ impl Inner {
                 &zeron_doc::ProviderSessionMark {
                     session_id: known.session_id,
                     cwd: known.cwd,
-                    seen: entries.last().map(|entry| entry.id.clone()),
+                    // Not the message that triggers this switch (written
+                    // before dispatch), nor any other it never answered: a
+                    // switch back must replay them.
+                    seen: entries
+                        .iter()
+                        .rposition(|entry| entry.role != zeron_doc::MessageRole::User)
+                        .map(|ix| entries[ix].id.clone()),
                 },
             )
         {

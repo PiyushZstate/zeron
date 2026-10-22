@@ -2552,8 +2552,21 @@ impl AppState {
     /// Whether Cloud is on for this account (its logical device exists).
     /// Cloud is on for this account — never while signed out, whatever a
     /// stale status says.
+    /// Signed in, and the edge offers this account Cloud (`CLOUD_ACCESS`):
+    /// Cloud and Billing in Settings, the Cloud checkout, Cloud projects.
+    /// False until the status arrives.
+    pub fn cloud_offered(&self) -> bool {
+        self.signed_in() && self.cloud_status.as_ref().is_some_and(|s| s.available)
+    }
+
+    /// [`Self::cloud_offered`], but true while the status is still unknown
+    /// (setup keeps its GitHub step until the edge says otherwise).
+    pub fn cloud_maybe_offered(&self) -> bool {
+        self.signed_in() && self.cloud_status.as_ref().is_none_or(|s| s.available)
+    }
+
     pub fn cloud_enabled(&self) -> bool {
-        self.signed_in()
+        self.cloud_offered()
             && (self.cloud_status
             .as_ref()
             .is_some_and(crate::cloud::account_enabled)

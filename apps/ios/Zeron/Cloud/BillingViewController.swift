@@ -55,10 +55,22 @@ final class BillingViewController: UIViewController, SFSafariViewControllerDeleg
     private func render() {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         guard let billing = cloud.billing else {
+            stack.addArrangedSubview(spacer(40))
+            if let error = cloud.billingError {
+                // A failed read is said, with a way forward — never a spinner
+                // that runs forever.
+                stack.addArrangedSubview(note("Couldn't load billing. \(error)"))
+                let retry = CloudUI.secondaryButton("Try again", symbol: "arrow.clockwise") { [weak self] in
+                    guard let self else { return }
+                    Task { await self.cloud.refreshBilling() }
+                }
+                retry.accessibilityIdentifier = "billing-retry"
+                stack.addArrangedSubview(retry)
+                return
+            }
             let spinner = UIActivityIndicatorView(style: .medium)
             spinner.startAnimating()
             spinner.color = Palette.secondary
-            stack.addArrangedSubview(spacer(40))
             stack.addArrangedSubview(spinner)
             return
         }

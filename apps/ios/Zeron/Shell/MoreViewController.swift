@@ -195,10 +195,11 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
             Row(id: "account", title: app.accountName, subtitle: app.accountDetail, symbol: "person.crop.circle", accessory: .none),
         ])
         // Agents and where they run, as the desktop groups them: Providers,
-        // then Cloud and Billing while signed in.
+        // then Cloud and Billing when this account is offered Cloud.
         s.appendSections(["Agents"])
         var agents = [Row(id: "providers", title: "Providers", subtitle: "Agents and their accounts on each device", symbol: "cpu")]
-        if !app.isDemo || ProcessInfo.processInfo.arguments.contains("-cloud") {
+        let demoCloud = app.isDemo && ProcessInfo.processInfo.arguments.contains("-cloud")
+        if (!app.isDemo && app.cloud.available) || demoCloud {
             let cloud = app.cloud
             let github = cloud.githubAccount.map { "GitHub @\($0)" } ?? "Connect GitHub"
             agents.append(Row(id: "cloud", title: "Cloud", subtitle: cloud.problem?.title ?? github, symbol: "cloud"))

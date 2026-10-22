@@ -59,6 +59,11 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
 
     @MainActor private var cloud: CloudStore { app.cloud }
 
+    /// This account is offered Cloud (the edge says so; demos opt in).
+    @MainActor private var cloudOffered: Bool {
+        app.isDemo ? ProcessInfo.processInfo.arguments.contains("-cloud") : cloud.available
+    }
+
     private var onCloud: Bool { target == Self.cloud }
 
     private var targetName: String {
@@ -227,7 +232,7 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
             action.state = host.id == target ? .on : .off
             return action
         }
-        if !app.isDemo || ProcessInfo.processInfo.arguments.contains("-cloud") {
+        if cloudOffered {
             let cloud = UIAction(title: "Cloud", image: UIImage(systemName: "cloud")) { [weak self] _ in
                 self?.select(Self.cloud)
             }
@@ -256,6 +261,10 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
         s.appendSections(["Agents"])
         s.appendItems(onCloud ? cloudRows() : computerRows())
         dataSource.apply(s, animatingDifferences: false)
+        if onCloud, !cloudOffered {
+            onSummary?("a computer", false, [])
+            return
+        }
         let names: [String]? = onCloud
             ? CloudStore.agents.map(\.name)
             : harnesses[target].map { $0.filter(\.installed).map(\.label) }
@@ -263,7 +272,11 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
     }
 
     private func cloudRows() -> [Row] {
-        CloudStore.agents.map { agent in
+        // Landed on Cloud (no computers yet) without being offered it.
+        guard cloudOffered else {
+            return [Row(id: "no-computers", title: "No computers yet", subtitle: "Install Zeron on a computer to run agents and manage their accounts here.", symbol: "desktopcomputer")]
+        }
+        return CloudStore.agents.map { agent in
             let count = (cloud.accounts[agent.login] ?? []).count + (cloud.accounts[agent.key] ?? []).count
             let busy = signingIn == agent.login
             return Row(

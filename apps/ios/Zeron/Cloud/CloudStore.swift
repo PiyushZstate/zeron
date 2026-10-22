@@ -33,6 +33,8 @@ final class CloudStore {
     private(set) var usage: [String: CloudUsageInfo] = [:]
     private(set) var usageErrors: [String: String] = [:]
     private(set) var billing: BillingInfo?
+    /// Why the last billing read failed (shown with Retry until one succeeds).
+    private(set) var billingError: String?
     /// The account's session machines (read when a Cloud chat needs them).
     private(set) var sessions: [CloudSessionInfo] = []
     private(set) var loading = false
@@ -90,8 +92,11 @@ final class CloudStore {
         if let last = sessionsRead, Date().timeIntervalSince(last) < 8 { return }
         sessionsRead = Date()
         Task { [weak self] in
-            if let list = try? await client.cloudSessions() { self?.sessions = list }
-            self?.info = (try? await client.cloudStatus()) ?? self?.info
+            let list = try? await client.cloudSessions()
+            let status = try? await client.cloudStatus()
+            guard self?.client === client else { return }
+            if let list { self?.sessions = list }
+            self?.info = status ?? self?.info
             self?.changed()
         }
     }
@@ -148,9 +153,13 @@ final class CloudStore {
         changed()
         refreshTask = Task { [weak self] in
             defer {
-                self?.refreshTask = nil
-                self?.loading = false
-                self?.changed()
+                // Signed out (or into another account) meanwhile: reset()
+                // already cleared this; never clobber the new account's.
+                if self?.client === client {
+                    self?.refreshTask = nil
+                    self?.loading = false
+                    self?.changed()
+                }
             }
             do {
                 var info = try await client.cloudStatus()
@@ -158,6 +167,7 @@ final class CloudStore {
                 if info.available, info.state == "off" {
                     info = (try? await client.cloudEnable()) ?? info
                 }
+                guard self?.client === client else { return }
                 self?.info = info
                 self?.error = nil
                 self?.changed()
@@ -171,12 +181,15 @@ final class CloudStore {
                         lists[provider] = (try? await client.vaultAccounts(provider: provider)) ?? []
                     }
                 }
-                self?.vault = await vault
-                self?.repos = await repos ?? []
-                self?.billing = await billing
+                let (v, r, b) = (await vault, await repos, await billing)
+                guard self?.client === client else { return }
+                self?.vault = v
+                self?.repos = r ?? []
+                self?.billing = b
                 self?.accounts = lists
                 self?.refreshUsage()
             } catch {
+                guard self?.client === client else { return }
                 self?.error = Self.message(error)
             }
         }
@@ -191,8 +204,10 @@ final class CloudStore {
                     lists[provider] = (try? await client.vaultAccounts(provider: provider)) ?? []
                 }
             }
+            let vault = try? await client.vaultStatus()
+            guard self?.client === client else { return }
             self?.accounts = lists
-            self?.vault = (try? await client.vaultStatus()) ?? self?.vault
+            self?.vault = vault ?? self?.vault
             self?.changed()
             self?.refreshUsage()
         }
@@ -216,6 +231,7 @@ final class CloudStore {
                     }
                 }
                 for await (key, result) in group {
+                    guard self?.client === client else { continue }
                     switch result {
                     case let .success(usage):
                         self?.usage[key] = usage
@@ -231,15 +247,32 @@ final class CloudStore {
 
     func refreshGitHub() async {
         guard let client else { return }
-        vault = (try? await client.vaultStatus()) ?? vault
-        repos = (try? await client.githubRepos(query: nil)) ?? repos
+        let vault = try? await client.vaultStatus()
+        let repos = try? await client.githubRepos(query: nil)
+        guard self.client === client else { return }
+        self.vault = vault ?? self.vault
+        self.repos = repos ?? self.repos
         changed()
     }
 
     func refreshBilling() async {
         guard let client else { return }
-        billing = (try? await client.billingStatus()) ?? billing
-        info = (try? await client.cloudStatus()) ?? info
+        let read: Result<BillingInfo, Error>
+        do {
+            read = .success(try await client.billingStatus())
+        } catch {
+            read = .failure(error)
+        }
+        let status = try? await client.cloudStatus()
+        guard self.client === client else { return }
+        switch read {
+        case let .success(value):
+            billing = value
+            billingError = nil
+        case let .failure(error):
+            billingError = Self.message(error)
+        }
+        info = status ?? info
         changed()
     }
 
@@ -254,6 +287,7 @@ final class CloudStore {
         usage = [:]
         usageErrors = [:]
         billing = nil
+        billingError = nil
         sessions = []
         sessionsRead = nil
         error = nil

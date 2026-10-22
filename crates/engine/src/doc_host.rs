@@ -922,7 +922,11 @@ impl ChatDocHandle {
             return Ok(false);
         }
         let id = format!("switch:{created_at}");
-        self.doc.push_message(&SessionMessageEntry {
+        // The send that switches wrote its message first: the seam goes
+        // before it (and any other unanswered message), so it reads as the
+        // new provider's question, not the old one's.
+        let unanswered = entries.iter().rev().take_while(|entry| entry.role == MessageRole::User).count();
+        self.doc.insert_message_before_last(unanswered, &SessionMessageEntry {
             id: id.clone(),
             role: MessageRole::System,
             parts: vec![MessagePart::Switch {
@@ -5620,7 +5624,11 @@ impl DocHost {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
                     }
                 }
-                if sessions.defers_to_turn_end(chat_id, Some((harness, &request))) {
+                // A run on another provider than the live turn's (a stale
+                // client, another device's switch) waits for the turn: the
+                // provider never changes by killing a turn mid-flight.
+                let other_provider = sessions.live_harness(chat_id).is_some_and(|live| live != harness);
+                if other_provider || sessions.defers_to_turn_end(chat_id, Some((harness, &request))) {
                     self.hold_until_turn_end(
                         handle,
                         message_id,

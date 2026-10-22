@@ -131,8 +131,11 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
                 self.source.retryDelivery()
             }
         }
-        if isCloud {
-            cloudToken = app.cloud.observe { [weak self] in self?.render(animated: true) }
+        // Watched whatever the row says now: a just-created Cloud chat's row
+        // may not have arrived yet.
+        cloudToken = app.cloud.observe { [weak self] in
+            guard let self, self.isCloud else { return }
+            self.render(animated: true)
         }
 
         bottom.axis = .vertical

@@ -324,7 +324,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             chips.append(ComposerChip(id: "project", title: "No project", symbol: "tray"))
             chips.append(ComposerChip(id: "host", title: host?.name ?? "Choose host", symbol: "desktopcomputer"))
         }
-        let model = models.first { $0.harness == draft.harness && $0.id == draft.model } ?? models.first { $0.harness == draft.harness }
+        let model = draftModel
         // Never the harness name in place of a model: a model this host
         // hasn't listed still gets its catalog label.
         let modelTitle = model?.label ?? draft.model.map { modelLabel(harness: draft.harness, model: $0) } ?? fallbackModels(harness: draft.harness).first?.label ?? HarnessNames.label(draft.harness)
@@ -513,8 +513,17 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
         }
     }
 
+    /// The draft's own model when it names one (even one this list lacks:
+    /// it's what gets sent, so its label and efforts are its own); the
+    /// provider's default only when it names none.
+    private var draftModel: ModelChoice? {
+        draft.model == nil
+            ? models.first { $0.harness == draft.harness }
+            : models.first { $0.harness == draft.harness && $0.id == draft.model }
+    }
+
     private func effortMenu() -> UIMenu {
-        let model = models.first { $0.harness == draft.harness && $0.id == draft.model } ?? models.first { $0.harness == draft.harness }
+        let model = draftModel
         return UIMenu(title: "Reasoning effort", children: (model?.efforts ?? []).map { e in
             UIAction(title: e.capitalized, state: e == draft.effort ? .on : .off) { [weak self] _ in
                 self?.draft.effort = e

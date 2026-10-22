@@ -10,6 +10,8 @@ final class CloudRepoPickerViewController: UITableViewController, UISearchResult
     private var query = ""
     private var creating: String?
     private var token: AnyObject?
+    /// The repository read is in flight (`cloud.repos` stays nil on failure).
+    private var loading = false
 
     init(app: AppModel) {
         self.app = app
@@ -36,8 +38,17 @@ final class CloudRepoPickerViewController: UITableViewController, UISearchResult
         navigationItem.hidesSearchBarWhenScrolling = false
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "repo")
         token = cloud.observe { [weak self] in self?.reloadRepos() }
+        load()
+    }
+
+    private func load() {
+        loading = true
         reloadRepos()
-        Task { await cloud.refreshGitHub() }
+        Task { [weak self] in
+            await self?.cloud.refreshGitHub()
+            self?.loading = false
+            self?.reloadRepos()
+        }
     }
 
     private func reloadRepos() {
@@ -49,6 +60,30 @@ final class CloudRepoPickerViewController: UITableViewController, UISearchResult
     }
 
     private func emptyView() -> UIView {
+        if cloud.repos == nil {
+            // Still reading, or the read failed: say which, never a blank page.
+            if loading {
+                let spinner = UIActivityIndicatorView(style: .medium)
+                spinner.startAnimating()
+                return spinner
+            }
+            let stack = UIStackView(arrangedSubviews: [
+                CloudUI.header("Couldn't load repositories", "Check your connection and try again.", alignment: .center),
+                CloudUI.secondaryButton("Try again", symbol: "arrow.clockwise") { [weak self] in self?.load() },
+            ])
+            stack.axis = .vertical
+            stack.alignment = .center
+            stack.spacing = 16
+            let holder = UIView()
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            holder.addSubview(stack)
+            NSLayoutConstraint.activate([
+                stack.centerYAnchor.constraint(equalTo: holder.centerYAnchor, constant: -40),
+                stack.leadingAnchor.constraint(equalTo: holder.leadingAnchor, constant: 32),
+                stack.trailingAnchor.constraint(equalTo: holder.trailingAnchor, constant: -32),
+            ])
+            return holder
+        }
         let connected = cloud.githubConnected
         let stack = UIStackView(arrangedSubviews: [
             CloudUI.tile(image: CloudUI.githubMark, side: 52),
@@ -71,7 +106,7 @@ final class CloudRepoPickerViewController: UITableViewController, UISearchResult
             stack.leadingAnchor.constraint(equalTo: holder.leadingAnchor, constant: 32),
             stack.trailingAnchor.constraint(equalTo: holder.trailingAnchor, constant: -32),
         ])
-        return cloud.repos == nil ? UIView() : holder
+        return holder
     }
 
     func updateSearchResults(for searchController: UISearchController) {

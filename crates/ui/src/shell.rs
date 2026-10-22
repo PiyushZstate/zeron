@@ -595,9 +595,9 @@ impl SettingsSection {
     }
 
     /// [`Self::visible_in_nav`], plus what depends on the account: Cloud
-    /// and Billing only while signed in.
-    fn shown_in_nav(self, signed_in: bool) -> bool {
-        self.visible_in_nav() && (!self.needs_account() || signed_in)
+    /// and Billing only when the account is offered Cloud.
+    fn shown_in_nav(self, cloud_offered: bool) -> bool {
+        self.visible_in_nav() && (!self.needs_account() || cloud_offered)
     }
 
     /// Pages about the signed-in account (they open General when signed out).
@@ -5477,8 +5477,8 @@ impl Shell {
 
     pub(crate) fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         let mut section = section.canonical();
-        // Signed out there is no Cloud or billing to manage.
-        if section.needs_account() && !self.state.read(cx).signed_in() {
+        // Signed out, or not offered Cloud: no Cloud or billing to manage.
+        if section.needs_account() && !self.state.read(cx).cloud_offered() {
             section = SettingsSection::General;
         }
         self.command_palette = None;
@@ -8441,7 +8441,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let signed_in = self.state.read(cx).signed_in();
+        let cloud_offered = self.state.read(cx).cloud_offered();
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Cloud => icons::CLOUD,
@@ -8480,7 +8480,7 @@ impl Shell {
                         .children(
                             SettingsSection::ALL
                                 .into_iter()
-                                .filter(|item| item.shown_in_nav(signed_in))
+                                .filter(|item| item.shown_in_nav(cloud_offered))
                                 .map(|item| {
                                     let index = SettingsSection::ALL
                                         .iter()
@@ -8520,7 +8520,7 @@ impl Shell {
                                         move |this, event: &gpui::KeyDownEvent, window, cx| {
                                             let items: Vec<_> = SettingsSection::ALL
                                                 .into_iter()
-                                                .filter(|s| s.shown_in_nav(signed_in))
+                                                .filter(|s| s.shown_in_nav(cloud_offered))
                                                 .collect();
                                             let current =
                                                 items.iter().position(|s| *s == item).unwrap_or(0);

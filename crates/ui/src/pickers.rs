@@ -998,6 +998,18 @@ impl Pickers {
                 } else {
                     CheckoutKind::default()
                 };
+                // ...and Cloud runs Codex and Claude Code only: a provider it
+                // can't run would boot (and bill) a machine for a failing run.
+                if this.config.checkout == CheckoutKind::Cloud
+                    && this
+                        .config
+                        .harness
+                        .is_some_and(|h| !matches!(h, HarnessId::Codex | HarnessId::ClaudeCode))
+                {
+                    this.config.harness = None;
+                    this.config.model = None;
+                    this.config.reasoning = None;
+                }
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
             }

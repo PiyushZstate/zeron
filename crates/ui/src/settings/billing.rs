@@ -27,9 +27,10 @@ const POLL_FOR: Duration = Duration::from_secs(10 * 60);
 /// Most packs one purchase buys (the edge's cap).
 const MAX_PACKS: u32 = 20;
 
-/// The last status this page read, so a later visit paints at once.
+/// The last status this page read (and whose account it was), so a later
+/// visit paints at once — never another account's balance.
 #[derive(Default)]
-struct BillingCache(Option<BillingStatus>);
+struct BillingCache(Option<(String, BillingStatus)>);
 
 impl gpui::Global for BillingCache {}
 
@@ -84,10 +85,12 @@ pub struct BillingPage {
 impl BillingPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        let account = state.read(cx).auth_user().map(|user| user.id.clone());
         let status = cx
             .try_global::<BillingCache>()
             .and_then(|cache| cache.0.clone())
-            .map_or(Loadable::Idle, Loadable::Ready);
+            .filter(|(owner, _)| Some(owner) == account.as_ref())
+            .map_or(Loadable::Idle, |(_, status)| Loadable::Ready(status));
         let mut page = Self {
             state,
             scroll: widgets::PageScroll::default(),
@@ -135,7 +138,9 @@ impl BillingPage {
     /// Take a fresh status; when a Stripe page was open and something it
     /// could change did, say what happened and stop checking.
     fn apply(&mut self, status: BillingStatus, cx: &mut Context<Self>) {
-        cx.default_global::<BillingCache>().0 = Some(status.clone());
+        if let Some(account) = self.state.read(cx).auth_user().map(|user| user.id.clone()) {
+            cx.default_global::<BillingCache>().0 = Some((account, status.clone()));
+        }
         if let Some(pending) = &self.pending {
             let now = Snapshot::of(&status);
             if now != pending.before {

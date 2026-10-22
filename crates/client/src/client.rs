@@ -835,10 +835,39 @@ impl Client {
             .workspace
             .chat(chat_id)
             .is_some_and(|chat| zeron_proto::is_cloud_device(&chat.device_id, ""));
+        // A Cloud chat's children on Cloud go with it: its delegates (each on
+        // a machine of its own, which would otherwise outlive the parent) and
+        // its side chats (on its machine, now gone).
+        let children: Vec<String> = if on_cloud {
+            let (state, _) = self.inner.workspace.state();
+            state
+                .chats
+                .iter()
+                .filter(|chat| {
+                    chat.parent_chat_id.as_deref() == Some(chat_id)
+                        && zeron_proto::is_cloud_device(&chat.device_id, "")
+                })
+                .map(|chat| chat.id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.chat_write(chat_id, |doc| doc.delete_chat(chat_id))?;
-        if on_cloud {
-            self.delete_cloud_machines(vec![chat_id.to_owned()]);
+        for child in &children {
+            if let Err(err) = self.chat_write(child, |doc| doc.delete_chat(child)) {
+                tracing::warn!(chat = %child, error = %err, "deleting a Cloud chat's child failed");
+            }
+            self.forget_local_session(child);
         }
+        if on_cloud {
+            self.delete_cloud_machines(std::iter::once(chat_id.to_owned()).chain(children).collect());
+        }
+        self.forget_local_session(chat_id);
+        Ok(())
+    }
+
+    /// Drop a deleted chat's open session and local snapshot.
+    fn forget_local_session(&self, chat_id: &str) {
         let core = lock(&self.inner.sessions).remove(chat_id);
         // A view may still hold the session: close its room now (it flushes
         // once), so nothing re-saves the snapshot deleted below.
@@ -851,7 +880,6 @@ impl Client {
         {
             tracing::debug!(error = %err, "local chat snapshot delete failed");
         }
-        Ok(())
     }
 
     /// Mid-session ref switch: retarget onto the ref's existing worktree (row

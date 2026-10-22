@@ -210,7 +210,13 @@ impl Onboarding {
         let observe_state = cx.observe(&state, |this, state, cx| {
             if this.awaiting_sign_in && state.read(cx).signed_in() {
                 this.awaiting_sign_in = false;
-                this.go(Step::Github, cx);
+                let next = if this.github_in_flow(cx) { Step::Github } else { Step::Providers };
+                this.go(next, cx);
+            }
+            // The edge answered that this account has no Cloud while on its
+            // GitHub step: move past it.
+            if this.step == Step::Github && !this.github_in_flow(cx) {
+                this.go(Step::Providers, cx);
             }
             // The engine arrived, or the sync switch replaced it: the agents
             // page has to ask the new one.
@@ -272,10 +278,10 @@ impl Onboarding {
         cx.notify();
     }
 
-    /// Whether the GitHub step is part of setup: only once signed in, since
-    /// Cloud needs an account.
+    /// Whether the GitHub step is part of setup: signed in, and Cloud offered
+    /// to the account (kept while its status is still unknown).
     fn github_in_flow(&self, cx: &Context<Self>) -> bool {
-        self.state.read(cx).signed_in()
+        self.state.read(cx).cloud_maybe_offered()
     }
 
     fn github_connected(&self, cx: &Context<Self>) -> bool {

@@ -1022,9 +1022,10 @@ impl WorkspaceHost {
     }
 
     /// [`create_chat_with_parent`](Self::create_chat_with_parent) with an
-    /// explicit host for a chat IN a project: a chat run on Cloud is hosted
-    /// by its own session device, not the device owning the project's
-    /// folder. `host: None` keeps the project's owner.
+    /// explicit host: a chat run on Cloud is hosted by its session device,
+    /// not the device owning the project's folder, nor (for a side chat of a
+    /// Cloud chat with no project) the device that asked. `host: None` keeps
+    /// the project's owner, or the named device.
     #[allow(clippy::too_many_arguments)]
     pub fn create_chat_hosted(
         &self,
@@ -1047,7 +1048,9 @@ impl WorkspaceHost {
             None => None,
         };
         let host_device = match (&space, device_id, host) {
-            (Some(_), _, Some(host)) => host.to_string(),
+            // An explicit host always wins: a side chat of a Cloud chat runs
+            // on that machine, never on the computer that asked for it.
+            (_, _, Some(host)) => host.to_string(),
             (Some(space), _, None) => space.device_id.clone(),
             (None, Some(device_id), _) => device_id.to_string(),
             (None, None, _) => {

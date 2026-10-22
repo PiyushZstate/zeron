@@ -269,6 +269,8 @@ struct AuthInner {
     /// exchange); two concurrent refreshes would race and could revoke the session.
     refresh_gate: tokio::sync::Mutex<()>,
     refresh_flight: Mutex<Option<RefreshFlight>>,
+    /// Set at shutdown ([`Auth::quiesce_refresh`]): no refresh after.
+    refresh_quiesced: std::sync::atomic::AtomicBool,
     /// Failed refreshes are shared across every HTTP/WS token consumer, not
     /// just delayed by the background loop. Resettable without waiting on HTTP.
     refresh_retry: Mutex<RefreshRetry>,
@@ -368,6 +370,7 @@ impl Auth {
                 sign_in: Mutex::new(SignInLifecycle::default()),
                 refresh_gate: tokio::sync::Mutex::new(()),
                 refresh_flight: Mutex::new(None),
+                refresh_quiesced: std::sync::atomic::AtomicBool::new(false),
                 refresh_retry: Mutex::new(RefreshRetry::default()),
                 retry_tx,
                 loopback: tokio::sync::Mutex::new(None),
@@ -861,11 +864,34 @@ impl Auth {
         flight.await.map_err(EngineError::Other)
     }
 
+    /// Shutdown: wait (bounded) for a token refresh already in flight, then
+    /// let no other start in this process. A refresh token is single-use; a
+    /// process that quits mid-exchange lets the next engine spend the same
+    /// token, and the loser of that race deletes the shared session file.
+    pub async fn quiesce_refresh(&self, limit: std::time::Duration) {
+        match tokio::time::timeout(limit, self.inner.refresh_gate.lock()).await {
+            Ok(_gate) => {}
+            Err(_) => tracing::warn!("a token refresh was still running at shutdown"),
+        }
+        // Later refreshes answer "no token" at once (never wait: shutdown's
+        // own flushes may ask for a bearer).
+        self.inner
+            .refresh_quiesced
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     async fn refresh_serialized(
         &self,
         organization_id: Option<&str>,
     ) -> Result<Option<String>, EngineError> {
         let _gate = self.inner.refresh_gate.lock().await;
+        if self
+            .inner
+            .refresh_quiesced
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
         // Re-check under the gate: the refresh we queued behind may have done the work.
         if organization_id.is_none()
             && let Some(entry) = &*lock(&self.inner.access)

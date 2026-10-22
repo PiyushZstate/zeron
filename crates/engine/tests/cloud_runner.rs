@@ -650,8 +650,10 @@ async fn heartbeat_reports_active_runs_with_the_runner_bearer() {
     let rig = Rig::new().await;
     let identity = rig.enrolled().await;
     let auth = rig.auth(identity.clone());
-    // Relay traffic: two real requests and a stream open count; the dial
-    // readiness probe and EngineReady do not.
+    // Relay traffic: what a person does there counts (opening a terminal,
+    // typing in it, writing a file); looking does not (the dial readiness
+    // probe, EngineReady, lists, watches) — an open sidebar must not keep a
+    // machine from its idle sleep.
     struct Echo;
     #[async_trait::async_trait]
     impl zeron_rpc::RpcService for Echo {
@@ -672,6 +674,9 @@ async fn heartbeat_reports_active_runs_with_the_runner_bearer() {
         (methods::LIST_HARNESSES, json!({})),
         (methods::LIST_REPOS, json!({})),
         (methods::WATCH_QUEUE, json!({"chatId": "c"})),
+        (methods::OPEN_TERMINAL, json!({})),
+        (methods::WRITE_TERMINAL, json!({})),
+        (methods::WRITE_WORKSPACE_FILE, json!({})),
     ] {
         served.handle(method, params).await.unwrap();
     }
@@ -908,14 +913,10 @@ async fn github_grant_sets_env_git_store_helper_and_gh_hosts() {
             .unwrap_err(),
         zeron_engine::credentials::CLAUDE_NOT_SIGNED_IN
     );
-    assert_eq!(
-        request.env.get("GH_TOKEN").map(String::as_str),
-        Some("ghu_token")
-    );
-    assert_eq!(
-        request.env.get("GITHUB_TOKEN").map(String::as_str),
-        Some("ghu_token")
-    );
+    // Never in the run's environment: fixed at spawn, it would outlive the
+    // hour-long token (and `gh` prefers it over the refreshed hosts.yml).
+    assert!(!request.env.contains_key("GH_TOKEN"));
+    assert!(!request.env.contains_key("GITHUB_TOKEN"));
     let store = rig.data_dir.join("cloud/git-credentials");
     assert_eq!(
         std::fs::read_to_string(&store).unwrap(),
