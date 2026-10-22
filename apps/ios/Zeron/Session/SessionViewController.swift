@@ -297,12 +297,23 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         UIView.animate(withDuration: 0.18, delay: 0, options: [.curveEaseOut, .allowUserInteraction], animations: reveal)
     }
 
+    #if DEBUG
+    private static var debugPickerShown = false
+    #endif
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         hasAppeared = true
         landed = true
         (splitViewController as? SplitRootController)?.sessionDidAppear(chatId)
         list.settleEdgeEffect()
+        #if DEBUG
+        // Screenshots: `-model-picker` opens the picker once.
+        if ProcessInfo.processInfo.arguments.contains("-model-picker"), !Self.debugPickerShown, let picker = source.modelPicker() {
+            Self.debugPickerShown = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.present(picker, animated: true) }
+        }
+        #endif
         showTranscriptIfReady()
         if holdingTranscript {
             // Nothing to lay out (an empty or unreachable session): stop

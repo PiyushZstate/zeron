@@ -47,6 +47,7 @@ struct ModelChoice: Equatable {
     let id: String
     let label: String
     let efforts: [String]
+    var detail: String? = nil
 }
 
 /// "Ask anything" → a composer-first canvas. Context is set with native menus
@@ -262,7 +263,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
 
     private static func catalogModels() -> [ModelChoice] {
         fallbackHarnesses().filter(\.offered).flatMap { h in
-            fallbackModels(harness: h.id).map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels) }
+            fallbackModels(harness: h.id).map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels, detail: $0.description) }
         }
     }
 
@@ -498,10 +499,11 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
         let tabs = order.compactMap { h -> ModelPickerTab? in
             let choices = models.filter { $0.harness == h }
             guard let first = choices.first else { return nil }
-            let rows = choices.map { ModelPickerRow(id: $0.id, label: $0.label, detail: nil) }
+            let rows = choices.map { ModelPickerRow(id: $0.id, label: $0.label, detail: $0.detail) }
             return ModelPickerTab(harness: h, label: first.harnessLabel) { rows }
         }
-        return ModelPickerViewController(tabs: tabs, harness: draft.harness, model: draft.model) { [weak self] harness, model in
+        let host = runsOnCloud ? (name: "Cloud", symbol: "cloud") : (name: app.deviceName(deviceId), symbol: "desktopcomputer")
+        return ModelPickerViewController.sheet(tabs: tabs, harness: draft.harness, model: draft.model, host: host) { [weak self] harness, model in
             guard let self else { return }
             if harness != self.draft.harness { self.draft.effort = nil }
             self.draft.harness = harness

@@ -506,9 +506,9 @@ final class SessionFlowTests: XCTestCase {
         let chip = app.buttons["composer-chip-model"]
         XCTAssertTrue(chip.waitForExistence(timeout: 5))
         chip.tap()
-        let list = app.tables["model-picker-list"]
+        let list = app.collectionViews.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-list'")).firstMatch
         XCTAssertTrue(list.waitForExistence(timeout: 5), "the picker opens")
-        let row = list.cells.element(boundBy: 1)
+        let row = list.cells.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-row-'")).element(boundBy: 1)
         XCTAssertTrue(row.waitForExistence(timeout: 5), "models load")
         let picked = row.staticTexts.element(boundBy: 0).label
         row.tap()
@@ -534,8 +534,15 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(claude.waitForExistence(timeout: 5), "other providers have tabs")
         XCTAssertTrue(app.buttons["model-picker-tab-codex"].exists)
         snapshot(app, "model-picker")
+        // Swiping the list moves to the next provider, and its tab follows.
+        app.collectionViews["model-picker-list-codex"].swipeLeft()
+        expectation(for: NSPredicate(format: "isSelected == true"), evaluatedWith: claude)
+        waitForExpectations(timeout: 5)
+        app.buttons["model-picker-tab-codex"].tap()
+        expectation(for: NSPredicate(format: "isSelected == true"), evaluatedWith: app.buttons["model-picker-tab-codex"])
+        waitForExpectations(timeout: 5)
         claude.tap()
-        let row = app.tables["model-picker-list"].cells.element(boundBy: 0)
+        let row = app.collectionViews["model-picker-list-claude-code"].cells.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-row-'")).element(boundBy: 0)
         XCTAssertTrue(row.waitForExistence(timeout: 5), "Claude's models load")
         let picked = row.staticTexts.element(boundBy: 0).label
         row.tap()
@@ -549,7 +556,7 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(field.waitForExistence(timeout: 10))
         field.tap()
         older.buttons["composer-chip-model"].tap()
-        XCTAssertTrue(older.tables["model-picker-list"].waitForExistence(timeout: 5))
+        XCTAssertTrue(older.collectionViews.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-list'")).firstMatch.waitForExistence(timeout: 5))
         XCTAssertFalse(older.buttons["model-picker-tab-codex"].exists, "an older host keeps its provider")
         XCTAssertTrue(older.staticTexts["This computer needs a newer Zeron to switch provider."].exists)
     }

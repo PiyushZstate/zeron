@@ -278,14 +278,15 @@ final class CoreSessionSource: SessionSource {
         var tabs = [ModelPickerTab(harness: harness, label: row.harnessLabel ?? HarnessNames.label(harness)) { await rows(harness) }]
         if canSwitchProvider {
             tabs += providers(cloud: row.isCloud).filter { $0.id != harness }.map { h in
-                ModelPickerTab(harness: h.id, label: h.label) { await rows(h.id) }
+                ModelPickerTab(harness: h.id, label: h.label, footer: "Your next message continues this chat with \(h.label).") { await rows(h.id) }
             }
         }
         let note: String? = canSwitchProvider ? nil
             : turnRunning ? "You can switch provider when this turn ends."
             : hostSwitchesProviders ? nil
             : "This computer needs a newer Zeron to switch provider."
-        return ModelPickerViewController(tabs: tabs, harness: harness, model: row.model, note: note) { [weak self] pickedHarness, model in
+        let host = row.isCloud ? (name: "Cloud", symbol: "cloud") : (name: app?.deviceName(hostDevice) ?? "This computer", symbol: "desktopcomputer")
+        return ModelPickerViewController.sheet(tabs: tabs, harness: harness, model: row.model, host: host, note: note) { [weak self] pickedHarness, model in
             self?.setConfig {
                 if pickedHarness != $0.harness {
                     $0.harness = pickedHarness
