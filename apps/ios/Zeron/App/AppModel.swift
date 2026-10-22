@@ -663,9 +663,9 @@ final class AppModel {
         // A retry after a failed first send reuses that chat (and machine)
         // instead of starting a second one.
         let chatId: String
-        // Only while nothing the machine was made from changed (its project,
-        // branch, provider): otherwise that's a different chat to start.
-        let key = "\(spaceId)|\(draft.branch ?? "")|\(draft.harness)"
+        // Only while nothing the chat was made with changed (its project,
+        // branch, provider, model): otherwise that's a different chat.
+        let key = "\(spaceId)|\(draft.branch ?? "")|\(draft.harness)|\(draft.model ?? "")"
         if let unsent = unsentCloudChat, unsent.key == key, client.sessionRow(chatId: unsent.chatId) != nil {
             chatId = unsent.chatId
         } else {

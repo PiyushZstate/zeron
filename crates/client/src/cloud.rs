@@ -95,10 +95,6 @@ impl Client {
             "Turn on Cloud",
         )
         .await
-        .map(|status| CloudStatus {
-            available: true,
-            ..status
-        })
         .map_err(Failure::into_error)
     }
 

@@ -327,7 +327,15 @@ export const handleCloudRoute = async (
   // explicit override for dev tunnels).
   const edgeUrl = env.CLOUD_EDGE_URL ?? url.origin;
 
-  if (rest.length === 0 && request.method === "DELETE") return rpc(() => stub.destroy(caller));
+  if (rest.length === 0 && request.method === "DELETE") {
+    // Off the beta list (cleanup only): the reply says so, or a client would
+    // read "off but available" and set Cloud up again.
+    const offered = cloudOffered(env, auth);
+    return rpc(async () => {
+      const result = await stub.destroy(caller);
+      return result.ok && !offered ? { ok: true as const, value: { ...result.value, available: false } } : result;
+    });
+  }
   if (rest.length === 1 && rest[0] === "enable" && request.method === "POST") {
     if (!cloudAvailable(env)) return unavailable();
     return rpc(() => stub.enable(caller));

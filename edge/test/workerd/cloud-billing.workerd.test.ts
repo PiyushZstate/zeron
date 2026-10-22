@@ -182,6 +182,18 @@ describe("billing", () => {
     await webhook("customer.subscription.deleted", { ...subscription, status: "canceled" }, { created: t + 20 });
     await webhook("customer.subscription.updated", { ...subscription, status: "active" }, { created: t + 5 });
     expect((await billing(u)).plan).toMatchObject({ id: "max", status: "active" });
+
+    // A replacement's cancel that outruns its own creation: once canceled,
+    // that subscription never shows as the plan.
+    const third = { ...subscription, id: "sub_third", items: { data: [{ price: { id: "price_base" }, current_period_end: end }] } };
+    await webhook("customer.subscription.deleted", { ...third, status: "canceled" }, { created: t + 40 });
+    await webhook("customer.subscription.created", third, { created: t + 30 });
+    expect((await billing(u)).plan).toMatchObject({ id: "max", status: "active" });
+    // Ended plan on record, then a stale event for an older one: still none.
+    await webhook("customer.subscription.deleted", { ...next, status: "canceled" }, { created: t + 50 });
+    expect((await billing(u)).plan).toBeUndefined();
+    await webhook("customer.subscription.updated", { ...subscription, id: "sub_ancient", status: "active" }, { created: t + 1 });
+    expect((await billing(u)).plan).toBeUndefined();
   });
 
   it("the portal needs a Stripe customer first", async () => {

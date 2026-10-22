@@ -932,6 +932,13 @@ export class CloudAccount extends DurableObject<Env> {
     // Before the laptop learns the device: its first send nudges this room
     // while the machine is still booting, and must queue, not 404.
     await this.claimDeviceRoom(s.deviceId, caller.userId);
+    // Credits can run out across those awaits: a refused start leaves no
+    // half-made session behind (unsaved, unworked, yet counted as awake).
+    if (this.balance() <= 0) {
+      this.sessions.delete(chatId);
+      this.byDevice.delete(s.deviceId);
+      return this.outOfCredits();
+    }
     return this.beginProvision(caller, s, edgeUrl);
   }
 
@@ -1790,15 +1797,20 @@ export class CloudAccount extends DurableObject<Env> {
         // newer state, and a canceled subscription never comes back.
         const stored = readBillingState<SubscriptionState & { eventAt?: number }>(sql, "subscription");
         const incoming = event.subscription;
+        // Every subscription ever seen canceled: Stripe's cancel is terminal,
+        // and it may arrive before that subscription's own earlier events.
+        const canceled = readBillingState<string[]>(sql, "canceledSubscriptions") ?? [];
+        if (incoming.status === "canceled" && !canceled.includes(incoming.id)) {
+          writeBillingState(sql, "canceledSubscriptions", [...canceled, incoming.id].slice(-50));
+        }
         const same = stored?.id === incoming.id;
+        // Older than what's on record, whichever subscription it's for.
         const older = stored?.eventAt !== undefined && event.createdAt !== undefined && event.createdAt < stored.eventAt;
-        const revived = same && stored?.status === "canceled" && incoming.status !== "canceled";
-        // Another subscription than the one on record takes over only when
-        // it is live and not older: a canceled old one, arriving late, must
-        // not erase the plan that replaced it (and let a second be bought).
-        const displaced =
-          stored !== undefined && !same && stored.status !== "canceled" && (incoming.status === "canceled" || older);
-        if (!(same && older) && !revived && !displaced) {
+        const revived = incoming.status !== "canceled" && canceled.includes(incoming.id);
+        // A canceled other subscription never erases the live one on record
+        // (and so never lets a second plan be bought).
+        const displaced = stored !== undefined && !same && stored.status !== "canceled" && incoming.status === "canceled";
+        if (!older && !revived && !displaced) {
           writeBillingState(sql, "subscription", { ...event.subscription, ...(event.createdAt !== undefined ? { eventAt: event.createdAt } : {}) });
         }
         break;

@@ -195,6 +195,7 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
 
     private func load() {
         if onCloud {
+            if cloud.info == nil { cloud.refresh() }
             cloud.refreshAccounts()
             collectionView.refreshControl?.endRefreshing()
             return
@@ -278,9 +279,9 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
 
     private func cloudRows() -> [Row] {
         if !cloudOffered, !app.isDemo {
-            // Not known yet: ask, and say so (a beta user's Cloud is coming).
+            // Not known yet: say so (a beta user's Cloud is coming; `load`
+            // asked for it — never from here, which runs on every change).
             if cloud.info == nil {
-                cloud.refresh()
                 return [Row(id: "loading", title: "Loading…", symbol: "ellipsis")]
             }
             // Landed on Cloud (no computers yet) without being offered it.

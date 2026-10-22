@@ -150,7 +150,8 @@ final class CloudStore {
     func refresh() {
         guard let client, refreshTask == nil else { return }
         loading = true
-        changed()
+        // The task is recorded before anyone hears of the change: an observer
+        // that re-renders and asks again must find this read in flight.
         refreshTask = Task { [weak self] in
             defer {
                 // Signed out (or into another account) meanwhile: reset()
@@ -204,6 +205,7 @@ final class CloudStore {
             }
             self?.retryDelay = 30
         }
+        changed()
     }
 
     /// How long until a failed status read is tried again.
