@@ -10,8 +10,9 @@
 //! everywhere it works the same way. Nothing restarts it behind the app's
 //! back: the app starts it again the next time it opens (or when its
 //! connection drops). After an app update it restarts into the new version
-//! once nothing is running — by stopping while the app runs (the app starts
-//! the new one, its child), relaunching itself only when it doesn't.
+//! once nothing is running — on macOS only while the app runs, by stopping
+//! so the app starts the new one as its child; elsewhere by relaunching
+//! itself.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -234,26 +235,21 @@ fn stop_when_uninstalled(
     });
 }
 
-/// Whether the app that started this engine runs now. On macOS an engine
-/// it starts is its child and attributed to it — Keychain and privacy
-/// permissions included. One this engine relaunched instead (orphaned when
+/// Whether the app that starts this engine runs now. On macOS an engine
+/// the app starts is its child and attributed to it — Keychain and privacy
+/// permissions included. One this engine relaunched itself (orphaned when
 /// this one exits) was found outside the user's Keychain after an update:
 /// Claude Code reported "Not logged in" and sign-ins failed until the app
-/// started the engine again. So while the app runs, a restart into a new
-/// version leaves the start to it (its reconnect starts the engine when the
-/// port goes quiet). Elsewhere a child of the app has no such tie.
+/// started the engine again. So on macOS a restart into a new version only
+/// happens while the app runs, and leaves the start to it (its reconnect
+/// starts the engine when the port goes quiet); until then this engine keeps
+/// serving — the running image outlives the update on disk.
+#[cfg(target_os = "macos")]
 fn app_starts_engine() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        let Some(bundle) = std::env::var_os(APP_ENV).map(PathBuf::from) else {
-            return false;
-        };
-        app_running(&bundle.join("Contents").join("MacOS"))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
+    let Some(bundle) = std::env::var_os(APP_ENV).map(PathBuf::from) else {
+        return false;
+    };
+    app_running(&bundle.join("Contents").join("MacOS"))
 }
 
 /// A process runs from `dir` (the bundle's `Contents/MacOS`) that isn't one
@@ -334,8 +330,13 @@ impl Engine {
         };
 
         let restart_stop = stop_tx.clone();
+        // macOS: the new version is only ever started by the app (see
+        // `app_starts_engine`), so the restart waits for the app to run and
+        // this engine keeps serving the old version until then.
+        #[cfg(target_os = "macos")]
+        zeron_update::set_managed_restart_ready(app_starts_engine);
         zeron_update::set_managed_restart(move || {
-            if app_starts_engine() {
+            if cfg!(target_os = "macos") {
                 tracing::info!("restarting into the update: the app starts the new engine");
             } else {
                 relaunch_self()?;
