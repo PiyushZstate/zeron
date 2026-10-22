@@ -154,7 +154,7 @@ pub(crate) mod geom {
     /// Error cards: inner padding, and their action button.
     pub const NOTICE_PAD: f32 = 12.0;
     pub const NOTICE_BUTTON: f32 = 32.0;
-    pub const NOTICE_BUTTON_W: f32 = 96.0;
+    pub const NOTICE_BUTTON_W: f32 = 80.0;
     pub const IMAGE: f32 = 260.0;
     pub const WORKING: f32 = 36.0;
     pub const VISUAL_LOADING: f32 = 18.0;
@@ -859,29 +859,33 @@ pub(crate) fn place_row(
         }
         Content::Notice(n) => {
             // Card: padding, the warning glyph beside the text, and the
-            // action button under it.
+            // action button trailing it; text and button centered on each
+            // other.
             let pad = px.v(NOTICE_PAD);
             let icon = px.v(16.0);
-            let text_x = x + pad + icon + px.v(10.0);
-            let text_w = (cw - (text_x - x) - pad).max(px.v(40.0));
-            let button_h = px.v(NOTICE_BUTTON);
+            let gap = px.v(10.0);
+            let text_x = x + pad + icon + gap;
+            let button = n.action.map(|_| (px.v(NOTICE_BUTTON_W), px.v(NOTICE_BUTTON)));
+            let trailing = button.map_or(0.0, |(w, _)| w + gap);
+            let text_w = (cw - (text_x - x) - pad - trailing).max(px.v(40.0));
             // Measure first (no output), then paint the card under the text.
             let th = place_text(&n.text, text_x, top + pad, text_w, None);
-            let body = th + if n.action.is_some() { px.v(10.0) + button_h } else { 0.0 };
+            let body = button.map_or(th, |(_, bh)| th.max(bh));
             let h = body + pad * 2.0;
+            let text_y = top + pad + (body - th) / 2.0;
             if let Some(out) = out.as_deref_mut() {
                 out.fill(x, top, cw, h, px.v(14.0), ColorRole::DangerWash);
                 out.widget(
                     WidgetKind::Icon { name: "exclamationmark.triangle.fill".into(), color: ColorRole::DangerSoft },
-                    (x + pad, top + pad + (n.text.lh - icon) / 2.0, icon, icon),
+                    (x + pad, text_y + (n.text.lh - icon) / 2.0, icon, icon),
                     None,
                 );
             }
-            place_text(&n.text, text_x, top + pad, text_w, out.as_deref_mut());
-            if let (Some((action, label)), Some(out)) = (n.action, out) {
+            place_text(&n.text, text_x, text_y, text_w, out.as_deref_mut());
+            if let (Some((action, label)), Some((bw, bh)), Some(out)) = (n.action, button, out) {
                 out.widget(
                     WidgetKind::Action { action: action.into(), label: label.into() },
-                    (text_x, top + pad + th + px.v(10.0), px.v(NOTICE_BUTTON_W).min(text_w), button_h),
+                    (x + cw - pad - bw, top + pad + (body - bh) / 2.0, bw, bh),
                     None,
                 );
             }

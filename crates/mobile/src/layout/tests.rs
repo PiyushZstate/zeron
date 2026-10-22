@@ -1297,6 +1297,10 @@ fn errors_render_as_cards_with_a_log_in_button_when_signing_in_fixes_them() {
         assert_eq!(actions.is_empty(), !wants_button, "row {i}: {actions:?}");
         if wants_button {
             assert_eq!(actions, [("sign-in", "Log in")]);
+            // The button trails the text, never under it.
+            let button = d.widgets.iter().find(|w| matches!(w.kind, display::WidgetKind::Action { .. })).unwrap();
+            let text_right = d.runs.iter().map(|r| r.x + r.width).fold(0.0, f32::max);
+            assert!(button.x > text_right, "row {i}: button at {} beside text ending {text_right}", button.x);
         }
     }
 }

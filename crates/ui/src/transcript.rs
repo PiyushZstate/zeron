@@ -49,7 +49,7 @@ use crate::markdown::parser::{
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _};
-use crate::notice::{NoticeChipIcon::Tile, notice_chip};
+use crate::notice::{NoticeChipIcon::Tile, notice_chip_with_action};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
@@ -9141,7 +9141,7 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// The transcript ErrorChip — the shared [`notice_chip`] in its tile
+/// The transcript ErrorChip — the shared [`notice_chip_with_action`] in its tile
 /// treatment (a port of zeron chat-view.tsx `ErrorChip`, restacked for long
 /// payloads: header row with the red-washed tile and the medium "Error"
 /// label, then the human message below). Unlike the web port, the message
@@ -9150,7 +9150,7 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
 /// zeronsh/comet#95 undiagnosable from the screenshot.
 ///
 /// A refusal that signing in fixes (signed out, out of usage) says so in the
-/// label and carries a "Log in" button for that chat's provider.
+/// label and carries a "Log in" button on its right for that chat's provider.
 fn error_chip(
     message: SharedString,
     problem: Option<zeron_proto::run_errors::ProviderProblem>,
@@ -9185,12 +9185,16 @@ fn error_chip(
         .py(px(4.0))
         .w_full()
         .child(
-            notice_chip(theme, false, label, message, Tile)
-                .overflow_hidden()
-                .w_full()
-                .when_some(button, |chip, button| {
-                    chip.child(div().pt(px(2.0)).flex().child(button))
-                }),
+            notice_chip_with_action(
+                theme,
+                false,
+                label,
+                message,
+                Tile,
+                button.map(IntoElement::into_any_element),
+            )
+            .overflow_hidden()
+            .w_full(),
         )
         .into_any_element()
 }

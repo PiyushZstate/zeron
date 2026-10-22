@@ -36,6 +36,19 @@ pub fn notice_chip(
     message: impl Into<SharedString>,
     icon: NoticeChipIcon,
 ) -> Div {
+    notice_chip_with_action(theme, warning, label, message, icon, None)
+}
+
+/// [`notice_chip`] with an action trailing the header and message (the
+/// transcript's "Log in"), centered on them.
+pub fn notice_chip_with_action(
+    theme: &Theme,
+    warning: bool,
+    label: &'static str,
+    message: impl Into<SharedString>,
+    icon: NoticeChipIcon,
+    action: Option<AnyElement>,
+) -> Div {
     let (accent, muted) = if warning {
         (theme.warning, theme.warning_muted)
     } else {
@@ -90,51 +103,71 @@ pub fn notice_chip(
     };
     // The tile pins its own label/message colors; the plain icon inherits the
     // chip-wide muted accent.
-    chip.child(
-        div()
-            .flex()
+    let copy = div()
+        .id("notice-copy")
+        .flex_none()
+        .size(px(20.0))
+        .rounded(px(6.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(move |s| s.bg(accent.opacity(0.12)))
+        // The composer chip dismisses on click; copying must
+        // not take the notice with it.
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_message.to_string()));
+        })
+        .tooltip(crate::settings::widgets::text_tooltip("Copy message"))
+        .child(
+            crate::icons::icon(crate::icons::COPY)
+                .size(px(12.0))
+                .text_color(muted.opacity(0.8)),
+        );
+    let header = div()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .child(header_icon)
+        .child(
+            div()
+                .font_weight(FontWeight::MEDIUM)
+                .when(tile, |label| label.text_color(muted.opacity(0.8)))
+                .child(label),
+        )
+        .child(div().flex_1());
+    let message = div()
+        .min_w_0()
+        .w_full()
+        .when(tile, |message| message.text_color(muted))
+        .child(message);
+    match action {
+        // Copy pinned to the header's top-right corner.
+        None => chip.child(header.child(copy)).child(message),
+        // Copy rides beside the action, both centered on the text.
+        Some(action) => chip
+            .flex_row()
             .items_center()
-            .gap(px(8.0))
-            .child(header_icon)
+            .gap(px(12.0))
             .child(
                 div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .when(tile, |label| label.text_color(muted.opacity(0.8)))
-                    .child(label),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(header)
+                    .child(message),
             )
-            .child(div().flex_1())
             .child(
                 div()
-                    .id("notice-copy")
                     .flex_none()
-                    .size(px(20.0))
-                    .rounded(px(6.0))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(accent.opacity(0.12)))
-                    // The composer chip dismisses on click; copying must
-                    // not take the notice with it.
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                            copy_message.to_string(),
-                        ));
-                    })
-                    .tooltip(crate::settings::widgets::text_tooltip("Copy message"))
-                    .child(
-                        crate::icons::icon(crate::icons::COPY)
-                            .size(px(12.0))
-                            .text_color(muted.opacity(0.8)),
-                    ),
+                    .gap(px(6.0))
+                    .child(copy)
+                    .child(action),
             ),
-    )
-    .child(
-        div()
-            .min_w_0()
-            .w_full()
-            .when(tile, |message| message.text_color(muted))
-            .child(message),
-    )
+    }
 }
