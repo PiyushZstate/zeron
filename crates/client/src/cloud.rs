@@ -696,6 +696,46 @@ impl Client {
         Ok(chat_id)
     }
 
+    /// Cloud's models for `harness` as the edge lists them (kept there by
+    /// hand, so a new model needs no app release, and no computer or Cloud
+    /// machine is asked); the last list read while the edge is out of reach;
+    /// the curated static list before the first.
+    pub async fn cloud_models(&self, harness: &str) -> Vec<crate::catalog::ModelInfo> {
+        const CLOUD_CATALOG: &str = "cloud";
+        #[derive(Deserialize)]
+        struct Models {
+            #[serde(default)]
+            models: std::collections::HashMap<String, Vec<crate::catalog::ModelInfo>>,
+        }
+        let cache = crate::catalog::DiskCatalog::new(&self.inner.config.data_dir);
+        if let Ok(reply) = self
+            .cloud_call::<Models>(
+                reqwest::Method::GET,
+                &["cloud", "models"],
+                &[],
+                None,
+                "Read Cloud's models",
+            )
+            .await
+        {
+            for (agent, list) in reply.models {
+                if !list.is_empty() {
+                    let list = crate::catalog::normalize_models(&agent, list);
+                    cache.put_models(CLOUD_CATALOG, &agent, &list);
+                }
+            }
+            // Rows and chips pick up newly learned model labels.
+            self.inner.recompute_workspace();
+        }
+        match cache.models(CLOUD_CATALOG, harness) {
+            Some(list) => {
+                crate::catalog::learn_labels(harness, &list);
+                list
+            }
+            None => crate::catalog::fallback_models(harness),
+        }
+    }
+
     // ── plumbing ────────────────────────────────────────────────────────────
 
     async fn account_list(

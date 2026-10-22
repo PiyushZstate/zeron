@@ -1056,8 +1056,8 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
     func closeSession(chatId: String) 
     
     /**
-     * Cloud's model catalog for `harness`: from one of the user's online
-     * computers (never a Cloud machine), else cached, else the static list.
+     * Cloud's model catalog for `harness`: the edge's list, else the last
+     * one read, else the static list.
      */
     func cloudModels(harness: String) async  -> [ModelInfo]
     
@@ -1532,8 +1532,8 @@ open func closeSession(chatId: String)  {try! rustCall() {
 }
     
     /**
-     * Cloud's model catalog for `harness`: from one of the user's online
-     * computers (never a Cloud machine), else cached, else the static list.
+     * Cloud's model catalog for `harness`: the edge's list, else the last
+     * one read, else the static list.
      */
 open func cloudModels(harness: String)async  -> [ModelInfo]  {
     return
@@ -19710,7 +19710,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zeron_mobile_checksum_method_coreclient_close_session() != 11270) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_zeron_mobile_checksum_method_coreclient_cloud_models() != 33439) {
+    if (uniffi_zeron_mobile_checksum_method_coreclient_cloud_models() != 32016) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_connectivity() != 51284) {

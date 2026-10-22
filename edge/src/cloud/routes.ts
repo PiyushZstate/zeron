@@ -33,6 +33,7 @@ import { json, jsonError, readJsonBody } from "../http";
 import type { CloudResult, RepoInput } from "./cloud-account";
 import { isEdgeOrigin } from "./install-script";
 import { DAY_MS, dayKey, isDayKey } from "./metering";
+import { CLOUD_MODELS } from "./models";
 
 /** The longest range a usage read covers. */
 const MAX_USAGE_DAYS = 366;
@@ -257,6 +258,10 @@ export const handleCloudRoute = async (
     }
     if (!ns) return json({ from, to, days: [], credits: 0, balance: 0, available: false });
     return rpc(() => accountStub(ns, orgId, auth.userId).usage(caller, from, to));
+  }
+  if (rest.length === 1 && rest[0] === "models" && request.method === "GET") {
+    // Static (models.ts): readable whether or not this account turned Cloud on.
+    return json({ models: CLOUD_MODELS });
   }
   if (rest[0] === "billing") {
     if (!ns) return unavailable();

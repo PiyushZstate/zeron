@@ -1264,53 +1264,6 @@ impl Client {
         }
     }
 
-    /// Cloud's catalog for `harness`, without dialing — let alone waking — a
-    /// session machine: one of the user's own online computers answers (Cloud
-    /// machines run the same CLIs; the desktop engine answers for Cloud the
-    /// same way), cached as Cloud's; else the last one learned; else the
-    /// curated list.
-    pub async fn cloud_models(&self, harness: &str) -> Vec<ModelInfo> {
-        const CLOUD_CATALOG: &str = "cloud";
-        let cache = catalog::DiskCatalog::new(&self.inner.config.data_dir);
-        if let Some(live) = self.inner.live() {
-            let hosts: Vec<String> = self
-                .inner
-                .workspace
-                .snapshot()
-                .execution_devices()
-                .into_iter()
-                .filter(|d| d.online && !d.is_self && !zeron_proto::is_cloud_device(&d.id, ""))
-                .map(|d| d.id)
-                .collect();
-            for host in hosts {
-                let reply = live
-                    .relay
-                    .call(
-                        &host,
-                        zeron_rpc::methods::LIST_MODELS,
-                        serde_json::json!({ "harness": harness }),
-                    )
-                    .await
-                    .ok()
-                    .and_then(|v| serde_json::from_value::<Vec<ModelInfo>>(v).ok());
-                if let Some(list) = reply.filter(|list| !list.is_empty()) {
-                    let list = catalog::normalize_models(harness, list);
-                    cache.put_models(CLOUD_CATALOG, harness, &list);
-                    cache.put_models(&host, harness, &list);
-                    self.inner.recompute_workspace();
-                    return list;
-                }
-            }
-        }
-        match cache.models(CLOUD_CATALOG, harness) {
-            Some(list) => {
-                catalog::learn_labels(harness, &list);
-                list
-            }
-            None => catalog::fallback_models(harness),
-        }
-    }
-
     // ── push notifications ────────────────────────────────────────────────
 
     /// Ask for session notifications on this device: its APNs `token` (hex),

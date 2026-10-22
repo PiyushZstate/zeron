@@ -89,6 +89,21 @@ describe("account", () => {
   });
 });
 
+describe("models", () => {
+  it("lists Cloud's models for each agent, Cloud on or off", async () => {
+    const u = newUser();
+    const res = await call("GET", "/cloud/org1/models", userBearer(u));
+    expect(res.status).toBe(200);
+    const { models } = (await res.json()) as { models: Record<string, { id: string; label: string }[]> };
+    expect(Object.keys(models).sort()).toEqual(["claude-code", "codex"]);
+    for (const list of Object.values(models)) {
+      expect(list.length).toBeGreaterThan(0);
+      expect(new Set(list.map((m) => m.id)).size).toBe(list.length);
+    }
+    expect((await call("GET", "/cloud/org2/models", userBearer(u))).status).toBe(403);
+  });
+});
+
 describe("sessions get their own machines", () => {
   it("provisions a noEnv sandbox per chat with the project, idempotently per chat", async () => {
     const u = newUser();

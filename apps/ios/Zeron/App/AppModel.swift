@@ -607,8 +607,8 @@ final class AppModel {
     /// The agents Cloud runs.
     static let cloudHarnesses = ["claude-code", "codex"]
 
-    /// Cloud's models, as one of the user's own computers reports them (a
-    /// Cloud machine is never dialed for a catalog).
+    /// Cloud's models, as the edge lists them (no computer or Cloud machine
+    /// is asked).
     func cloudModels() async -> [ModelChoice] {
         guard let client else { return [] }
         var out: [ModelChoice] = []

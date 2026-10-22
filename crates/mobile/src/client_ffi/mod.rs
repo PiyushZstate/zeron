@@ -386,8 +386,8 @@ impl CoreClient {
             .collect()
     }
 
-    /// Cloud's model catalog for `harness`: from one of the user's online
-    /// computers (never a Cloud machine), else cached, else the static list.
+    /// Cloud's model catalog for `harness`: the edge's list, else the last
+    /// one read, else the static list.
     pub async fn cloud_models(&self, harness: String) -> Vec<ModelInfo> {
         let client = self.client.clone();
         let fallback = harness.clone();
