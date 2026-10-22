@@ -25,6 +25,7 @@ export type StripeEnv = Pick<
   | "STRIPE_PRICE_PRO"
   | "STRIPE_PRICE_MAX"
   | "STRIPE_PRICE_CREDITS"
+  | "STRIPE_PORTAL_CONFIGURATION"
   | "STRIPE_API_URL"
 >;
 
@@ -191,7 +192,9 @@ export const createCheckout = async (
 export const createPortal = async (env: StripeEnv, customer: string, returnUrl: string): Promise<string> => {
   const session = await stripePost<{ url: string }>(env, "billing_portal/sessions", {
     customer,
-    return_url: `${returnUrl}?result=portal`
+    return_url: `${returnUrl}?result=portal`,
+    // Cloud's own portal: the account's default may serve other products.
+    ...(env.STRIPE_PORTAL_CONFIGURATION ? { configuration: env.STRIPE_PORTAL_CONFIGURATION } : {})
   });
   return session.url;
 };

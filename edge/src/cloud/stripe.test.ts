@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { billingAvailable, formEncode, parseEvent, signPayload, verifySignature, type StripeEnv } from "./stripe";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { billingAvailable, createPortal, formEncode, parseEvent, signPayload, verifySignature, type StripeEnv } from "./stripe";
 
 const env: StripeEnv = {
   STRIPE_SECRET_KEY: "sk",
@@ -12,10 +12,24 @@ const env: StripeEnv = {
 const account = { orgId: "org1", userId: "u1" };
 
 describe("stripe", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
   it("is available only when every key and price is set", () => {
     expect(billingAvailable(env)).toBe(true);
     expect(billingAvailable({ ...env, STRIPE_PRICE_MAX: undefined })).toBe(false);
     expect(billingAvailable({})).toBe(false);
+  });
+
+  it("opens Cloud's own portal when one is configured", async () => {
+    const bodies: string[] = [];
+    vi.stubGlobal("fetch", async (_url: string, init: RequestInit) => {
+      bodies.push(String(init.body));
+      return new Response(JSON.stringify({ url: "https://portal" }));
+    });
+    await createPortal(env, "cus_1", "https://edge/billing/done");
+    await createPortal({ ...env, STRIPE_PORTAL_CONFIGURATION: "bpc_cloud" }, "cus_1", "https://edge/billing/done");
+    expect(bodies[0]).not.toContain("configuration");
+    expect(bodies[1]).toContain("configuration=bpc_cloud");
   });
 
   it("form-encodes nested keys the way Stripe reads them", () => {

@@ -75,6 +75,9 @@ export interface Env {
   STRIPE_PRICE_PRO?: string;
   STRIPE_PRICE_MAX?: string;
   STRIPE_PRICE_CREDITS?: string;
+  /** The Billing Portal configuration Cloud's customers get (its plans,
+   * switching, cancelling). Unset ⇒ the account's default portal. */
+  STRIPE_PORTAL_CONFIGURATION?: string;
   /** Stripe API origin override (tests point it at a fake). */
   STRIPE_API_URL?: string;
   /** Origin session engines talk to; default = the creating request's
