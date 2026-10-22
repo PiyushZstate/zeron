@@ -9150,7 +9150,7 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
 /// zeronsh/comet#95 undiagnosable from the screenshot.
 ///
 /// A refusal that signing in fixes (signed out, out of usage) says so in the
-/// label and carries a "Log in" button on its right for that chat's provider.
+/// label and carries a "Log in" button for that chat's provider.
 fn error_chip(
     message: SharedString,
     problem: Option<zeron_proto::run_errors::ProviderProblem>,

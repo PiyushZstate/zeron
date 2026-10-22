@@ -20,8 +20,8 @@ pub enum NoticeChipIcon {
 
 /// The failure notice both surfaces render (zeron composer.tsx `Notice`,
 /// chat-view.tsx `ErrorChip`): a tinted rounded chip — `border
-/// <accent>/[0.16]` over a `<accent>/[0.05]` wash (0.1 for the transcript's tile), a tinted wash,
-/// never a bare stroke — with a header row (DangerTriangle + medium label, a
+/// <accent>/[0.16]` over a `<accent>/[0.05]` wash (the transcript's tile:
+/// a borderless 0.1 wash), never a bare stroke — with a header row (DangerTriangle + medium label, a
 /// tiny copy button pinned to its top-right corner — failure payloads are
 /// meant to be pasted, not screenshotted) and the message below. The message WRAPS instead of truncating: failure payloads carry
 /// exit statuses and stderr, and a one-line ellipsis was exactly what made
@@ -39,8 +39,8 @@ pub fn notice_chip(
     notice_chip_with_action(theme, warning, label, message, icon, None)
 }
 
-/// [`notice_chip`] with an action trailing the header and message (the
-/// transcript's "Log in"), centered on them.
+/// [`notice_chip`] with an action under the message (the transcript's
+/// "Log in").
 pub fn notice_chip_with_action(
     theme: &Theme,
     warning: bool,
@@ -66,8 +66,10 @@ pub fn notice_chip_with_action(
             .flex_col()
             .gap(px(6.0))
             .rounded(px(inset))
-            .border_1()
-            .border_color(accent.opacity(0.16))
+            // The transcript's alert is borderless: the wash alone.
+            .when(!tile, |chip| {
+                chip.border_1().border_color(accent.opacity(0.16))
+            })
             .bg(accent.opacity(wash))
             .px(px(inset))
             .py(px(8.0))
@@ -142,32 +144,11 @@ pub fn notice_chip_with_action(
         .w_full()
         .when(tile, |message| message.text_color(muted))
         .child(message);
-    match action {
-        // Copy pinned to the header's top-right corner.
-        None => chip.child(header.child(copy)).child(message),
-        // Copy rides beside the action, both centered on the text.
-        Some(action) => chip
-            .flex_row()
-            .items_center()
-            .gap(px(12.0))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .child(header)
-                    .child(message),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(copy)
-                    .child(action),
-            ),
-    }
+    // Copy pinned to the header's top-right corner; an action goes under
+    // the message.
+    chip.child(header.child(copy))
+        .child(message)
+        .when_some(action, |chip, action| {
+            chip.child(div().pt(px(2.0)).flex().child(action))
+        })
 }
