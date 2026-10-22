@@ -23,6 +23,11 @@ final class CoreSessionSource: SessionSource {
     /// host doesn't open until it answers.
     private var hostHarnesses: [HarnessInfo] = []
     private var harnessesDevice = ""
+    /// What a chat with no model of its own runs: its host's default (the
+    /// catalog's first model), by "device|harness". Seeded from the built-in
+    /// list so the chip never shows a bare provider name, then the host's.
+    private var defaultModels: [String: ModelPickerRow] = [:]
+    private var defaultModelsLoading: Set<String> = []
     private weak var engine: TranscriptView?
 
     init(app: AppModel, client: CoreClient, handle: SessionHandle, chatId: String) {
@@ -84,7 +89,7 @@ final class CoreSessionSource: SessionSource {
         next.canSteer = c.host.capabilities.midTurnSteering ?? false
         next.placeholder = "Message \(row?.harnessLabel ?? "the agent")"
         var chips: [ComposerChip] = []
-        if let model = row?.modelLabel ?? row?.harnessLabel {
+        if let model = row?.modelLabel ?? row.flatMap({ defaultModel(for: $0)?.label }) ?? row?.harnessLabel {
             chips.append(ComposerChip(id: "model", title: model, symbol: nil, icon: BrandMarks.image(for: row?.harness ?? "claude-code", side: 13)))
         }
         if let r = row?.reasoning, !r.isEmpty {
@@ -296,7 +301,9 @@ final class CoreSessionSource: SessionSource {
             : hostSwitchesProviders ? nil
             : "This computer needs a newer Zeron to switch provider."
         let host = row.isCloud ? (name: "Cloud", symbol: "cloud") : (name: app?.deviceName(hostDevice) ?? "This computer", symbol: "desktopcomputer")
-        return ModelPickerViewController.sheet(tabs: tabs, harness: harness, model: row.model, host: host, note: note) { [weak self] pickedHarness, model in
+        // No model of its own: it runs the default, so that's the one ticked.
+        let current = row.model ?? defaultModel(for: row)?.id
+        return ModelPickerViewController.sheet(tabs: tabs, harness: harness, model: current, host: host, note: note) { [weak self] pickedHarness, model in
             self?.setConfig {
                 if pickedHarness != $0.harness {
                     $0.harness = pickedHarness
@@ -307,6 +314,28 @@ final class CoreSessionSource: SessionSource {
                 $0.model = model.id
             }
         }
+    }
+
+    /// The model a chat without one runs: the host's default for its
+    /// provider. The built-in list answers at once; the host's (or Cloud's)
+    /// own list replaces it when it arrives.
+    private func defaultModel(for row: SessionRow) -> ModelPickerRow? {
+        let harness = row.harness ?? "claude-code"
+        let key = "\(hostDevice)|\(harness)"
+        if defaultModels[key] == nil, let first = fallbackModels(harness: harness).first {
+            defaultModels[key] = ModelPickerRow(id: first.id, label: first.label, detail: first.description)
+        }
+        if !hostDevice.isEmpty, defaultModelsLoading.insert(key).inserted {
+            let device = hostDevice
+            Task { @MainActor [weak self] in
+                guard let self, let first = await self.client.listModels(deviceId: device, harness: harness).first else { return }
+                let row = ModelPickerRow(id: first.id, label: first.label, detail: first.description)
+                guard self.defaultModels[key] != row else { return }
+                self.defaultModels[key] = row
+                self.refresh()
+            }
+        }
+        return defaultModels[key]
     }
 
     /// The providers a chat on this host can move to: Cloud runs Claude

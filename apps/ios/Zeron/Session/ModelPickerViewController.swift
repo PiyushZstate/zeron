@@ -502,8 +502,13 @@ private final class ModelCell: UICollectionViewCell {
         check.alpha = current ? 1 : 0
         updatePlate()
         accessibilityLabel = [row.label, row.detail].compactMap { $0 }.joined(separator: ", ")
-        accessibilityTraits = current ? [.button, .selected] : .button
+        accessibilityValue = current ? "Current" : nil
         accessibilityIdentifier = "model-picker-row-\(row.id)"
+    }
+
+    override var accessibilityTraits: UIAccessibilityTraits {
+        get { isCurrent ? [.button, .selected] : .button }
+        set {}
     }
 
     override var isHighlighted: Bool {

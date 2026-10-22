@@ -197,6 +197,8 @@ pub(crate) fn chats() -> Vec<DemoChat> {
         DemoChat {
             last_ago_ms: 5 * DAY,
             created_ago_ms: 6 * DAY,
+            // Started without picking a model: it runs the default.
+            model: "",
             ..chat(
                 "chat-blog",
                 Some("space-blog"),
@@ -430,7 +432,7 @@ pub(crate) fn seed(
             source_context: source_context.clone(),
             config: Some(ChatConfig {
                 harness: demo.harness,
-                model: Some(demo.model.into()),
+                model: (!demo.model.is_empty()).then(|| demo.model.into()),
                 reasoning: Some(demo.reasoning),
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
