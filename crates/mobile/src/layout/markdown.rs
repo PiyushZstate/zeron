@@ -846,7 +846,7 @@ pub(crate) fn place_text(t: &PText, x: f32, y: f32, width: f32, out: Option<&mut
                 let size = (span.pad_start - 4.0).max(0.0);
                 out.widget(
                     WidgetKind::Icon { name: icon.clone(), color: ColorRole::TextSecondary },
-                    (x + f.x, text_top + (t.lh - size) / 2.0, size, size),
+                    (x + f.x + 2.0, text_top + (t.lh - size) / 2.0, size, size),
                     None,
                 );
             }

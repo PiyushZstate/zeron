@@ -734,9 +734,9 @@ fn chip_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, icon: &'static str, co
     }
 }
 
-/// The provider-switch seam: "Switched from [logo] Codex to [logo] Claude
-/// Code", each provider's logo before its name (as the desktop draws it).
-/// A seam written without harness ids reads the same, minus the logos.
+/// The provider-switch seam: "Switched from [logo] to [logo]", each
+/// provider by its logo alone (its name stays in the copied text). A seam
+/// written without harness ids names them instead.
 fn switch_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, from: (&str, Option<&str>), to: (&str, Option<&str>)) -> RowCore {
     let (size, lh) = TYPE.small;
     let style = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
@@ -747,7 +747,9 @@ fn switch_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, from: (&str, Option<
     let mut marks = Vec::new();
     let mut push = |text: &mut String, piece: &str, harness: Option<&str>| {
         let start = text.len();
-        text.push_str(piece);
+        // A logo stands in for the name: a zero-width word joiner carries the
+        // padding the logo is drawn in.
+        text.push_str(if harness.is_some() { "\u{2060}" } else { piece });
         let pad = if harness.is_some() { mark + 4.0 } else { 0.0 };
         spans.push(zeron_text::Span { range: start..text.len(), style: style.id, pad_start: pad, pad_end: 0.0, atomic: harness.is_some(), inline_box: None });
         if let Some(harness) = harness {
