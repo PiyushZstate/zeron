@@ -935,7 +935,9 @@ export class CloudAccount extends DurableObject<Env> {
     // Credits can run out across those awaits: a refused start leaves no
     // half-made session behind (unsaved, unworked, yet counted as awake).
     if (this.balance() <= 0) {
-      this.sessions.delete(chatId);
+      // Only this record: a delete and re-create during the awaits put
+      // another one there.
+      if (this.sessions.get(chatId) === s) this.sessions.delete(chatId);
       this.byDevice.delete(s.deviceId);
       return this.outOfCredits();
     }
@@ -1810,7 +1812,14 @@ export class CloudAccount extends DurableObject<Env> {
         // A canceled other subscription never erases the live one on record
         // (and so never lets a second plan be bought).
         const displaced = stored !== undefined && !same && stored.status !== "canceled" && incoming.status === "canceled";
-        if (!older && !revived && !displaced) {
+        // Same subscription, same second: Checkout's `incomplete` never undoes
+        // the `active` it became.
+        const regressed =
+          same &&
+          stored?.eventAt === event.createdAt &&
+          incoming.status === "incomplete" &&
+          (stored?.status === "active" || stored?.status === "trialing");
+        if (!older && !revived && !displaced && !regressed) {
           writeBillingState(sql, "subscription", { ...event.subscription, ...(event.createdAt !== undefined ? { eventAt: event.createdAt } : {}) });
         }
         break;
