@@ -476,6 +476,28 @@ class SessionsViewController: SessionListController {
         navigationItem.rightBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "ellipsis"), menu: optionsMenu())
     }
 
+    /// iPhone: search lives in the bottom bar (the system's toolbar-integrated
+    /// field) and filters this list in place.
+    func enableToolbarSearch() {
+        guard navigationItem.searchController == nil else { return }
+        let search = UISearchController(searchResultsController: nil)
+        search.searchResultsUpdater = self
+        search.obscuresBackgroundDuringPresentation = false
+        search.searchBar.placeholder = "Search"
+        navigationItem.searchController = search
+        navigationItem.preferredSearchBarPlacement = .integrated
+        navigationItem.searchBarPlacementAllowsToolbarIntegration = true
+        // Otherwise the list opens scrolled past the large title.
+        navigationItem.hidesSearchBarWhenScrolling = false
+    }
+
+    func activateSearch() {
+        navigationItem.searchController?.isActive = true
+        DispatchQueue.main.async { [weak self] in
+            self?.navigationItem.searchController?.searchBar.becomeFirstResponder()
+        }
+    }
+
     override func buildSections() -> [(id: String, header: String?, folders: [FolderRowVM], sessions: [SessionRowVM])] {
         if !query.trimmingCharacters(in: .whitespaces).isEmpty {
             return [("results", nil, [], app.search(query))]
@@ -576,6 +598,8 @@ final class FolderViewController: SessionListController {
     init(app: AppModel, folder: FolderRowVM) {
         self.folder = folder
         super.init(app: app)
+        // The front page's bottom bar is the front page's alone.
+        hidesBottomBarWhenPushed = true
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -645,6 +669,12 @@ final class FolderViewController: SessionListController {
         // iPad presents action sheets as popovers: anchor it to the ⋯ button.
         alert.popoverPresentationController?.barButtonItem = navigationItem.rightBarButtonItem
         present(alert, animated: true)
+    }
+}
+
+extension SessionsViewController: UISearchResultsUpdating {
+    func updateSearchResults(for searchController: UISearchController) {
+        query = searchController.searchBar.text ?? ""
     }
 }
 

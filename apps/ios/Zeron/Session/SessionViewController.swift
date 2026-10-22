@@ -210,7 +210,6 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        setAccessory(visible: false)
         // Coming back on screen (e.g. after a second copy of this chat was
         // popped and detached it): live again.
         if hasAppeared { source.reattach() }
@@ -224,44 +223,6 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
 
     deinit {
         if let backgroundObserver { NotificationCenter.default.removeObserver(backgroundObserver) }
-    }
-
-    /// Swap the tab accessory *inside* the push/pop animation so it travels
-    /// with the tab bar instead of snapping ahead of it (no empty glass pill,
-    /// no composer ghosting over the tab bar).
-    private func setAccessory(visible: Bool) {
-        guard let tabs = tabBarController as? MainTabController else { return }
-        guard let coordinator = transitionCoordinator else {
-            return tabs.setAccessoryVisible(visible, animated: false)
-        }
-        // Our bottom glass (composer stack) and the tab bar's glass never
-        // overlap: the stack fades opposite to the tab bar, tracking an
-        // interactive swipe-back too.
-        let bottomStack = bottom
-        let jumpButton = jump
-        if visible {
-            bottomStack.alpha = 1
-            tabs.prepareAccessoryForReveal()
-        } else {
-            bottomStack.alpha = 0
-        }
-        coordinator.animate(alongsideTransition: { _ in
-            if visible {
-                tabs.setAccessoryContentAlpha(1)
-                jumpButton.alpha = 0
-            } else {
-                tabs.setAccessoryVisible(false, animated: false)
-            }
-            bottomStack.alpha = visible ? 0 : 1
-        }, completion: { context in
-            // An interactive pop that's cancelled keeps the session on screen.
-            // Re-derive the accessory from what's actually on top rather than
-            // flipping: a cancelled pop also re-runs viewWillAppear, and two
-            // flips left "New session" showing over the session.
-            if context.isCancelled { bottomStack.alpha = 1 }
-            tabs.syncAccessory()
-            tabs.setAccessoryContentAlpha(1)
-        })
     }
 
     // MARK: Opening (loader, then the transcript)
@@ -338,7 +299,6 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
                 self.showTranscriptIfReady()
             }
         }
-        (tabBarController as? MainTabController)?.syncAccessory()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -346,7 +306,6 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         // Leaving mid-edit: give the queued row back and the draft its place.
         if editingQueueId != nil { endEdit(commit: nil) }
         saveDraft()
-        if isMovingFromParent { setAccessory(visible: true) }
     }
 
     /// Tear down only once the pop has really happened: an interactive

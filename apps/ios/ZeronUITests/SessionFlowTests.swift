@@ -138,24 +138,25 @@ final class SessionFlowTests: XCTestCase {
         jump.tap()
     }
 
-    /// Search → back to Sessions / Settings (recorded for the accessory
-    /// transition).
-    func testSearchTabRoundTrip() {
+    /// The bottom bar's Search filters the list in place; leaving search
+    /// brings the bar (and New session) back.
+    func testBottomBarSearch() {
         let app = launch()
         XCTAssertTrue(app.staticTexts["Sessions"].waitForExistence(timeout: 10))
-        let accessory = app.buttons["new-session"]
-        XCTAssertTrue(accessory.waitForExistence(timeout: 5))
-        for back in ["Sessions", "Settings"] {
-            app.tabBars.buttons[back].tap()
-            sleep(1)
-            app.tabBars.buttons["Search"].tap()
-            sleep(2)
-            // Close beside the field leaves search for the tab you came from.
-            app.buttons["Close"].firstMatch.tap()
-            sleep(2)
-            XCTAssertTrue(accessory.waitForExistence(timeout: 5), "accessory back after search")
-            XCTAssertTrue(accessory.isHittable, "accessory usable after search")
-        }
+        let compose = app.buttons["new-session"]
+        XCTAssertTrue(compose.waitForExistence(timeout: 5))
+        let field = app.searchFields.firstMatch
+        XCTAssertTrue(field.waitForExistence(timeout: 5), "search in the bottom bar")
+        field.tap()
+        field.typeText("wrangler")
+        let match = app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'Wrangler deploy hygiene'")).firstMatch
+        XCTAssertTrue(match.waitForExistence(timeout: 5), "match shown")
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'Agent visuals'")).firstMatch.exists, "non-matches filtered out")
+        snapshot(app, "bottom-bar-search")
+        // The system's close button beside the field.
+        app.buttons["close"].firstMatch.tap()
+        XCTAssertTrue(compose.waitForExistence(timeout: 5), "bar back after search")
+        XCTAssertTrue(compose.isHittable, "New session usable after search")
     }
 
     /// Tapping a link in the transcript opens it (in-app Safari for web).
@@ -181,8 +182,8 @@ final class SessionFlowTests: XCTestCase {
         let ready = "/tmp/zeron-push-ready"
         try? FileManager.default.removeItem(atPath: ready)
         let app = launch()
-        XCTAssertTrue(app.tabBars.buttons["Settings"].waitForExistence(timeout: 10))
-        app.tabBars.buttons["Settings"].tap()
+        XCTAssertTrue(app.buttons["bottom-settings"].waitForExistence(timeout: 10))
+        app.buttons["bottom-settings"].tap()
         let toggle = app.switches["toggle-notify:enabled"]
         XCTAssertTrue(toggle.waitForExistence(timeout: 5))
         if (toggle.value as? String) != "1" {
@@ -232,14 +233,17 @@ final class SessionFlowTests: XCTestCase {
         snapshot(app, "unknown-chat-returned-to-sessions")
     }
 
-    func testTabsAndSearch() {
+    func testSettingsFromBottomBar() {
         let app = launch()
         XCTAssertTrue(app.staticTexts["Sessions"].waitForExistence(timeout: 10))
-        app.tabBars.buttons["Settings"].tap()
+        snapshot(app, "bottom-bar")
+        app.buttons["bottom-settings"].tap()
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["new-session"].exists, "the bar stays on the front page")
         snapshot(app, "settings")
-        app.tabBars.buttons["Sessions"].tap()
+        app.navigationBars["Settings"].buttons.firstMatch.tap()
         XCTAssertTrue(app.navigationBars["Sessions"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["new-session"].waitForExistence(timeout: 5))
     }
 
     /// Render Math toggles the Math Font row; the font picks from a sheet of
@@ -247,7 +251,7 @@ final class SessionFlowTests: XCTestCase {
     func testMathSettings() {
         let app = launch()
         XCTAssertTrue(app.staticTexts["Sessions"].waitForExistence(timeout: 10))
-        app.tabBars.buttons["Settings"].tap()
+        app.buttons["bottom-settings"].tap()
         XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 5))
         let toggle = app.switches["toggle-math:render"]
         for _ in 0..<6 where !toggle.exists || !toggle.isHittable { app.swipeUp() }
@@ -321,7 +325,7 @@ final class SessionFlowTests: XCTestCase {
         let app = launch()
         let cell = app.cells["session-chat-deploy"]
         XCTAssertTrue(cell.waitForExistence(timeout: 10))
-        // Recent sits below the inline sections; bring the row clear of the accessory.
+        // Recent sits below the inline sections; bring the row clear of the bottom bar.
         app.collectionViews.firstMatch.swipeUp()
         cell.swipeLeft()
         app.buttons["Archive"].tap()
@@ -660,7 +664,7 @@ final class SessionFlowTests: XCTestCase {
         start.press(forDuration: 0.05, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.5)), withVelocity: .slow, thenHoldForDuration: 0.3)
         sleep(1)
         XCTAssertTrue(input.exists, "still on the session")
-        XCTAssertFalse(app.buttons["new-session"].isHittable, "no New session accessory over the session")
+        XCTAssertFalse(app.buttons["new-session"].isHittable, "no bottom bar over the session")
         // The reply keeps streaming to completion.
         XCTAssertTrue(app.staticTexts.matching(identifier: "row-markdown").element(boundBy: 0).waitForExistence(timeout: 20))
         XCTAssertTrue(app.buttons["Send message"].waitForExistence(timeout: 40), "turn settles (updates still arriving)")
