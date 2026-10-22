@@ -3459,6 +3459,9 @@ enum BlobFetch {
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
+    /// An error card's "Log in": sign in to the provider this chat's run
+    /// was refused by (signed out, or out of usage).
+    SignIn { chat_id: String },
     /// A spawn chip's "Open subagent" affordance: open the subagent's
     /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
     /// in (the frozen blob is keyed `{chat_id}/{doc_id}`); `frozen` means
@@ -7639,7 +7642,22 @@ impl Transcript {
             RowKind::Visual { owner, path, title } => {
                 self.render_visual(&row.id, owner, path, title, cx)
             }
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::ErrorChip { message } => {
+                let problem = zeron_proto::run_errors::provider_problem(message);
+                let sign_in = self
+                    .chat_id
+                    .clone()
+                    .filter(|_| problem.is_some())
+                    .map(|chat_id| {
+                        let chat_id = chat_id.to_string();
+                        cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
+                            cx.emit(TranscriptEvent::SignIn {
+                                chat_id: chat_id.clone(),
+                            });
+                        })
+                    });
+                error_chip(message.clone(), problem, sign_in, &theme)
+            }
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
             RowKind::SwitchMarker {
                 from,
@@ -9130,14 +9148,49 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
 /// WRAPS instead of truncating: startup-crash errors carry the agent's exit
 /// status and stderr, and a one-line ellipsis was exactly what made
 /// zeronsh/comet#95 undiagnosable from the screenshot.
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+///
+/// A refusal that signing in fixes (signed out, out of usage) says so in the
+/// label and carries a "Log in" button for that chat's provider.
+fn error_chip(
+    message: SharedString,
+    problem: Option<zeron_proto::run_errors::ProviderProblem>,
+    sign_in: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>,
+    theme: &Theme,
+) -> AnyElement {
+    use zeron_proto::run_errors::ProviderProblem;
+    let label = match problem {
+        Some(ProviderProblem::SignedOut) => "Signed out",
+        Some(ProviderProblem::LimitReached) => "Limit reached",
+        None => "Error",
+    };
+    let button = sign_in.map(|on_click| {
+        div()
+            .id("error-sign-in")
+            .flex_none()
+            .h(px(26.0))
+            .px(px(12.0))
+            .rounded_full()
+            .flex()
+            .items_center()
+            .bg(theme.danger_muted)
+            .text_color(theme.bg)
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(px(12.0))
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.9))
+            .on_click(on_click)
+            .child(problem.map_or("Log in", ProviderProblem::action_label))
+    });
     div()
         .py(px(4.0))
         .w_full()
         .child(
-            notice_chip(theme, false, "Error", message, Tile)
+            notice_chip(theme, false, label, message, Tile)
                 .overflow_hidden()
-                .w_full(),
+                .w_full()
+                .when_some(button, |chip, button| {
+                    chip.child(div().pt(px(2.0)).flex().child(button))
+                }),
         )
         .into_any_element()
 }

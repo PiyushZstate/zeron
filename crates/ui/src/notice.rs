@@ -20,7 +20,7 @@ pub enum NoticeChipIcon {
 
 /// The failure notice both surfaces render (zeron composer.tsx `Notice`,
 /// chat-view.tsx `ErrorChip`): a tinted rounded chip — `border
-/// <accent>/[0.16]` over a `<accent>/[0.05]` wash, a subtle tinted wash,
+/// <accent>/[0.16]` over a `<accent>/[0.05]` wash (0.1 for the transcript's tile), a tinted wash,
 /// never a bare stroke — with a header row (DangerTriangle + medium label, a
 /// tiny copy button pinned to its top-right corner — failure payloads are
 /// meant to be pasted, not screenshotted) and the message below. The message WRAPS instead of truncating: failure payloads carry
@@ -44,6 +44,9 @@ pub fn notice_chip(
     let message = message.into();
     let copy_message = message.clone();
     let tile = matches!(icon, NoticeChipIcon::Tile);
+    // The transcript's block chip reads as an alert: a stronger red wash,
+    // the message in the lighter red.
+    let wash = if tile { 0.1 } else { 0.05 };
     let frame = |inset: f32| {
         div()
             .flex()
@@ -52,7 +55,7 @@ pub fn notice_chip(
             .rounded(px(inset))
             .border_1()
             .border_color(accent.opacity(0.16))
-            .bg(accent.opacity(0.05))
+            .bg(accent.opacity(wash))
             .px(px(inset))
             .py(px(8.0))
     };
@@ -131,7 +134,7 @@ pub fn notice_chip(
         div()
             .min_w_0()
             .w_full()
-            .when(tile, |message| message.text_color(theme.text.opacity(0.8)))
+            .when(tile, |message| message.text_color(muted))
             .child(message),
     )
 }

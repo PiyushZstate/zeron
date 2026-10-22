@@ -66,6 +66,17 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         list.imageLoader = { [weak self] ref, iv in self?.source.loadImage(ref, into: iv) }
         list.imageFetcher = { [weak self] ref in await self?.source.image(ref) }
         // Hidden while following (the runway glide and tail spring travel).
+        // An error card's "Log in": that provider's sign-in, started at once.
+        list.onAction = { [weak self] action in
+            guard let self, action == "sign-in", let target = self.source.signInTarget() else { return }
+            let accounts = AgentAccountsViewController(app: self.app, target: target, signIn: true)
+            let nav = UINavigationController(rootViewController: accounts)
+            if let sheet = nav.sheetPresentationController {
+                sheet.detents = [.medium(), .large()]
+                sheet.prefersGrabberVisible = true
+            }
+            self.present(nav, animated: true)
+        }
         list.onDistanceFromBottom = { [weak self] d in
             guard let self else { return }
             self.setJumpVisible(d > 140 && !self.list.following)
