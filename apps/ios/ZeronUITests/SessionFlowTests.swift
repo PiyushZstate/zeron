@@ -336,6 +336,37 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(app.cells["session-chat-deploy"].waitForExistence(timeout: 5), "unarchived session returns")
     }
 
+    /// The ⋯ menu is headed by the session's title and where it runs, and
+    /// deletes after a confirmation; the list's long-press menu deletes too.
+    func testSessionMenuHeaderAndDelete() {
+        let app = launch()
+        let cell = app.cells["session-chat-cjk"]
+        XCTAssertTrue(cell.waitForExistence(timeout: 10))
+        cell.press(forDuration: 1.0)
+        XCTAssertTrue(app.buttons["Delete"].waitForExistence(timeout: 5), "Delete in the list's menu")
+        snapshot(app, "list-menu-delete")
+        app.buttons["Delete"].tap()
+        XCTAssertTrue(app.alerts["Delete session?"].waitForExistence(timeout: 5))
+        snapshot(app, "delete-confirm")
+        app.alerts.buttons["Cancel"].tap()
+        XCTAssertTrue(cell.waitForExistence(timeout: 5), "cancel keeps the session")
+
+        cell.tap()
+        XCTAssertTrue(app.scrollViews["transcript"].waitForExistence(timeout: 10))
+        let menu = app.buttons["session-menu"]
+        XCTAssertTrue(menu.waitForExistence(timeout: 5))
+        snapshot(app, "session-bar")
+        menu.tap()
+        let header = app.staticTexts.matching(NSPredicate(format: "label CONTAINS '多言語'")).firstMatch
+        XCTAssertTrue(header.waitForExistence(timeout: 5), "title heads the menu")
+        snapshot(app, "session-menu")
+        app.buttons["Delete"].tap()
+        XCTAssertTrue(app.alerts["Delete session?"].waitForExistence(timeout: 5))
+        app.alerts.buttons["Delete"].tap()
+        XCTAssertTrue(app.navigationBars["Sessions"].waitForExistence(timeout: 5), "back on the list")
+        XCTAssertFalse(app.cells["session-chat-cjk"].waitForExistence(timeout: 2), "deleted")
+    }
+
     func testNewProjectFolderBrowser() {
         // New projects are created from the new-session project picker.
         let app = launch(["-route", "new"])
