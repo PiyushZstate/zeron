@@ -175,6 +175,13 @@ describe("billing", () => {
     // Even at the same second, a canceled subscription stays canceled.
     await webhook("customer.subscription.updated", subscription, { created: t });
     expect((await billing(u)).plan).toBeUndefined();
+
+    // A new plan replaces it; the old one's late events don't erase the new.
+    const next = { ...subscription, id: "sub_next", items: { data: [{ price: { id: "price_max" }, current_period_end: end }] } };
+    await webhook("customer.subscription.created", next, { created: t + 10 });
+    await webhook("customer.subscription.deleted", { ...subscription, status: "canceled" }, { created: t + 20 });
+    await webhook("customer.subscription.updated", { ...subscription, status: "active" }, { created: t + 5 });
+    expect((await billing(u)).plan).toMatchObject({ id: "max", status: "active" });
   });
 
   it("the portal needs a Stripe customer first", async () => {

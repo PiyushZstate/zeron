@@ -282,6 +282,53 @@ describe("credits", () => {
   });
 });
 
+describe("previews from a Cloud machine", () => {
+  const next = (ws: WebSocket): Promise<Record<string, unknown>> =>
+    new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("no message")), 2000);
+      ws.addEventListener("message", (event) => { clearTimeout(timeout); resolve(JSON.parse(event.data as string)); }, { once: true });
+    });
+  const silent = (ws: WebSocket, ms = 300): Promise<boolean> =>
+    new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(true), ms);
+      ws.addEventListener("message", () => { clearTimeout(timeout); resolve(false); }, { once: true });
+    });
+  const join = async (bearer: string, device: string) => {
+    const res = await SELF.fetch(`https://edge.test/preview/org1/ws?device=${device}`, { headers: { authorization: bearer, upgrade: "websocket" } });
+    expect(res.status).toBe(101);
+    const ws = res.webSocket!;
+    ws.accept();
+    return ws;
+  };
+  const sdp = (type: string) => ({ type, sdp: "v=0\r\na=fingerprint:sha-256 AA:BB\r\n" });
+
+  it("publishes as itself, sees no one else's services, and only responds to a device that contacted it", async () => {
+    const u = newUser();
+    const { deviceId, key } = await readySession(u);
+    const laptop = await join(userBearer(u), "laptop");
+    await laptop.send(JSON.stringify({ type: "catalog", services: [] }));
+    const heard = next(laptop);
+    const machine = await join(`Bearer ${await runnerToken(u, deviceId, key)}`, "laptop"); // claims the laptop: ignored
+    // The laptop hears of the machine (as itself), the machine of no one.
+    expect(await heard).toMatchObject({ type: "catalog", device: deviceId });
+    expect(await silent(machine)).toBe(true);
+
+    // The laptop starts a pairing; the machine may answer it.
+    const toMachine = next(machine);
+    laptop.send(JSON.stringify({ type: "signal", to: deviceId, signal: { kind: "connect", session: "s1" } }));
+    expect(await toMachine).toMatchObject({ type: "signal", from: "laptop" });
+    const toLaptop = next(laptop);
+    machine.send(JSON.stringify({ type: "signal", to: "laptop", signal: { kind: "offer", session: "s1", sdp: sdp("offer") } }));
+    expect(await toLaptop).toMatchObject({ type: "signal", from: deviceId, signal: { kind: "offer" } });
+
+    // It never starts one.
+    const closed = new Promise<number>((resolve) => machine.addEventListener("close", (e) => resolve(e.code), { once: true }));
+    machine.send(JSON.stringify({ type: "signal", to: "laptop", signal: { kind: "connect", session: "s2" } }));
+    expect(await closed).toBe(1008);
+    laptop.close();
+  });
+});
+
 describe("runner enrollment", () => {
   it("accepts the code once, binds the key, enrolls it under the account with the vault, and marks the session ready", async () => {
     const u = newUser();

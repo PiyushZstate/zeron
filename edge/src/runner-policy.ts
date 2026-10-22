@@ -63,6 +63,11 @@ export const runnerRefusal = (auth: Verified, method: string, url: URL): string 
         return undefined;
       }
       return "runner tokens may only sync registry rows";
+    case "preview":
+      // Its own services only, as a publisher (the route pins the device to
+      // the runner's, and the room never shows it anyone else's).
+      if (parts.length === 3 && parts[2] === "ws") return undefined;
+      return "runner tokens cannot use this route";
     case "chat2":
     case "blob":
       // Gated per chat on the registry's host field (runner-access.ts).
@@ -74,9 +79,7 @@ export const runnerRefusal = (auth: Verified, method: string, url: URL): string 
       // Retired mirror: acknowledged and discarded.
       return undefined;
     default:
-      // Anything not named here is the user's, including routes added later
-      // (e.g. `preview`: every device's service catalog and the peer mesh to
-      // their localhost services).
+      // Anything not named here is the user's, including routes added later.
       return "runner tokens cannot use this route";
   }
 };

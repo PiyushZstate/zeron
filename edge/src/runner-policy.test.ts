@@ -40,9 +40,8 @@ const REFUSED: [string, string][] = [
   ["GET", "/device/laptop-1/ws?role=client"],
   ["GET", "/device/laptop-1/ws"],
   ["POST", "/device/laptop-1/nudge"],
-  // Routes the policy doesn't name are refused (preview: every device's
-  // service catalog and the peer mesh).
-  ["GET", "/preview/o/ws"],
+  // Routes the policy doesn't name are refused.
+  ["GET", "/preview/o/other"],
   ["GET", "/something-new/o"],
   // Legacy whole-user loro rooms.
   ["GET", "/session/c1/ws"],
@@ -94,7 +93,9 @@ describe("runner policy", () => {
       ["GET", "/chat2/c1/ws"],
       ["PUT", "/blob/c1/p1"],
       ["POST", "/runner/heartbeat"],
-      ["PUT", "/attachments/a1"]
+      ["PUT", "/attachments/a1"],
+      // As a publisher of its own services (preview-route pins the device).
+      ["GET", "/preview/o/ws"]
     ]) {
       expect(refused(runner, method!, path!), `${method} ${path}`).toBe(false);
     }

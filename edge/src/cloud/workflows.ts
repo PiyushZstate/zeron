@@ -265,6 +265,9 @@ export class ProvisionWorkflow extends WorkflowEntrypoint<Env, ProvisionParams> 
         if (!current) {
           const adopted = await step.do("sandbox-adopted", DO_STEP, () => account.wfSandboxAdopted(created.id));
           if (!adopted) {
+            // As DeleteWorkflow does: stopped first (a provider may refuse to
+            // delete a sandbox still starting), then deleted.
+            await stopSandbox(step, provider, created.id, "stop a superseded Cloud sandbox");
             await step.do("drop-superseded-sandbox", PROVIDER_STEP, async () => {
               try {
                 await provider.delete(created.id);

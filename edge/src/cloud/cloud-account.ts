@@ -918,7 +918,9 @@ export class CloudAccount extends DurableObject<Env> {
       deviceId: newCloudDeviceId(),
       createdAt: now,
       state: "provisioning",
-      generation: 0,
+      // Not 0: a session re-created for a chat id whose last one was just
+      // deleted must not share generations with that one's stray workflows.
+      generation: now,
       provider: providerName,
       activeRuns: 0,
       clients: 0,
@@ -1171,6 +1173,10 @@ export class CloudAccount extends DurableObject<Env> {
   }
 
   private async beginProvision(caller: CloudCaller, s: SessionRecord, edgeUrl: string): Promise<CloudResult<CloudSessionView>> {
+    // Every way a machine boots (create, retry, a wake that re-provisions)
+    // needs credits; a failed provision retried out of credits would
+    // otherwise boot unpaid, and land in `error`, which no sleep reaches.
+    if (this.balance() <= 0) return this.outOfCredits();
     const project = s.repo;
     const accountDeviceId = this.acct.deviceId;
     if (!project || !accountDeviceId) {
@@ -1783,10 +1789,16 @@ export class CloudAccount extends DurableObject<Env> {
         // Stripe delivers out of order: a late `updated` must not undo a
         // newer state, and a canceled subscription never comes back.
         const stored = readBillingState<SubscriptionState & { eventAt?: number }>(sql, "subscription");
-        const same = stored?.id === event.subscription.id;
-        const stale = same && stored?.eventAt !== undefined && event.createdAt !== undefined && event.createdAt < stored.eventAt;
-        const revived = same && stored?.status === "canceled" && event.subscription.status !== "canceled";
-        if (!stale && !revived) {
+        const incoming = event.subscription;
+        const same = stored?.id === incoming.id;
+        const older = stored?.eventAt !== undefined && event.createdAt !== undefined && event.createdAt < stored.eventAt;
+        const revived = same && stored?.status === "canceled" && incoming.status !== "canceled";
+        // Another subscription than the one on record takes over only when
+        // it is live and not older: a canceled old one, arriving late, must
+        // not erase the plan that replaced it (and let a second be bought).
+        const displaced =
+          stored !== undefined && !same && stored.status !== "canceled" && (incoming.status === "canceled" || older);
+        if (!(same && older) && !revived && !displaced) {
           writeBillingState(sql, "subscription", { ...event.subscription, ...(event.createdAt !== undefined ? { eventAt: event.createdAt } : {}) });
         }
         break;
@@ -1894,11 +1906,15 @@ export class CloudAccount extends DurableObject<Env> {
     s.idleCheckAt = undefined;
     this.ledger("stop", s);
     this.scheduleReconcile();
-    if (s.pendingWake) {
+    // Asleep first, persisted: a wake that's refused (out of credits, too
+    // many awake) must leave a sleeping session, never one stuck stopping.
+    const wake = s.pendingWake;
+    s.pendingWake = false;
+    await this.saveSession(s);
+    if (wake) {
       await this.beginWake(s);
       return true;
     }
-    await this.saveSession(s);
     await this.saveAccount();
     return true;
   }
