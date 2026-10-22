@@ -236,7 +236,14 @@ impl Client {
             )
             .await
         {
-            Ok(repos) => Ok(repos.repos),
+            Ok(repos) => {
+                let mut cache = crate::lock(&self.inner.cloud_repos);
+                for repo in &repos.repos {
+                    cache.insert(repo.full_name.to_ascii_lowercase(), CloudRepoRef::from(repo));
+                }
+                drop(cache);
+                Ok(repos.repos)
+            }
             Err(Failure::Missing(_)) => Ok(Vec::new()),
             Err(Failure::Error(error)) => Err(error),
         }
@@ -594,6 +601,10 @@ impl Client {
         else {
             return Ok(None);
         };
+        // Already read (the new-session screen lists them): no round trip.
+        if let Some(repo) = crate::lock(&self.inner.cloud_repos).get(&name.to_ascii_lowercase()) {
+            return Ok(Some(repo.clone()));
+        }
         Ok(self
             .github_repos(Some(&name))
             .await?

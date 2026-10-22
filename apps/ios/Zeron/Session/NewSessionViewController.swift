@@ -150,7 +150,11 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             guard let self else { return UIMenu() }
             return AttachmentPicker.menu(host: self, limit: 8 - self.composer.images.count) { [weak self] in self?.composer.addImages($0) }
         }
-        composer.onChipTap = { _, _ in }
+        // The model chip opens the picker sheet (tabs per provider).
+        composer.onChipTap = { [weak self] id, _ in
+            guard let self, id == "model" else { return }
+            self.present(self.modelPicker(), animated: true)
+        }
         composer.mentionSearch = { [weak self] q in
             guard let self, let p = self.project else { return [] }
             return await self.app.searchFiles(deviceId: p.device, spaceId: p.id, query: q)
@@ -331,7 +335,6 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             "project": { [weak self] in self?.projectMenu() },
             "host": { [weak self] in self?.hostMenu() },
             "branch": { [weak self] in self?.branchMenu() },
-            "model": { [weak self] in self?.modelMenu() },
             "effort": { [weak self] in self?.effortMenu() },
         ]
         mark.image = BrandMarks.image(for: draft.harness, side: 34)
@@ -487,18 +490,24 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
         ])
     }
 
-    private func modelMenu() -> UIMenu {
-        let byHarness = Dictionary(grouping: models, by: \.harness)
-        return UIMenu(title: "Model", children: byHarness.keys.sorted().map { h in
-            UIMenu(title: byHarness[h]!.first!.harnessLabel, image: BrandMarks.image(for: h, side: 16), options: .displayInline, children: byHarness[h]!.map { m in
-                UIAction(title: m.label, state: m.harness == draft.harness && m.id == draft.model ? .on : .off) { [weak self] _ in
-                    self?.draft.harness = m.harness
-                    self?.draft.model = m.id
-                    self?.draft.effort = nil
-                    self?.refreshChips()
-                }
-            })
-        })
+    /// A tab per provider the target runs (the draft's first), each listing
+    /// the models already loaded for it.
+    private func modelPicker() -> UIViewController {
+        var order: [String] = [draft.harness]
+        for m in models where !order.contains(m.harness) { order.append(m.harness) }
+        let tabs = order.compactMap { h -> ModelPickerTab? in
+            let choices = models.filter { $0.harness == h }
+            guard let first = choices.first else { return nil }
+            let rows = choices.map { ModelPickerRow(id: $0.id, label: $0.label, detail: nil) }
+            return ModelPickerTab(harness: h, label: first.harnessLabel) { rows }
+        }
+        return ModelPickerViewController(tabs: tabs, harness: draft.harness, model: draft.model) { [weak self] harness, model in
+            guard let self else { return }
+            if harness != self.draft.harness { self.draft.effort = nil }
+            self.draft.harness = harness
+            self.draft.model = model.id
+            self.refreshChips()
+        }
     }
 
     private func effortMenu() -> UIMenu {

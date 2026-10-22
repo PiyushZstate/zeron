@@ -17,6 +17,8 @@ final class CoreSessionSource: SessionSource {
     /// Between turns, on a host that switches providers, the model menu
     /// offers the other providers too.
     private var canSwitchProvider = false
+    private var hostSwitchesProviders = false
+    private var turnRunning = false
     /// The host's providers, read ahead: a menu whose top level waits on the
     /// host doesn't open until it answers.
     private var hostHarnesses: [HarnessInfo] = []
@@ -58,7 +60,9 @@ final class CoreSessionSource: SessionSource {
         let c = handle.composer()
         let row = app?.row(chatId)
         hostDevice = c.host.deviceId
-        canSwitchProvider = c.host.capabilities.providerSwitch && !c.live.turnRunning
+        hostSwitchesProviders = c.host.capabilities.providerSwitch
+        turnRunning = c.live.turnRunning
+        canSwitchProvider = hostSwitchesProviders && !turnRunning
         if canSwitchProvider, harnessesDevice != hostDevice {
             let device = hostDevice
             harnessesDevice = device
@@ -107,7 +111,11 @@ final class CoreSessionSource: SessionSource {
         } else if c.sendState == .failed {
             next.banner = .notDelivered
         } else if c.sendState == .queued {
-            next.banner = .failed("\(c.host.name ?? "Host") is offline — will send when it's back")
+            // A Cloud chat's message waits for its machine to start or wake —
+            // the transcript's setup step says so, as on the desktop.
+            if row?.isCloud != true {
+                next.banner = .failed("\(c.host.name ?? "Host") is offline — will send when it's back")
+            }
         } else if c.sendState == .sending {
             next.banner = .sending
         } else if app?.connectivity?.state == .offline {
@@ -233,25 +241,8 @@ final class CoreSessionSource: SessionSource {
         let harness = row.harness ?? "claude-code"
         switch id {
         case "model":
-            var children: [UIMenuElement] = [UIDeferredMenuElement { [weak self] done in
-                guard let self else { return done([]) }
-                Task { @MainActor in
-                    let models = (try? await self.client.listModels(deviceId: self.hostDevice, harness: harness)) ?? fallbackModels(harness: harness)
-                    done(models.map { m in
-                        UIAction(title: m.label, subtitle: m.description, state: m.id == row.model ? .on : .off) { [weak self] _ in
-                            self?.setConfig { $0.model = m.id }
-                        }
-                    })
-                }
-            }]
-            if canSwitchProvider {
-                // On top: a long model list would otherwise bury it.
-                let others = otherProviders(current: harness, cloud: row.isCloud)
-                if !others.isEmpty {
-                    children.insert(UIMenu(title: "Switch provider", options: .displayInline, children: others), at: 0)
-                }
-            }
-            return UIMenu(title: "Model", children: children)
+            // The picker sheet takes the tap (see `modelPicker`).
+            return nil
         case "effort":
             return UIMenu(title: "Reasoning effort", children: [UIDeferredMenuElement { [weak self] done in
                 guard let self else { return done([]) }
@@ -276,32 +267,43 @@ final class CoreSessionSource: SessionSource {
         }
     }
 
-    /// One submenu per other provider the host offers, listing its models;
-    /// a pick moves the chat to that provider and model. Cloud runs Claude
-    /// Code and Codex.
-    private func otherProviders(current: String, cloud: Bool) -> [UIMenuElement] {
-        let harnesses = cloud
+    func modelPicker() -> UIViewController? {
+        guard let row = app?.row(chatId) else { return nil }
+        let harness = row.harness ?? "claude-code"
+        let rows: (String) async -> [ModelPickerRow] = { [weak self] id in
+            guard let self else { return [] }
+            let models = (try? await self.client.listModels(deviceId: self.hostDevice, harness: id)) ?? fallbackModels(harness: id)
+            return models.map { ModelPickerRow(id: $0.id, label: $0.label, detail: $0.description) }
+        }
+        var tabs = [ModelPickerTab(harness: harness, label: row.harnessLabel ?? HarnessNames.label(harness)) { await rows(harness) }]
+        if canSwitchProvider {
+            tabs += providers(cloud: row.isCloud).filter { $0.id != harness }.map { h in
+                ModelPickerTab(harness: h.id, label: h.label) { await rows(h.id) }
+            }
+        }
+        let note: String? = canSwitchProvider ? nil
+            : turnRunning ? "You can switch provider when this turn ends."
+            : hostSwitchesProviders ? nil
+            : "This computer needs a newer Zeron to switch provider."
+        return ModelPickerViewController(tabs: tabs, harness: harness, model: row.model, note: note) { [weak self] pickedHarness, model in
+            self?.setConfig {
+                if pickedHarness != $0.harness {
+                    $0.harness = pickedHarness
+                    // The old provider's effort and options don't carry over.
+                    $0.reasoning = nil
+                    $0.modelOptions = [:]
+                }
+                $0.model = model.id
+            }
+        }
+    }
+
+    /// The providers a chat on this host can move to: Cloud runs Claude
+    /// Code and Codex; a computer, the agents it offers.
+    private func providers(cloud: Bool) -> [HarnessInfo] {
+        cloud
             ? fallbackHarnesses().filter { ["claude-code", "codex"].contains($0.id) }
             : (hostHarnesses.isEmpty ? fallbackHarnesses() : hostHarnesses).filter(\.offered)
-        return harnesses.filter { $0.id != current }.map { h in
-            UIMenu(title: h.label, image: BrandMarks.image(for: h.id, side: 16), children: [UIDeferredMenuElement { [weak self] done in
-                guard let self else { return done([]) }
-                Task { @MainActor in
-                    let models = (try? await self.client.listModels(deviceId: self.hostDevice, harness: h.id)) ?? fallbackModels(harness: h.id)
-                    done(models.map { m in
-                        UIAction(title: m.label, subtitle: m.description) { [weak self] _ in
-                            self?.setConfig {
-                                $0.harness = h.id
-                                $0.model = m.id
-                                // The old provider's effort and options don't carry over.
-                                $0.reasoning = nil
-                                $0.modelOptions = [:]
-                            }
-                        }
-                    })
-                }
-            }])
-        }
     }
 
     private func setConfig(_ change: (inout ChatConfig) -> Void) {

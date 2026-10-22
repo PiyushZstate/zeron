@@ -79,6 +79,10 @@ pub(crate) struct ClientInner {
     foreground: AtomicBool,
     synced: AtomicBool,
     pub(crate) harness_catalogs: Mutex<HashMap<String, Vec<HarnessInfo>>>,
+    /// GitHub repositories Cloud reaches, as last read (lowercased
+    /// `owner/name`): starting a Cloud session needs one, and reading it
+    /// again would hold the new chat up.
+    pub(crate) cloud_repos: Mutex<HashMap<String, crate::cloud::CloudRepoRef>>,
 }
 
 impl Drop for ClientInner {
@@ -594,6 +598,7 @@ impl Client {
             foreground: AtomicBool::new(true),
             synced: AtomicBool::new(false),
             harness_catalogs: Mutex::new(HashMap::new()),
+            cloud_repos: Mutex::new(HashMap::new()),
             credentials: credentials.clone(),
             config,
         });

@@ -84,6 +84,11 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             guard let self else { return UIMenu() }
             return AttachmentPicker.menu(host: self, limit: 8 - self.composer.images.count) { [weak self] in self?.composer.addImages($0) }
         }
+        // The model chip opens the picker sheet (tabs per provider).
+        composer.onChipTap = { [weak self] id, _ in
+            guard let self, id == "model", let picker = self.source.modelPicker() else { return }
+            self.present(picker, animated: true)
+        }
         composer.onSend = { [weak self] text, images, mode in
             guard let self else { return .kept }
             if self.editingQueueId != nil {

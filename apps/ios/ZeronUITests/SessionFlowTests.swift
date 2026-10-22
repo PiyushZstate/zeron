@@ -497,7 +497,7 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons["Photo Library"].waitForExistence(timeout: 5), "attach menu opens from the card")
     }
 
-    /// Regression: the model chip's menu completed off the main thread.
+    /// The model chip opens the picker sheet; a pick names the model on the chip.
     func testModelPickerInSession() {
         let app = launch(["-route", "chat:chat-deploy"])
         let input = app.textViews["composer-input"]
@@ -506,16 +506,21 @@ final class SessionFlowTests: XCTestCase {
         let chip = app.buttons["composer-chip-model"]
         XCTAssertTrue(chip.waitForExistence(timeout: 5))
         chip.tap()
-        let item = app.collectionViews.buttons.element(boundBy: 0)
-        XCTAssertTrue(item.waitForExistence(timeout: 5), "models load")
-        item.tap()
-        XCTAssertTrue(input.waitForExistence(timeout: 5))
+        let list = app.tables["model-picker-list"]
+        XCTAssertTrue(list.waitForExistence(timeout: 5), "the picker opens")
+        let row = list.cells.element(boundBy: 1)
+        XCTAssertTrue(row.waitForExistence(timeout: 5), "models load")
+        let picked = row.staticTexts.element(boundBy: 0).label
+        row.tap()
+        expectation(for: NSPredicate(format: "label == %@", picked), evaluatedWith: chip)
+        waitForExpectations(timeout: 5)
         XCTAssertEqual(app.state, .runningForeground)
     }
 
-    /// Between turns, on a host that switches providers, the model menu moves
-    /// the chat to another provider; an older host's chat keeps its own.
-    func testModelMenuSwitchesProviderWhereTheHostCan() {
+    /// Between turns, on a host that switches providers, the picker's tabs
+    /// move the chat to another provider; an older host's chat shows only its
+    /// own, and says why.
+    func testModelPickerSwitchesProviderWhereTheHostCan() {
         let app = launch(["-route", "chat:chat-tabs"])
         let input = app.textViews["composer-input"]
         XCTAssertTrue(input.waitForExistence(timeout: 10))
@@ -525,20 +530,16 @@ final class SessionFlowTests: XCTestCase {
         let before = chip.label
         chip.tap()
         // The demo's chat-tabs runs Codex on the Mac.
-        let claude = app.collectionViews.buttons["Claude Code"]
-        XCTAssertTrue(claude.waitForExistence(timeout: 5), "other providers are offered")
-        snapshot(app, "switch-provider-menu")
+        let claude = app.buttons["model-picker-tab-claude-code"]
+        XCTAssertTrue(claude.waitForExistence(timeout: 5), "other providers have tabs")
+        XCTAssertTrue(app.buttons["model-picker-tab-codex"].exists)
+        snapshot(app, "model-picker")
         claude.tap()
-        // The submenu's first row is its own header: pick a Claude model.
-        let model = app.collectionViews.buttons
-            .matching(NSPredicate(format: "label BEGINSWITH 'Fable' OR label BEGINSWITH 'Opus' OR label BEGINSWITH 'Sonnet'"))
-            .firstMatch
-        XCTAssertTrue(model.waitForExistence(timeout: 5), "the provider's models load")
-        let picked = model.label.components(separatedBy: ",")[0]
-        model.tap()
-        // The chip names the Claude Code model now.
-        let switched = NSPredicate(format: "label == %@", picked)
-        expectation(for: switched, evaluatedWith: chip)
+        let row = app.tables["model-picker-list"].cells.element(boundBy: 0)
+        XCTAssertTrue(row.waitForExistence(timeout: 5), "Claude's models load")
+        let picked = row.staticTexts.element(boundBy: 0).label
+        row.tap()
+        expectation(for: NSPredicate(format: "label == %@", picked), evaluatedWith: chip)
         waitForExpectations(timeout: 5)
         XCTAssertNotEqual(chip.label, before)
 
@@ -548,9 +549,9 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(field.waitForExistence(timeout: 10))
         field.tap()
         older.buttons["composer-chip-model"].tap()
-        XCTAssertTrue(older.collectionViews.buttons.element(boundBy: 0).waitForExistence(timeout: 5))
-        XCTAssertFalse(older.staticTexts["Switch provider"].exists, "an older host keeps its provider")
-        XCTAssertFalse(older.collectionViews.buttons["Codex"].exists)
+        XCTAssertTrue(older.tables["model-picker-list"].waitForExistence(timeout: 5))
+        XCTAssertFalse(older.buttons["model-picker-tab-codex"].exists, "an older host keeps its provider")
+        XCTAssertTrue(older.staticTexts["This computer needs a newer Zeron to switch provider."].exists)
     }
 
     /// Regression: a drag that starts at the tail re-latched follow at once,
