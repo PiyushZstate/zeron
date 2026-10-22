@@ -73,10 +73,9 @@ impl Client {
             .cloud_call::<CloudStatus>(reqwest::Method::GET, &["cloud"], &[], None, "Cloud status")
             .await
         {
-            Ok(status) => Ok(CloudStatus {
-                available: true,
-                ..status
-            }),
+            // The edge says whether this account is offered Cloud
+            // (`CLOUD_ACCESS`): never assumed from a 200.
+            Ok(status) => Ok(status),
             Err(Failure::Missing(_)) => Ok(CloudStatus::default()),
             Err(Failure::Error(error)) => Err(error),
         }
@@ -802,7 +801,11 @@ impl Client {
         })?;
         if !(200..300).contains(&status) {
             let error = edge_error(status, &bytes, what);
-            return Err(if is_read && matches!(status, 404 | 501 | 503) {
+            // A read the edge can't route is "not offered here". A 503 on
+            // the status read itself is the edge failing for a moment (it
+            // answers that read even unconfigured): an error, to retry.
+            let status_read = segments == ["cloud"];
+            return Err(if is_read && (matches!(status, 404 | 501) || (status == 503 && !status_read)) {
                 Failure::Missing(error)
             } else {
                 Failure::Error(error)

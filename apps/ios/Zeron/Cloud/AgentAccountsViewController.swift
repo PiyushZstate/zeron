@@ -275,7 +275,11 @@ final class AgentAccountsViewController: UITableViewController {
             cell.accessibilityIdentifier = row.id
             return cell
         case .waiting:
-            let detail = [signIn?.message, "Tap to cancel"].compactMap { $0 }.joined(separator: " · ")
+            // A computer's sign-in can be called off from here; a Cloud one
+            // ends with its browser sheet.
+            var parts = [signIn?.message]
+            if case .device = target { parts.append("Tap to cancel") }
+            let detail = parts.compactMap { $0 }.joined(separator: " · ")
             let cell = plainCell(text: "Finish signing in in the browser…", detail: detail, symbol: nil, tint: Palette.secondary)
             let spinner = UIActivityIndicatorView(style: .medium)
             spinner.startAnimating()
@@ -322,7 +326,7 @@ final class AgentAccountsViewController: UITableViewController {
 
     override func tableView(_ tableView: UITableView, shouldHighlightRowAt indexPath: IndexPath) -> Bool {
         if case .add = items[indexPath.row] { return signIn == nil && busy == nil }
-        if case .waiting = items[indexPath.row] { return true }
+        if case .waiting = items[indexPath.row], case .device = target { return true }
         return false
     }
 

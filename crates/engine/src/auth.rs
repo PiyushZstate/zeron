@@ -869,15 +869,17 @@ impl Auth {
     /// process that quits mid-exchange lets the next engine spend the same
     /// token, and the loser of that race deletes the shared session file.
     pub async fn quiesce_refresh(&self, limit: std::time::Duration) {
-        match tokio::time::timeout(limit, self.inner.refresh_gate.lock()).await {
-            Ok(_gate) => {}
-            Err(_) => tracing::warn!("a token refresh was still running at shutdown"),
-        }
-        // Later refreshes answer "no token" at once (never wait: shutdown's
-        // own flushes may ask for a bearer).
+        // Set while holding the gate (when it's had in time): a refresh
+        // queued behind the in-flight one then sees the flag, never a window
+        // between our release and the store. Later ones answer "no token" at
+        // once, never waiting (shutdown's own flushes may ask for a bearer).
+        let gate = tokio::time::timeout(limit, self.inner.refresh_gate.lock()).await;
         self.inner
             .refresh_quiesced
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        if gate.is_err() {
+            tracing::warn!("a token refresh was still running at shutdown");
+        }
     }
 
     async fn refresh_serialized(

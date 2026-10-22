@@ -61,13 +61,17 @@ struct LiveTerminal {
     seq: u64,
     last_active_at: std::time::Instant,
     exited: bool,
-    /// Program-detection replies written so far (bounded: see `pump_output`).
+    /// Program-detection replies in the current window (rate-limited: see
+    /// `pump_output`).
     support_replies: u32,
+    support_window: std::time::Instant,
 }
 
-/// Most program-detection replies one terminal ever writes. Detection needs
-/// one per program; output that keeps asking is answered no further.
-const MAX_SUPPORT_REPLIES: u32 = 64;
+/// Program-detection replies one terminal writes per [`SUPPORT_WINDOW`].
+/// Detection needs one per program launch; output that keeps asking faster
+/// is answered no further until the window turns over.
+const MAX_SUPPORT_REPLIES: u32 = 8;
+const SUPPORT_WINDOW: Duration = Duration::from_secs(10);
 
 impl LiveTerminal {
     /// Stamp a seq, append to the bounded replay window, and fan out to live
@@ -414,6 +418,7 @@ impl Terminals {
             last_active_at: std::time::Instant::now(),
             exited: false,
             support_replies: 0,
+            support_window: std::time::Instant::now(),
         }));
         lock(&self.inner.sessions).insert(id.clone(), session.clone());
 
@@ -647,9 +652,13 @@ async fn pump_output(
         let update = session.programs.feed(&buffer);
         // Answer from the PTY owner, not a viewport: detection must work while
         // detached and must not be replayed when another viewer attaches.
-        // At most one per batch and a bounded number per terminal: the write
-        // goes to the PTY's input, which a program that never reads stdin
-        // fills, and this runs under the session lock.
+        // At most one per batch and a few per window: the write goes to the
+        // PTY's input, which a program that never reads stdin fills, and this
+        // runs under the session lock.
+        if update.queries > 0 && session.support_window.elapsed() >= SUPPORT_WINDOW {
+            session.support_window = std::time::Instant::now();
+            session.support_replies = 0;
+        }
         if update.queries > 0 && session.support_replies < MAX_SUPPORT_REPLIES {
             session.support_replies += 1;
             if let Some(writer) = session.writer.as_mut()

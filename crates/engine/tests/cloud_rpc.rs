@@ -42,7 +42,11 @@ async fn mock_edge() -> (String, Seen) {
                         .map(|(_, value)| value.trim().to_string())
                 });
                 let (status, body) = if request.starts_with("GET /cloud/") {
-                    ("200 OK", r#"{"state":"ready","deviceId":"cloud-abc"}"#)
+                    // The edge says whether the account is offered Cloud.
+                    (
+                        "200 OK",
+                        r#"{"state":"ready","deviceId":"cloud-abc","available":true}"#,
+                    )
                 } else if request.starts_with("GET /vault/") {
                     (
                         "200 OK",
@@ -291,7 +295,7 @@ fn cloud_edge(request: &str, body: &str) -> (u16, String) {
     if request.starts_with("GET /cloud/") {
         return (
             200,
-            r#"{"state":"ready","deviceId":"cloud-acct","awakeSessions":0,"maxAwakeSessions":5}"#
+            r#"{"state":"ready","deviceId":"cloud-acct","awakeSessions":0,"maxAwakeSessions":5,"available":true}"#
                 .into(),
         );
     }

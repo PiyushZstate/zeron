@@ -607,7 +607,7 @@ final class AppModel {
     }
 
     /// A Cloud chat created whose first message didn't go out yet.
-    private var unsentCloudChat: (spaceId: String, chatId: String)?
+    private var unsentCloudChat: (key: String, chatId: String)?
 
     /// The agents Cloud runs.
     static let cloudHarnesses = ["claude-code", "codex"]
@@ -663,11 +663,14 @@ final class AppModel {
         // A retry after a failed first send reuses that chat (and machine)
         // instead of starting a second one.
         let chatId: String
-        if let unsent = unsentCloudChat, unsent.spaceId == spaceId, client.sessionRow(chatId: unsent.chatId) != nil {
+        // Only while nothing the machine was made from changed (its project,
+        // branch, provider): otherwise that's a different chat to start.
+        let key = "\(spaceId)|\(draft.branch ?? "")|\(draft.harness)"
+        if let unsent = unsentCloudChat, unsent.key == key, client.sessionRow(chatId: unsent.chatId) != nil {
             chatId = unsent.chatId
         } else {
             chatId = try await client.createCloudSession(spaceId: spaceId, config: config, branch: draft.branch, title: nil)
-            unsentCloudChat = (spaceId, chatId)
+            unsentCloudChat = (key, chatId)
         }
         let handle = try client.openSession(chatId: chatId)
         _ = try handle.send(request: SendRequest(text: text, attachments: images.map(\.outgoing), worktree: nil, busy: .queue))

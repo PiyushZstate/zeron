@@ -169,10 +169,17 @@ impl EngineBackend for InProcessEngine {
             // listener is closed before bootstrap reports an assembly failure.
             let _ = ipc.await;
         }
+        // As the background engine does: no token refresh may be mid-exchange
+        // when another engine takes over the session file (single-use token).
+        self.refresh_task.abort();
         if let Some(runtime) = self.runtime.lock().await.take() {
+            runtime
+                .core()
+                .auth()
+                .quiesce_refresh(std::time::Duration::from_secs(10))
+                .await;
             runtime.shutdown().await;
         }
-        self.refresh_task.abort();
     }
 }
 
@@ -3640,8 +3647,18 @@ impl AppState {
             return;
         };
         self.cloud_repos_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(mut status) = crate::cloud::fetch_status(engine.clone()).await else {
-                return;
+            // A failed read (offline, the edge failing for a moment) is tried
+            // again: until it answers, Cloud reads as not offered, and
+            // nothing else would ask again until a restart.
+            let mut delay = std::time::Duration::from_secs(30);
+            let mut status = loop {
+                match crate::cloud::fetch_status(engine.clone()).await {
+                    Ok(status) => break status,
+                    Err(_) => {
+                        cx.background_executor().timer(delay).await;
+                        delay = (delay * 2).min(std::time::Duration::from_secs(300));
+                    }
+                }
             };
             // Cloud is part of every signed-in account: one not set up yet
             // is set up now. Nothing runs (or bills) until a chat does.

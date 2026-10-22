@@ -1126,6 +1126,13 @@ impl Engine {
         }
         tracing::info!("shutting down");
         server.abort();
+        // No token refresh mid-exchange when the next engine takes over the
+        // session file (a refresh token is single-use).
+        runtime
+            .core()
+            .auth()
+            .quiesce_refresh(std::time::Duration::from_secs(10))
+            .await;
         runtime.shutdown().await;
         Ok(())
     }

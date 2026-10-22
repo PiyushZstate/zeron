@@ -170,7 +170,13 @@ impl CloudClient {
             .call::<CloudStatus>(reqwest::Method::GET, &["cloud"], &[], None, "Cloud status")
             .await
         {
-            Ok(status) => Ok(available_cloud(status)),
+            // The edge says whether this account is offered Cloud
+            // (`CLOUD_ACCESS`): never assumed from a 200.
+            Ok(status) => Ok(status),
+            // 503 here is the edge failing for a moment (a status read always
+            // answers when Cloud is merely unconfigured): an error to retry,
+            // never "not offered", which would hide Cloud until restart.
+            Err(Failure::Missing(503, error)) => Err(error),
             Err(Failure::Missing(..)) => Ok(CloudStatus::default()),
             Err(Failure::Error(error)) => Err(error),
         }
@@ -191,7 +197,6 @@ impl CloudClient {
                 "Turn on Cloud",
             )
             .await
-            .map(available_cloud)
             .map_err(Failure::into_error)
     }
 
@@ -209,7 +214,6 @@ impl CloudClient {
                 "Delete Cloud",
             )
             .await
-            .map(available_cloud)
             .map_err(Failure::into_error)
     }
 
@@ -1152,12 +1156,6 @@ impl Target {
     }
 }
 
-fn available_cloud(status: CloudStatus) -> CloudStatus {
-    CloudStatus {
-        available: true,
-        ..status
-    }
-}
 
 fn available_vault(status: VaultStatus) -> VaultStatus {
     VaultStatus {
@@ -1356,11 +1354,21 @@ mod tests {
             ("GET", "/cloud/org_1") => (
                 200,
                 serde_json::json!({"state": "ready", "deviceId": "cloud-1", "lastActiveAt": 5,
-                    "awakeSessions": 1, "maxAwakeSessions": 5}),
+                    "awakeSessions": 1, "maxAwakeSessions": 5, "available": true}),
+            ),
+            // Not on the beta list: the edge answers, and says no.
+            ("GET", "/cloud/org_off") => (
+                200,
+                serde_json::json!({"state": "off", "awakeSessions": 0, "maxAwakeSessions": 0, "available": false}),
+            ),
+            // The edge failing for a moment.
+            ("GET", "/cloud/org_down") => (
+                503,
+                serde_json::json!({"error": "unavailable", "message": "Cloud is temporarily unavailable; try again."}),
             ),
             ("POST", "/cloud/org_1/enable") => (
                 200,
-                serde_json::json!({"state": "ready", "deviceId": "cloud-1"}),
+                serde_json::json!({"state": "ready", "deviceId": "cloud-1", "available": true}),
             ),
             ("GET", "/cloud/org_1/sessions") => (
                 200,
@@ -1388,7 +1396,7 @@ mod tests {
                 serde_json::json!({"chatId": "chat-1", "deviceId": "cloud-s1",
                     "spaceId": "sp-1", "state": "deleting", "createdAt": 3}),
             ),
-            ("DELETE", "/cloud/org_1") => (200, serde_json::json!({"state": "off"})),
+            ("DELETE", "/cloud/org_1") => (200, serde_json::json!({"state": "off", "available": true})),
             ("GET", "/cloud/org_1/usage?from=2026-09-29&to=2026-09-30") => (
                 200,
                 serde_json::json!({
@@ -1531,7 +1539,13 @@ mod tests {
         assert_eq!(deleted.state, CloudState::Off);
         assert!(deleted.available);
 
-        let requests = edge.requests();
+        // Only our calls: a local dev-server scan (a running app's preview
+        // discovery) may probe this port too.
+        let requests: Vec<_> = edge
+            .requests()
+            .into_iter()
+            .filter(|r| r.target.starts_with("/cloud/"))
+            .collect();
         assert!(
             requests
                 .iter()
@@ -1549,6 +1563,16 @@ mod tests {
                 .iter()
                 .any(|r| r.method == "DELETE" && r.target == "/cloud/org_1")
         );
+    }
+
+    #[tokio::test]
+    async fn cloud_status_is_the_edges_word_and_a_503_is_an_error_to_retry() {
+        let edge = MockEdge::start(edge).await;
+        // Off the beta list: not offered, whatever the 200 says otherwise.
+        let off = edge.client("org_off").status().await.unwrap();
+        assert!(!off.available);
+        // Down for a moment: an error (retried), never "not offered".
+        assert!(edge.client("org_down").status().await.is_err());
     }
 
     #[tokio::test]

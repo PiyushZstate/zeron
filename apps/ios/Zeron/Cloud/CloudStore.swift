@@ -189,11 +189,25 @@ final class CloudStore {
                 self?.accounts = lists
                 self?.refreshUsage()
             } catch {
-                guard self?.client === client else { return }
-                self?.error = Self.message(error)
+                guard let self, self.client === client else { return }
+                self.error = Self.message(error)
+                // Until a read answers, Cloud reads as not offered: ask again
+                // (30 s, doubling to 5 min) rather than hide it for good.
+                let delay = self.retryDelay
+                self.retryDelay = min(delay * 2, 300)
+                Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    guard let self, self.client === client, self.info == nil || self.error != nil else { return }
+                    self.refresh()
+                }
+                return
             }
+            self?.retryDelay = 30
         }
     }
+
+    /// How long until a failed status read is tried again.
+    private var retryDelay: Double = 30
 
     func refreshAccounts() {
         guard let client else { return }
@@ -288,6 +302,7 @@ final class CloudStore {
         usageErrors = [:]
         billing = nil
         billingError = nil
+        retryDelay = 30
         sessions = []
         sessionsRead = nil
         error = nil

@@ -254,6 +254,11 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
 
     private func reload() {
         guard dataSource != nil else { return }
+        // Remembered Cloud, but this account isn't offered it: a computer.
+        if onCloud, !app.isDemo, cloud.info != nil, !cloud.available, let computer = app.hostOptions.first {
+            target = computer.id
+            load()
+        }
         var s = NSDiffableDataSourceSnapshot<String, Row>()
         s.appendSections(["device"])
         // The device in the row's value: switching re-renders it.
@@ -272,8 +277,13 @@ final class ProvidersViewController: UIViewController, UICollectionViewDelegate 
     }
 
     private func cloudRows() -> [Row] {
-        // Landed on Cloud (no computers yet) without being offered it.
-        guard cloudOffered else {
+        if !cloudOffered, !app.isDemo {
+            // Not known yet: ask, and say so (a beta user's Cloud is coming).
+            if cloud.info == nil {
+                cloud.refresh()
+                return [Row(id: "loading", title: "Loading…", symbol: "ellipsis")]
+            }
+            // Landed on Cloud (no computers yet) without being offered it.
             return [Row(id: "no-computers", title: "No computers yet", subtitle: "Install Zeron on a computer to run agents and manage their accounts here.", symbol: "desktopcomputer")]
         }
         return CloudStore.agents.map { agent in

@@ -19299,7 +19299,8 @@ mod settings_modal_regressions {
         });
     }
 
-    /// Signed in to an organization (Cloud's settings need one).
+    /// Signed in to an organization the edge offers Cloud (Cloud's settings
+    /// need both).
     fn sign_in(state: &Entity<AppState>, cx: &mut App) {
         state.update(cx, |state, _| {
             state.auth = Some(zeron_proto::AuthState::SignedIn {
@@ -19309,6 +19310,10 @@ mod settings_modal_regressions {
                     name: None,
                 },
                 org_id: Some("org-a".into()),
+            });
+            state.cloud_status = Some(zeron_proto::CloudStatus {
+                available: true,
+                ..Default::default()
             });
         });
     }

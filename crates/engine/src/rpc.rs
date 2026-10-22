@@ -1608,18 +1608,37 @@ impl EngineRpc {
                 .map_err(failed)
                 .map(drop),
             MutateParams::DeleteSpace { space_id } => {
-                let cloud_chats: Vec<String> = self
-                    .workspace
-                    .read_chats()
-                    .unwrap_or_default()
-                    .into_iter()
+                let chats = self.workspace.read_chats().unwrap_or_default();
+                let mut cloud_chats: Vec<String> = chats
+                    .iter()
                     .filter(|chat| {
                         chat.space_id.as_deref() == Some(space_id.as_str())
                             && zeron_proto::is_cloud_device(&chat.device_id, "")
                     })
-                    .map(|chat| chat.id)
+                    .map(|chat| chat.id.clone())
+                    .collect();
+                // Their children on Cloud with no project of their own (side
+                // chats on a deleted machine, delegates) go with them.
+                let orphans: Vec<String> = chats
+                    .iter()
+                    .filter(|chat| {
+                        chat.space_id.is_none()
+                            && zeron_proto::is_cloud_device(&chat.device_id, "")
+                            && chat
+                                .parent_chat_id
+                                .as_ref()
+                                .is_some_and(|parent| cloud_chats.contains(parent))
+                    })
+                    .map(|chat| chat.id.clone())
                     .collect();
                 let deleted = self.workspace.delete_space(&space_id).map_err(failed)?;
+                for orphan in &orphans {
+                    if let Err(err) = self.workspace.delete_chat(orphan) {
+                        tracing::warn!(chat = %orphan, error = %err, "deleting a Cloud chat's child failed");
+                    }
+                    self.doc_host.purge_chat(orphan);
+                }
+                cloud_chats.extend(orphans);
                 self.delete_cloud_machines(cloud_chats);
                 // Best-effort teardown of live runs we host for the deleted chats
                 // (the doc rows are already tombstoned; a straggler run would only
