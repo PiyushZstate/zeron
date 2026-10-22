@@ -230,6 +230,9 @@ export interface LifecycleParams {
   readonly generation: number;
   readonly provider: string;
   readonly sandboxId: string;
+  /** Sleep only: stop even a busy machine (out of credits). An idle sleep
+   * leaves a busy one running. */
+  readonly force?: boolean;
 }
 
 export interface EnrollRequest extends CloudCaller {
@@ -879,6 +882,12 @@ export class CloudAccount extends DurableObject<Env> {
     const existing = this.sessions.get(chatId);
     if (existing) return this.okSession(existing);
     if (this.balance() <= 0) return this.outOfCredits();
+    // Sleeping sessions keep their sandbox (storage on the provider) and a
+    // record here: bounded, whoever is creating them.
+    const live = [...this.sessions.values()].filter((x) => x.state !== "deleting").length;
+    if (live >= this.maxSessions()) {
+      return fail(429, "too_many_sessions", `You have ${live} Cloud chats. Delete some to start another.`);
+    }
     const name = typeof repo?.fullName === "string" ? repo.fullName.split("/")[1] : undefined;
     const root = (this.env.CLOUD_PROJECTS_ROOT ?? CLOUD_PROJECTS_ROOT).replace(/\/+$/, "");
     const path = name ? `${root}/${name}` : "";
@@ -1017,6 +1026,14 @@ export class CloudAccount extends DurableObject<Env> {
     if (existing && existing.parentChatId !== parentChatId) {
       return fail(409, "conflict", "That chat already has a Cloud session.");
     }
+    // A new delegate takes a fresh chat id. Its row is written as the user,
+    // so an existing (or deleted) chat's id would re-home that chat under
+    // this machine and hand a stolen runner key its transcript.
+    if (!existing) {
+      const taken = await this.chatIdTaken(chatId);
+      if (taken === undefined) return fail(503, "unavailable", "Couldn't check the chat id; try again.");
+      if (taken) return fail(409, "conflict", "That chat id is already in use.");
+    }
     const started = existing
       ? this.okSession(existing)
       : await this.createSession(
@@ -1034,6 +1051,23 @@ export class CloudAccount extends DurableObject<Env> {
     return started;
   }
 
+  /** Whether `chatId` names a chat row in the user's registry, live or
+   * deleted; `undefined` when the registry couldn't be read. */
+  private async chatIdTaken(chatId: string): Promise<boolean | undefined> {
+    const { orgId, userId } = this.acct;
+    if (!orgId || !userId) return undefined;
+    const room = this.env.REGISTRY_ROOMS.get(this.env.REGISTRY_ROOMS.idFromName(`reg1/${orgId}/${userId}`));
+    try {
+      const res = await room.fetch(
+        new Request(`https://registry/chat-host?chat=${encodeURIComponent(chatId)}`, { headers: { [AUTH_USER_HEADER]: userId } })
+      );
+      if (!res.ok) return undefined;
+      return ((await res.json()) as { known?: unknown }).known === true;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** The delegate's chat row: hosted by its new machine, under its parent,
    * in the parent's project — only the fields known now (no nulls), so the
    * host's own later writes win field by field. Idempotent: an existing row
@@ -1044,7 +1078,18 @@ export class CloudAccount extends DurableObject<Env> {
     const room = this.env.REGISTRY_ROOMS.get(this.env.REGISTRY_ROOMS.idFromName(`reg1/${orgId}/${userId}`));
     const headers = { [AUTH_USER_HEADER]: userId };
     const host = await room.fetch(new Request(`https://registry/chat-host?chat=${encodeURIComponent(s.chatId)}`, { headers }));
-    if (host.ok && ((await host.json()) as { deviceId?: unknown }).deviceId === s.deviceId) return;
+    if (!host.ok) {
+      console.warn("cloud: reading a delegate's chat row failed", s.chatId, host.status);
+      return;
+    }
+    const row = (await host.json()) as { deviceId?: unknown; known?: unknown };
+    if (row.deviceId === s.deviceId) return;
+    // Only ever the first write of a fresh id: never over another device's
+    // chat, or a deleted one.
+    if (row.known === true) {
+      console.warn("cloud: not writing a delegate's row over an existing chat", s.chatId);
+      return;
+    }
     const set: Record<string, unknown> = {
       id: s.chatId,
       deviceId: s.deviceId,
@@ -1185,14 +1230,14 @@ export class CloudAccount extends DurableObject<Env> {
     return this.startWorkflow<LifecycleParams>(s, "wake", (generation) => ({ ...params, generation }));
   }
 
-  private async beginSleep(s: SessionRecord, reason: string): Promise<CloudResult<CloudSessionView>> {
+  private async beginSleep(s: SessionRecord, reason: string, force = false): Promise<CloudResult<CloudSessionView>> {
     const params = this.lifecycleParams(s);
     if (!params) return this.okSession(s);
     s.state = "stopping";
     s.pendingWake = false;
     s.idleCheckAt = undefined;
     this.ledger("sleep", s, { detail: reason });
-    return this.startWorkflow<LifecycleParams>(s, "sleep", (generation) => ({ ...params, generation }));
+    return this.startWorkflow<LifecycleParams>(s, "sleep", (generation) => ({ ...params, generation, ...(force ? { force } : {}) }));
   }
 
   private session(caller: CloudCaller, chatId: string): SessionRecord | CloudResult<never> {
@@ -1279,7 +1324,11 @@ export class CloudAccount extends DurableObject<Env> {
     s.failedAction = undefined;
     await this.saveSession(s);
 
-    if (workflow) {
+    // A provision still creating its sandbox is left to finish: told it was
+    // superseded, it deletes the sandbox it made. Terminated mid-create, the
+    // provider may already have made one nobody would ever record.
+    const creating = workflow?.kind === "provision" && !params;
+    if (workflow && !creating) {
       try {
         const instance = await this.workflowBinding(workflow.kind)?.get(workflow.id);
         const { status } = (await instance?.status()) ?? { status: "complete" };
@@ -1450,6 +1499,13 @@ export class CloudAccount extends DurableObject<Env> {
     return token ? { ok: true, value: token } : fail(503, "unavailable", "Runner tokens are not configured.");
   }
 
+  /** The repository a Cloud machine's chat works in: a runner's GitHub
+   * grants are bound to it (a stolen runner key gets nothing else). */
+  async repoOfDevice(caller: CloudCaller, deviceId: string): Promise<string | undefined> {
+    if (!this.matches(caller)) return undefined;
+    return this.sessionByDevice(deviceId)?.repo.fullName;
+  }
+
   /** `POST /runner/heartbeat` (runner bearer, already verified). */
   async heartbeat(runner: CloudCaller & { deviceId: string }, beat: Heartbeat): Promise<CloudResult<{ ok: true }>> {
     const s = this.sessionByDevice(runner.deviceId);
@@ -1467,7 +1523,8 @@ export class CloudAccount extends DurableObject<Env> {
     if (s.state === "ready") s.idleCheckAt = (s.lastActiveAt ?? now) + this.idleMs();
     const provider = this.providerOf(s);
     const ttlSeconds = provider ? effectiveTtl(provider.capabilities, parseTtlSeconds(this.env.CLOUD_TTL_SECONDS)) : null;
-    if (provider && s.sandboxId && shouldExtendTtl({ ttlSeconds, busy, lastExtendedAt: s.lastTtlExtendAt, now })) {
+    // Out of credits, a busy machine is not kept alive past its TTL.
+    if (provider && s.sandboxId && this.balance() > 0 && shouldExtendTtl({ ttlSeconds, busy, lastExtendedAt: s.lastTtlExtendAt, now })) {
       // A provider account that forces auto-stop (Boat trial) would stop a
       // busy session mid-run: keep pushing it out. Fire-and-forget; the next
       // beat retries.
@@ -1583,7 +1640,8 @@ export class CloudAccount extends DurableObject<Env> {
     }
     if (this.balance(now) <= 0) {
       for (const s of [...this.sessions.values()]) {
-        if (s.state === "ready" && !s.pendingDelete) await this.beginSleep(s, "out of credits");
+        // Forced: a busy machine can't decline this one and run on unpaid.
+        if (s.state === "ready" && !s.pendingDelete) await this.beginSleep(s, "out of credits", true);
       }
     }
     this.acct.nextReconcileAt = this.nextReconcile(sql, now);
@@ -1721,9 +1779,18 @@ export class CloudAccount extends DurableObject<Env> {
         if (!hasGrant(sql, reason)) addCredits(sql, { at: now, credits: event.credits, reason });
         break;
       }
-      case "subscription":
-        writeBillingState(sql, "subscription", event.subscription);
+      case "subscription": {
+        // Stripe delivers out of order: a late `updated` must not undo a
+        // newer state, and a canceled subscription never comes back.
+        const stored = readBillingState<SubscriptionState & { eventAt?: number }>(sql, "subscription");
+        const same = stored?.id === event.subscription.id;
+        const stale = same && stored?.eventAt !== undefined && event.createdAt !== undefined && event.createdAt < stored.eventAt;
+        const revived = same && stored?.status === "canceled" && event.subscription.status !== "canceled";
+        if (!stale && !revived) {
+          writeBillingState(sql, "subscription", { ...event.subscription, ...(event.createdAt !== undefined ? { eventAt: event.createdAt } : {}) });
+        }
         break;
+      }
       case "period_paid": {
         const plan = planById(event.plan);
         if (plan) {
@@ -1743,6 +1810,17 @@ export class CloudAccount extends DurableObject<Env> {
   private current(chatId: string, generation: number): SessionRecord | undefined {
     const s = this.sessions.get(chatId);
     return s && s.generation === generation ? s : undefined;
+  }
+
+  private maxSessions(): number {
+    const n = Number(this.env.CLOUD_MAX_SESSIONS);
+    return Number.isInteger(n) && n > 0 ? n : 50;
+  }
+
+  /** Whether any session holds `sandboxId` (a superseded provision keeps
+   * its sandbox only if one does). */
+  async wfSandboxAdopted(sandboxId: string): Promise<boolean> {
+    return [...this.sessions.values()].some((s) => s.sandboxId === sandboxId);
   }
 
   async wfSandboxCreated(

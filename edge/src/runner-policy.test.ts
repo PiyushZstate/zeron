@@ -35,6 +35,15 @@ const REFUSED: [string, string][] = [
   ["GET", "/device/laptop-1/sidecar/repos"],
   ["POST", "/device/laptop-1/sidecar/repos"],
   ["POST", "/device/laptop-1/status"],
+  // A user's computer, even one hosting a delegate's chat: never a client
+  // link or a nudge (its RPC surface is terminals, files, the user's bearer).
+  ["GET", "/device/laptop-1/ws?role=client"],
+  ["GET", "/device/laptop-1/ws"],
+  ["POST", "/device/laptop-1/nudge"],
+  // Routes the policy doesn't name are refused (preview: every device's
+  // service catalog and the peer mesh).
+  ["GET", "/preview/o/ws"],
+  ["GET", "/something-new/o"],
   // Legacy whole-user loro rooms.
   ["GET", "/session/c1/ws"],
   ["GET", "/tail/c1"],
@@ -70,9 +79,9 @@ describe("runner policy", () => {
       ["GET", "/device/laptop-1/status"],
       // A delegate's machine: a client link and the command nudge, gated per
       // device by runner-access.ts (runnerDeviceGate).
-      ["GET", "/device/laptop-1/ws?role=client"],
-      ["GET", "/device/laptop-1/ws"],
-      ["POST", "/device/laptop-1/nudge"],
+      ["GET", "/device/cloud-2/ws?role=client"],
+      ["GET", "/device/cloud-2/ws"],
+      ["POST", "/device/cloud-2/nudge"],
       // Delegates' sessions, checked per session by the CloudAccount.
       ["POST", "/cloud/o/sessions"],
       ["DELETE", "/cloud/o/sessions/c2"],
@@ -84,7 +93,8 @@ describe("runner policy", () => {
       // Gated per chat by runner-access.ts, not by path.
       ["GET", "/chat2/c1/ws"],
       ["PUT", "/blob/c1/p1"],
-      ["POST", "/runner/heartbeat"]
+      ["POST", "/runner/heartbeat"],
+      ["PUT", "/attachments/a1"]
     ]) {
       expect(refused(runner, method!, path!), `${method} ${path}`).toBe(false);
     }

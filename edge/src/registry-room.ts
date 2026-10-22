@@ -383,7 +383,10 @@ export class RegistryRoom implements DurableObject {
       return json({
         deviceId: chatHost(row) ?? null,
         // A delegate's parent host may reach it too (its runner started it).
-        parentHost: (parent && chatHost(this.loadRow("chats", parent))) ?? null
+        parentHost: (parent && chatHost(this.loadRow("chats", parent))) ?? null,
+        // Whether the id was ever used, tombstones included: a new delegate
+        // must take a fresh id, never an existing (or deleted) chat's.
+        known: row !== undefined
       });
     }
 

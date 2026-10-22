@@ -23,8 +23,17 @@ const stripeCalls = async () =>
 
 let eventSeq = 0;
 /** POST a Stripe-signed webhook (or a badly signed one). */
-const webhook = async (type: string, object: Record<string, unknown>, opts: { id?: string; badSignature?: boolean } = {}) => {
-  const payload = JSON.stringify({ id: opts.id ?? `evt_${++eventSeq}_${crypto.randomUUID().slice(0, 6)}`, type, data: { object } });
+const webhook = async (
+  type: string,
+  object: Record<string, unknown>,
+  opts: { id?: string; badSignature?: boolean; created?: number } = {}
+) => {
+  const payload = JSON.stringify({
+    id: opts.id ?? `evt_${++eventSeq}_${crypto.randomUUID().slice(0, 6)}`,
+    type,
+    created: opts.created ?? Math.floor(Date.now() / 1000),
+    data: { object }
+  });
   const t = Math.floor(Date.now() / 1000);
   const v1 = await signPayload(opts.badSignature ? "whsec_wrong" : "whsec_test_fake", t, payload);
   return SELF.fetch("https://edge.test/stripe/webhook", {
@@ -114,6 +123,7 @@ describe("billing", () => {
     await webhook("customer.subscription.created", subscription);
     await webhook("invoice.paid", {
       id: "in_1",
+      billing_reason: "subscription_create",
       customer: "cus_2",
       parent: { subscription_details: { metadata: metadata(u) } },
       lines: { data: [{ amount: 2000, pricing: { price_details: { price: "price_base" } }, period: { start, end } }] }
@@ -143,6 +153,28 @@ describe("billing", () => {
     view = await billing(u);
     expect(view.plan).toBeUndefined();
     expect(view.credits.monthly).toBe(44400);
+  });
+
+  it("a late subscription event never undoes a newer one, nor revives a canceled plan", async () => {
+    const u = newUser("bill");
+    const end = Math.floor((Date.now() + 28 * DAY) / 1000);
+    const t = Math.floor(Date.now() / 1000);
+    const subscription = {
+      id: "sub_late",
+      customer: "cus_late",
+      status: "active",
+      cancel_at_period_end: false,
+      metadata: metadata(u),
+      items: { data: [{ price: { id: "price_pro" }, current_period_end: end }] }
+    };
+    await webhook("customer.subscription.created", subscription, { created: t - 60 });
+    await webhook("customer.subscription.deleted", { ...subscription, status: "canceled" }, { created: t });
+    // Delivered late: an update from before the cancel.
+    await webhook("customer.subscription.updated", { ...subscription, cancel_at_period_end: true }, { created: t - 30 });
+    expect((await billing(u)).plan).toBeUndefined();
+    // Even at the same second, a canceled subscription stays canceled.
+    await webhook("customer.subscription.updated", subscription, { created: t });
+    expect((await billing(u)).plan).toBeUndefined();
   });
 
   it("the portal needs a Stripe customer first", async () => {

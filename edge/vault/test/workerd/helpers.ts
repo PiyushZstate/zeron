@@ -98,8 +98,10 @@ export const mockUpstream = (routes: Record<string, (call: UpstreamCall) => Resp
     const call = { url, init, body: typeof init?.body === "string" ? init.body : "" };
     calls.push(call);
     const route = routes[url];
-    if (!route) throw new Error(`unexpected upstream call ${url}`);
-    return route(call);
+    if (route) return route(call);
+    // A repository the user can see and push to, unless a test says otherwise.
+    if (url.startsWith("https://api.github.com/repos/")) return json({ permissions: { push: true } });
+    throw new Error(`unexpected upstream call ${url}`);
   });
   return { calls, count: (url: string) => calls.filter((call) => call.url === url).length };
 };

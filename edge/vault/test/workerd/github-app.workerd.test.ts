@@ -56,7 +56,7 @@ const verifyAppJwt = async (jwt: string): Promise<Record<string, number | string
 const tokenRows = (userId: string) =>
   runInDurableObject(accountStub(env, userId, "github"), (_instance, state) =>
     state.storage.sql
-      .exec<{ installation_id: number; envelope: string; expires_at: number }>("SELECT * FROM installation_tokens")
+      .exec<{ key: string; installation_id: number; envelope: string; expires_at: number }>("SELECT * FROM repo_tokens")
       .toArray()
   );
 
@@ -102,18 +102,42 @@ describe("github installation grants", () => {
       [mintUrl(21)]: () => minted(`ghs_install_${++mints}`)
     });
     expect(value(await grant("octocat/one")).accessToken).toBe("ghs_install_1");
-    expect(value(await grant("octocat/two")).accessToken).toBe("ghs_install_1");
+    expect(value(await grant("octocat/one")).accessToken).toBe("ghs_install_1");
     expect(mints).toBe(1);
     expect(upstream.count(INSTALLATIONS)).toBe(2);
-    const [row] = await tokenRows(userId);
-    expect(row?.installation_id).toBe(21);
-    expect(row?.envelope).not.toContain("ghs_install_1");
+    // Another repository is another token: one never covers two.
+    expect(value(await grant("octocat/two")).accessToken).toBe("ghs_install_2");
+    expect(mints).toBe(2);
+    const rows = await tokenRows(userId);
+    expect(rows.map((r) => r.key).sort()).toEqual(["21:octocat/one:write", "21:octocat/two:write"]);
+    expect(rows.every((r) => r.installation_id === 21 && !r.envelope.includes("ghs_install_"))).toBe(true);
 
     // Ten minutes left is too little to hand out again.
     await runInDurableObject(accountStub(env, userId, "github"), (_instance, state) => {
-      state.storage.sql.exec("UPDATE installation_tokens SET expires_at = ?", Date.now() + 10 * 60_000);
+      state.storage.sql.exec("UPDATE repo_tokens SET expires_at = ?", Date.now() + 10 * 60_000);
     });
-    expect(value(await grant("octocat/one")).accessToken).toBe("ghs_install_2");
+    expect(value(await grant("octocat/one")).accessToken).toBe("ghs_install_3");
+    expect(mints).toBe(3);
+  });
+
+  it("mint for the one repository asked for, read-only when the user can't push, nothing when they can't see it", async () => {
+    let mints = 0;
+    const { upstream, grant } = await connected({
+      [INSTALLATIONS]: () => json({ installations: [installation(41, "octo-org")] }),
+      [mintUrl(41)]: () => minted(`ghs_scoped_${++mints}`),
+      [`${API}/repos/octo-org/readable`]: () => json({ permissions: { pull: true, push: false } }),
+      [`${API}/repos/octo-org/hidden`]: () => json({ message: "Not Found" }, 404)
+    });
+    value(await grant("octo-org/writable"));
+    value(await grant("octo-org/readable"));
+    const bodies = upstream.calls.filter((call) => call.url === mintUrl(41)).map((call) => JSON.parse(call.body));
+    expect(bodies[0]).toEqual({ repositories: ["writable"] });
+    expect(bodies[1]).toEqual({ repositories: ["readable"], permissions: { contents: "read", metadata: "read", pull_requests: "read" } });
+    // The access check is the user's own token.
+    expect(bearer(upstream.calls.find((call) => call.url === `${API}/repos/octo-org/readable`)!)).toBe(USER_TOKEN);
+
+    const hidden = await grant("octo-org/hidden");
+    expect(hidden).toMatchObject({ ok: false, error: "not_found" });
     expect(mints).toBe(2);
   });
 

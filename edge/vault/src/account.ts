@@ -55,7 +55,7 @@ import { devicesStub } from "./names";
 import { adapterFor } from "./providers";
 import { codexEmail } from "./providers/codex";
 import { fetchGithubLogin, parseGithubToken, pollDeviceFlow, startDeviceFlow } from "./providers/github";
-import { appJwt, findInstallation, installUrl, mintInstallationToken } from "./providers/github-app";
+import { appJwt, findInstallation, installUrl, mintInstallationToken, repoAccess } from "./providers/github-app";
 import { filterRepos, listGithubBranches, listGithubRepos } from "./providers/github-repos";
 import type { FetchFn, GrantMaterial, ProviderAdapter } from "./providers/types";
 import { fetchUsage, hasUsage } from "./providers/usage";
@@ -161,8 +161,10 @@ export const cleanProfile = (profile: VaultAccountProfile | undefined): VaultAcc
 };
 
 const flowAad = (userId: string, flowId: string): string => `${userId}|github|flow:${flowId}`;
-const installationAad = (userId: string, installationId: number): string =>
-  `${userId}|github|installation:${installationId}`;
+/** A cached token is for one repository at one access level. */
+const repoTokenKey = (installationId: number, repo: string, readOnly: boolean): string =>
+  `${installationId}:${repo.toLowerCase()}:${readOnly ? "read" : "write"}`;
+const repoTokenAad = (userId: string, key: string): string => `${userId}|github|repo-token:${key}`;
 
 /** Why a session can't reach `owner`, in words the engine shows the user. */
 const notInstalled = (owner: string, slug: string | undefined): string =>
@@ -233,9 +235,12 @@ export class VaultAccount extends DurableObject<Env> {
     this.sql.exec(
       "CREATE TABLE IF NOT EXISTS canary (seq INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, ok INTEGER NOT NULL, status TEXT NOT NULL)"
     );
+    // Whole-installation tokens are no longer minted; drop any still cached.
+    this.sql.exec("DROP TABLE IF EXISTS installation_tokens");
     this.sql.exec(
-      `CREATE TABLE IF NOT EXISTS installation_tokens (
-        installation_id INTEGER PRIMARY KEY,
+      `CREATE TABLE IF NOT EXISTS repo_tokens (
+        key TEXT PRIMARY KEY,
+        installation_id INTEGER NOT NULL,
         envelope TEXT NOT NULL,
         expires_at INTEGER NOT NULL
       )`
@@ -359,7 +364,7 @@ export class VaultAccount extends DurableObject<Env> {
     const removed = this.row(slot) !== undefined;
     this.sql.exec("DELETE FROM accounts WHERE slot = ?", slot);
     if (this.getMeta("active") === slot) this.deleteMeta("active");
-    if (this.rows().length === 0) this.sql.exec("DELETE FROM installation_tokens");
+    if (this.rows().length === 0) this.sql.exec("DELETE FROM repo_tokens");
     return ok({ removed, accounts: this.accountViews() });
   }
 
@@ -371,7 +376,7 @@ export class VaultAccount extends DurableObject<Env> {
     const removed = this.rows().length > 0;
     this.sql.exec("DELETE FROM accounts");
     this.sql.exec("DELETE FROM github_flows");
-    this.sql.exec("DELETE FROM installation_tokens");
+    this.sql.exec("DELETE FROM repo_tokens");
     this.deleteMeta("active");
     return ok({ removed });
   }
@@ -586,12 +591,14 @@ export class VaultAccount extends DurableObject<Env> {
   }
 
   /**
-   * An App installation token for `repo`'s owner. The user token (already
+   * An App installation token for `repo` alone. The user token (already
    * refreshed by `usableMaterial`) lists the installations the user can
-   * reach — the ownership check — and the App JWT mints for the one on the
-   * owner. A minted token is cached sealed and reused while it has more than
-   * `INSTALLATION_TOKEN_REUSE_MS` left; the installation lookup still runs on
-   * every grant, so losing access to an account stops grants at once.
+   * reach and reads the repository itself — the access check: a user who
+   * can't see it gets nothing, one who can't push gets a read-only token.
+   * The App JWT mints for that one repository, never the whole installation.
+   * A minted token is cached sealed (per repository and access level) and
+   * reused while it has more than `INSTALLATION_TOKEN_REUSE_MS` left; both
+   * checks still run on every grant, so losing access stops grants at once.
    */
   private async installationGrant(
     slot: string,
@@ -615,10 +622,24 @@ export class VaultAccount extends DurableObject<Env> {
       case "found":
         break;
     }
+    const access = await repoAccess(user.accessToken, repo, this.fetchFn);
+    switch (access.kind) {
+      case "unauthorized":
+        this.markReconnect(slot, generation, "GitHub answered 401");
+        return fail("needs_reconnect", "GitHub rejected the stored token; reconnect GitHub");
+      case "failed":
+        return fail("upstream", `GitHub repository lookup failed: ${access.reason}`);
+      case "none":
+        return fail("not_found", `Your GitHub account can't reach ${repo} through the Zeron app.`);
+      case "ok":
+        break;
+    }
+    const readOnly = !access.push;
+    const key = repoTokenKey(found.id, repo, readOnly);
     const grant = (token: string, expiresAt: number): VaultResult<Grant> =>
       ok({ provider: "github", accessToken: token, expiresAt, generation, ...(user.account ? { account: user.account } : {}) });
 
-    const cached = await this.cachedInstallationToken(found.id);
+    const cached = await this.cachedRepoToken(key);
     if (cached) return grant(cached.token, cached.expiresAt);
 
     let jwt: string;
@@ -628,10 +649,11 @@ export class VaultAccount extends DurableObject<Env> {
       console.error(JSON.stringify({ event: "vault.github.app_key", message: errorMessage(error) }));
       return fail("unavailable", "the GitHub App private key is unusable");
     }
-    const minted = await mintInstallationToken(jwt, found.id, this.fetchFn);
+    const name = repo.slice(repo.indexOf("/") + 1);
+    const minted = await mintInstallationToken(jwt, found.id, { repository: name, readOnly }, this.fetchFn);
     switch (minted.kind) {
       case "gone":
-        this.sql.exec("DELETE FROM installation_tokens WHERE installation_id = ?", found.id);
+        this.sql.exec("DELETE FROM repo_tokens WHERE installation_id = ?", found.id);
         return fail("not_found", notInstalled(owner, this.env.GITHUB_APP_SLUG));
       case "rejected":
         // Our App credentials, never the user's: page someone, don't
@@ -643,30 +665,30 @@ export class VaultAccount extends DurableObject<Env> {
       case "ok":
         break;
     }
-    const envelope = await sealJson(await this.keyring(), minted.token, installationAad(this.userId, found.id));
+    const envelope = await sealJson(await this.keyring(), minted.token, repoTokenAad(this.userId, key));
     this.sql.exec(
-      `INSERT INTO installation_tokens (installation_id, envelope, expires_at) VALUES (?, ?, ?)
-       ON CONFLICT(installation_id) DO UPDATE SET envelope = excluded.envelope, expires_at = excluded.expires_at`,
+      `INSERT INTO repo_tokens (key, installation_id, envelope, expires_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET envelope = excluded.envelope, expires_at = excluded.expires_at`,
+      key,
       found.id,
       envelope,
       minted.expiresAt
     );
-    await this.audit({ event: "github_installation_token", provider: "github", detail: `installation ${found.id}` });
+    await this.audit({
+      event: "github_installation_token",
+      provider: "github",
+      detail: `installation ${found.id} · ${repo}${readOnly ? " (read-only)" : ""}`
+    });
     return grant(minted.token, minted.expiresAt);
   }
 
-  private async cachedInstallationToken(
-    installationId: number
-  ): Promise<{ readonly token: string; readonly expiresAt: number } | undefined> {
+  private async cachedRepoToken(key: string): Promise<{ readonly token: string; readonly expiresAt: number } | undefined> {
     const row = this.sql
-      .exec<{ envelope: string; expires_at: number }>(
-        "SELECT envelope, expires_at FROM installation_tokens WHERE installation_id = ?",
-        installationId
-      )
+      .exec<{ envelope: string; expires_at: number }>("SELECT envelope, expires_at FROM repo_tokens WHERE key = ?", key)
       .toArray()[0];
     if (!row || row.expires_at - Date.now() <= INSTALLATION_TOKEN_REUSE_MS) return undefined;
     try {
-      const opened = await openJson<string>(await this.keyring(), row.envelope, installationAad(this.userId, installationId));
+      const opened = await openJson<string>(await this.keyring(), row.envelope, repoTokenAad(this.userId, key));
       return { token: opened.value, expiresAt: row.expires_at };
     } catch (error) {
       if (error instanceof VaultUnavailable) throw error;

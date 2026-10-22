@@ -85,6 +85,9 @@ export interface Env {
   CLOUD_EDGE_URL?: string;
   /** Most sessions awake at once per user (default 5). */
   CLOUD_MAX_AWAKE?: string;
+  /** Most Cloud sessions (awake or asleep, each keeping its sandbox) per user
+   * (default 50). */
+  CLOUD_MAX_SESSIONS?: string;
   /** Who Cloud is offered to: `everyone`, or WorkOS user/org ids separated
    * by commas or spaces. Anyone else reads Cloud as unavailable, so every
    * client hides it. Unset ⇒ nobody (everyone under AUTH_MODE=dev). A

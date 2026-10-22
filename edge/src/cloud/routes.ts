@@ -241,11 +241,15 @@ export const handleCloudRoute = async (
   if (auth.orgId !== orgId) return jsonError(403, "forbidden", "Wrong organization.");
   if (!cloudOffered(env, auth)) {
     // Off the beta list: Cloud reads as unavailable (clients hide it) and
-    // nothing else answers.
+    // nothing new starts. Cleanup still works — deleting a chat deletes its
+    // machine, and turning Cloud off removes the rest — so taking someone
+    // off the list never strands what they already have.
     if (parts.length === 2 && request.method === "GET") {
       return json({ state: "off", awakeSessions: 0, maxAwakeSessions: 0, available: false });
     }
-    return jsonError(404, "not_found", "Cloud isn't available for this account.");
+    const cleanup =
+      request.method === "DELETE" && (parts.length === 2 || (parts.length === 4 && parts[2] === "sessions"));
+    if (!cleanup) return jsonError(404, "not_found", "Cloud isn't available for this account.");
   }
   // A runner acts for the chat its machine hosts (runner-policy.ts admits
   // only session routes; the CloudAccount checks each is its own delegate).
@@ -385,13 +389,15 @@ export const handleCloudRoute = async (
  * caller's own, so another user's device id is simply not found there.
  */
 export const autoWakeCloudDevice = (
-  env: Pick<Env, "CLOUD_ACCOUNTS">,
+  env: Pick<Env, "CLOUD_ACCOUNTS" | "CLOUD_ACCESS" | "AUTH_MODE">,
   ctx: Pick<ExecutionContext, "waitUntil">,
   auth: Verified,
   deviceId: string
 ): void => {
   const ns = env.CLOUD_ACCOUNTS;
   if (!ns || auth.kind !== "user" || !auth.orgId || !deviceId.startsWith(CLOUD_DEVICE_PREFIX)) return;
+  // Off the beta list: nothing wakes (their machines stay asleep until deleted).
+  if (!cloudOffered(env, auth)) return;
   const caller = { orgId: auth.orgId, userId: auth.userId };
   ctx.waitUntil(
     accountStub(ns, caller.orgId, caller.userId)

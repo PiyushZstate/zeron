@@ -259,9 +259,25 @@ export class ProvisionWorkflow extends WorkflowEntrypoint<Env, ProvisionParams> 
         const current = await step.do("record-sandbox", DO_STEP, () =>
           account.wfSandboxCreated(p.chatId, p.generation, p.provider, created.id, machine, created.createdAt)
         );
-        // Superseded (deleted while we created): the delete path owns cleanup,
-        // and the daily orphan scan reports anything it could not see.
-        if (!current) return;
+        // Superseded (the chat was deleted while we created): the sandbox we
+        // just made is ours to remove — nobody else knows it exists — unless
+        // a session has adopted it since.
+        if (!current) {
+          const adopted = await step.do("sandbox-adopted", DO_STEP, () => account.wfSandboxAdopted(created.id));
+          if (!adopted) {
+            await step.do("drop-superseded-sandbox", PROVIDER_STEP, async () => {
+              try {
+                await provider.delete(created.id);
+              } catch (e) {
+                if (e instanceof SandboxError && e.kind === "notFound") return {};
+                const failure = classifyFailure(e, "delete a superseded Cloud sandbox");
+                throw failure.retryable ? new Error(failure.message) : new NonRetryableError(failure.message);
+              }
+              return {};
+            });
+          }
+          return;
+        }
       }
       const id = sandboxId;
       await ensureRunning(step, provider, id, ttlSeconds, "boot");
@@ -367,7 +383,7 @@ export class SleepWorkflow extends WorkflowEntrypoint<Env, LifecycleParams> {
           }
         }
       );
-      if (quiesce.exitCode === QUIESCE_BUSY_EXIT) {
+      if (quiesce.exitCode === QUIESCE_BUSY_EXIT && !p.force) {
         await step.do("decline-sleep", DO_STEP, () => account.wfSleepDeclined(p.chatId, p.generation, quiesce.output));
         return;
       }

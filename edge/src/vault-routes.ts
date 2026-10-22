@@ -24,6 +24,7 @@ import {
 import type { Verified } from "./auth";
 import type { Env } from "./env";
 import { json, readJsonBody } from "./http";
+import { cloudAccountName } from "./cloud/policy";
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const KEY_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -69,7 +70,7 @@ export const vaultResponse = <T>(result: VaultResult<T>): Response => {
 /** Handle a `/vault/*` route; undefined means "not a vault route". */
 export const handleVaultRoute = async (
   request: Request,
-  env: Pick<Env, "VAULT">,
+  env: Pick<Env, "VAULT" | "CLOUD_ACCOUNTS">,
   auth: Verified,
   url: URL
 ): Promise<Response | undefined> => {
@@ -212,6 +213,20 @@ export const handleVaultRoute = async (
     if (repo !== undefined && (typeof repo !== "string" || repo.length > 200)) return bad("Bad repo.");
     if (auth.kind === "runner" && deviceId !== auth.deviceId) {
       return json({ error: "forbidden", message: "A runner may only request grants for itself." }, 403);
+    }
+    // A Cloud machine's GitHub access is its own chat's repository, nothing
+    // else the user's GitHub reaches.
+    if (auth.kind === "runner" && provider === "github") {
+      const own =
+        env.CLOUD_ACCOUNTS && auth.orgId
+          ? await env.CLOUD_ACCOUNTS.get(env.CLOUD_ACCOUNTS.idFromName(cloudAccountName(auth.orgId, auth.userId))).repoOfDevice(
+              { orgId: auth.orgId, userId: auth.userId },
+              deviceId
+            )
+          : undefined;
+      if (!own || typeof repo !== "string" || repo.toLowerCase() !== own.toLowerCase()) {
+        return json({ error: "forbidden", message: "A Cloud machine may only get GitHub access to its own chat's repository." }, 403);
+      }
     }
     const req: GrantRequest = { provider, deviceId, ts, sig, ...(repo !== undefined ? { repo } : {}) };
     return call(() => vault.grant(caller, req));

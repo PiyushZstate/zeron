@@ -163,6 +163,9 @@
     "BOAT_API_BASE": "https://boat.dev/api/v1",
     // New accounts start with no free credits (for now).
     "CLOUD_STARTING_CREDITS": "0",
+    // Where session engines reach the edge when no request names it (a wake
+    // that re-provisions a session whose first provision failed).
+    "CLOUD_EDGE_URL": "https://edge.zeron.sh",
     // Live-mode Stripe (USD). Cloud has its own Billing Portal configuration:
     // the account's default portal serves an older product's customers.
     "STRIPE_PRICE_BASE": "price_1UTEAyLcv6c1lAsKCaWynvev",
@@ -214,8 +217,10 @@
         "CLOUD_MACHINE": "default",
         "CLOUD_TEMPLATE": "zeron-cloud-dev",
         "CLOUD_STARTING_CREDITS": "600",
-        // Production keeps Cloud to a beta list: CLOUD_ACCESS is a secret there.
-        "CLOUD_ACCESS": "everyone",
+        // Staging's Cloud shares production's Boat account: only Wing's
+        // staging account (production's list is a secret).
+        "CLOUD_ACCESS": "user_01KWD6G6ZPW9HT4SW6D89HB5FB",
+        "CLOUD_EDGE_URL": "https://zeron-edge-staging.sylasincorporated.workers.dev",
         "BOAT_API_BASE": "https://boat.dev/api/v1",
         "STRIPE_PRICE_BASE": "price_1URyT5Ld6XnizwPIilL1dIYa",
         "STRIPE_PRICE_PRO": "price_1URyT5Ld6XnizwPIBzZSBN6b",

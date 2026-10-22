@@ -255,6 +255,31 @@ describe("credits", () => {
     const ledger = await runInDurableObject(accountStub(u), (_instance, state) => listLedger(state.storage.sql));
     expect(ledger.some((e) => e.event === "sleep" && e.detail === "out of credits")).toBe(true);
   });
+
+  it("caps how many Cloud chats one account keeps", async () => {
+    const u = newUser();
+    const project = await enableCloud(u);
+    const { spaceId } = await readySession(u, "chat-cap-0", project);
+    await runInDurableObject(accountStub(u), (instance) => {
+      const sessions = (instance as unknown as { sessions: Map<string, Record<string, unknown>> }).sessions;
+      const one = sessions.get("chat-cap-0")!;
+      for (let i = 1; i < 50; i++) sessions.set(`chat-cap-${i}`, { ...one, chatId: `chat-cap-${i}`, state: "sleeping" });
+    });
+    const refused = await createSession(u, "chat-cap-50", spaceId);
+    expect(refused.status).toBe(429);
+    expect(await refused.json()).toMatchObject({ error: "too_many_sessions" });
+  });
+
+  it("stops even a busy machine once credits run out", async () => {
+    const u = newUser();
+    const { sandboxId } = await readySession(u, "chat-busy-broke", await enableCloud(u));
+    await boatControl("__set", { sandboxId, quiesceExit: 75 });
+    await grant(u, -2000);
+    await runInDurableObject(accountStub(u), (instance) =>
+      (instance as unknown as { reconcile(now?: number, full?: boolean): Promise<boolean> }).reconcile(Date.now(), true)
+    );
+    await waitForSession(u, "chat-busy-broke", "sleeping");
+  });
 });
 
 describe("runner enrollment", () => {
@@ -347,6 +372,12 @@ describe("runner tokens", () => {
     expect((await call("POST", "/vault/org1/grant", bearer, grant)).status).toBe(200);
     expect((await call("POST", "/vault/org1/grant", bearer, { ...grant, deviceId: "laptop-1" })).status).toBe(403);
     expect((await vaultCalls("grant")).at(-1)!.args[0]).toEqual({ userId: u.userId, orgId: "org1", kind: "runner", deviceId });
+    // GitHub: only its own chat's repository (acme/app), whatever else the
+    // user's GitHub reaches.
+    const github = { provider: "github", deviceId, ts: Date.now(), sig: "c2ln" };
+    expect((await call("POST", "/vault/org1/grant", bearer, { ...github, repo: "ACME/app" })).status).toBe(200);
+    expect((await call("POST", "/vault/org1/grant", bearer, { ...github, repo: "acme/other" })).status).toBe(403);
+    expect((await call("POST", "/vault/org1/grant", bearer, github)).status).toBe(403);
 
     // The chat it hosts belongs to a laptop's project: the session reads
     // that project's row, but not the laptop's other projects.

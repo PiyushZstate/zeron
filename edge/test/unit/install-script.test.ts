@@ -84,7 +84,8 @@ afterEach(() => {
   if (root) rmSync(root, { recursive: true, force: true });
 });
 
-describe("cloud install script", () => {
+// These run the real script under a shell several times: slow on a busy machine.
+describe("cloud install script", { timeout: 60_000 }, () => {
   it("is ASCII (it travels base64-encoded via btoa) and carries its idempotency guards", () => {
     expect(/^[\x00-\x7f]*$/.test(CLOUD_INSTALL_SCRIPT)).toBe(true);
     for (const marker of ["#!/bin/sh", "set -eu", "umask 077", "flock 9", 'if [ -x "$dest/zeron" ]', "ln -sfn", "chmod 600", "cmp -s", "systemctl enable", "EnvironmentFile="]) {

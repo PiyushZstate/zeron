@@ -13,6 +13,7 @@
  * Pure, so the whole path table is unit-testable without a Worker.
  */
 import type { Verified } from "./auth";
+import { CLOUD_DEVICE_PREFIX } from "./cloud/policy";
 
 /** The pre-chat2 loro rooms (s2 sessions, workspace docs): whole-user
  * documents with no per-device scoping — never for a runner. */
@@ -48,6 +49,10 @@ export const runnerRefusal = (auth: Verified, method: string, url: URL): string 
       // delegate it started (checked by runnerDeviceGate) — a client link
       // and the command nudge. Never the host role.
       if (parts[2] === "status" && parts.length === 3 && method === "GET") return undefined;
+      // Only ever another Cloud machine: a delegate's chat can be written on
+      // a user's computer (its RPC surface: terminals, files, the user's
+      // bearer), and a chat's parent alone must never open that.
+      if (!(parts[1] ?? "").startsWith(CLOUD_DEVICE_PREFIX)) return "a runner may only use its own device room";
       if (parts[2] === "ws" && parts.length === 3 && (url.searchParams.get("role") ?? "client") === "client") return undefined;
       if (parts[2] === "nudge" && parts.length === 3 && method === "POST") return undefined;
       return "a runner may only use its own device room";
@@ -58,7 +63,20 @@ export const runnerRefusal = (auth: Verified, method: string, url: URL): string 
         return undefined;
       }
       return "runner tokens may only sync registry rows";
-    default:
+    case "chat2":
+    case "blob":
+      // Gated per chat on the registry's host field (runner-access.ts).
       return undefined;
+    case "runner":
+      // Its own heartbeat (the account DO checks the device).
+      return undefined;
+    case "attachments":
+      // Retired mirror: acknowledged and discarded.
+      return undefined;
+    default:
+      // Anything not named here is the user's, including routes added later
+      // (e.g. `preview`: every device's service catalog and the peer mesh to
+      // their localhost services).
+      return "runner tokens cannot use this route";
   }
 };

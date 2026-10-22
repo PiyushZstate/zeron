@@ -131,6 +131,32 @@ export const findInstallation = async (
   return { kind: "none" };
 };
 
+export type RepoAccess =
+  /** The user can see the repository; `push` = they may write to it. */
+  | { readonly kind: "ok"; readonly push: boolean }
+  /** Not visible to the user (missing, private to others, or not covered
+   * by the App's installation). */
+  | { readonly kind: "none" }
+  | { readonly kind: "unauthorized" }
+  | { readonly kind: "failed"; readonly reason: string };
+
+/** What the user may do in `owner/name`, asked with their own token: a
+ * user-to-server token sees exactly the repositories both the user and the
+ * App's installation reach. */
+export const repoAccess = async (userToken: string, repo: string, fetchFn: FetchFn): Promise<RepoAccess> => {
+  const response = await upstream(fetchFn, `${GITHUB_API}/repos/${repo.split("/").map(encodeURIComponent).join("/")}`, {
+    headers: headers(userToken)
+  });
+  if (!response) return { kind: "failed", reason: "timeout or network error" };
+  if (response.status === 401) return { kind: "unauthorized" };
+  if (response.status === 404 || response.status === 403) return { kind: "none" };
+  if (!response.ok) return { kind: "failed", reason: `GitHub HTTP ${response.status}` };
+  const body: unknown = await response.json().catch(() => undefined);
+  if (!isObject(body)) return { kind: "failed", reason: "unexpected GitHub response" };
+  const permissions = isObject(body.permissions) ? body.permissions : {};
+  return { kind: "ok", push: permissions.push === true || permissions.admin === true || permissions.maintain === true };
+};
+
 export type InstallationToken =
   | { readonly kind: "ok"; readonly token: string; readonly expiresAt: number }
   /** 404: the App was uninstalled (or the installation never existed). */
@@ -139,14 +165,21 @@ export type InstallationToken =
   | { readonly kind: "rejected"; readonly reason: string }
   | { readonly kind: "failed"; readonly reason: string };
 
+/** A token for ONE repository of the installation, never the whole of it;
+ * read-only when the user can't push there themselves. */
 export const mintInstallationToken = async (
   jwt: string,
   installationId: number,
+  scope: { readonly repository: string; readonly readOnly: boolean },
   fetchFn: FetchFn
 ): Promise<InstallationToken> => {
   const response = await upstream(fetchFn, `${GITHUB_API}/app/installations/${installationId}/access_tokens`, {
     method: "POST",
-    headers: headers(jwt)
+    headers: { ...headers(jwt), "content-type": "application/json" },
+    body: JSON.stringify({
+      repositories: [scope.repository],
+      ...(scope.readOnly ? { permissions: { contents: "read", metadata: "read", pull_requests: "read" } } : {})
+    })
   });
   if (!response) return { kind: "failed", reason: "timeout or network error" };
   if (response.status === 404) return { kind: "gone" };

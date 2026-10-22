@@ -160,7 +160,8 @@ export const createCheckout = async (
     cancel_url: `${returnUrl}?result=canceled`,
     client_reference_id: `${account.orgId}:${account.userId}`,
     ...(customer ? { customer } : {}),
-    allow_promotion_codes: true
+    // The account's coupons also serve an older product: no codes here.
+    allow_promotion_codes: false
   };
   if (request.kind === "subscription") {
     const price = planPrice(env, request.plan);
@@ -279,6 +280,8 @@ export type BillingEvent =
       readonly account: AccountRef;
       readonly customer?: string;
       readonly subscription: SubscriptionState;
+      /** The event's own time (Unix ms): Stripe doesn't deliver in order. */
+      readonly createdAt?: number;
     }
   | {
       readonly type: "period_paid";
@@ -355,7 +358,8 @@ export const parseEvent = (env: StripeEnv, event: Json): BillingEvent | undefine
         eventId,
         account,
         customer: idOf(data.customer),
-        subscription: type === "customer.subscription.deleted" ? { ...subscription, status: "canceled" } : subscription
+        subscription: type === "customer.subscription.deleted" ? { ...subscription, status: "canceled" } : subscription,
+        ...(num(event.created) !== undefined ? { createdAt: num(event.created)! * 1000 } : {})
       };
     }
     case "invoice.paid": {
@@ -365,6 +369,12 @@ export const parseEvent = (env: StripeEnv, event: Json): BillingEvent | undefine
         accountOf(obj(obj(data.parent)?.subscription_details)?.metadata);
       const invoice = str(data.id);
       if (!account || !invoice) return undefined;
+      // A plan's credits come with the invoice that starts or renews it. A
+      // plan change's mid-period invoice grants nothing: switching back and
+      // forth must not mint a month of credits each time (Cloud's portal
+      // switches plans without proration, from the next period).
+      const reason = str(data.billing_reason);
+      if (reason !== "subscription_create" && reason !== "subscription_cycle") return undefined;
       const lines = (obj(data.lines)?.data as unknown[] | undefined) ?? [];
       for (const raw of lines) {
         const line = obj(raw);
@@ -377,6 +387,7 @@ export const parseEvent = (env: StripeEnv, event: Json): BillingEvent | undefine
         // A plan change's invoice credits the unused old plan with a
         // negative line: only what was paid for grants credits.
         if ((num(line.amount) ?? 0) < 0) continue;
+        if (line.proration === true || obj(obj(line.parent)?.subscription_item_details)?.proration === true) continue;
         const period = obj(line.period);
         const start = num(period?.start);
         const end = num(period?.end);

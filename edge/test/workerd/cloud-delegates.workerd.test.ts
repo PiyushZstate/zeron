@@ -61,6 +61,32 @@ const startChild = (u: TestUser, runner: string, chatId: string, parentChatId: s
   call("POST", `/cloud/${u.orgId}/sessions`, runner, { chatId, parentChatId, config: { harness: "codex" }, ...body });
 
 describe("Cloud delegates", () => {
+  it("a delegate never takes an existing or deleted chat's id", async () => {
+    const { u, user, main, other, runner } = await world();
+    const laptopChat = `laptop-${rand()}`;
+    const gone = `gone-${rand()}`;
+    const push = await call("POST", "/registry/org1/push?device=laptop", user, {
+      batch: `b-${rand()}`,
+      ops: [
+        upsert("chats", laptopChat, { deviceId: "laptop", spaceId: main.spaceId, title: "on the laptop" }, "laptop"),
+        upsert("chats", gone, { deviceId: "laptop", spaceId: main.spaceId, title: "deleted" }, "laptop")
+      ]
+    });
+    expect(push.status, await push.clone().text()).toBe(200);
+    const del = await call("POST", "/registry/org1/push?device=laptop", user, {
+      batch: `b-${rand()}`,
+      ops: [{ kind: "chats", id: gone, op: "delete", hlc: encodeHlc(Date.now(), clock++, "laptop") }]
+    });
+    expect(del.status, await del.clone().text()).toBe(200);
+    for (const taken of [laptopChat, gone, other.chatId]) {
+      expect((await startChild(u, runner, taken, main.chatId)).status, taken).toBe(409);
+    }
+    // Nothing moved: the laptop's chat is still the laptop's, the deleted one stays deleted.
+    const after = await rows(user);
+    expect(find(after, "chats", laptopChat)?.fields.deviceId).toBe("laptop");
+    expect(find(after, "chats", gone)).toBeUndefined();
+  });
+
   it("a main chat's machine starts a child on a machine of its own, with its chat row", async () => {
     const { u, user, main, runner } = await world();
     const child = `child-${rand()}`;

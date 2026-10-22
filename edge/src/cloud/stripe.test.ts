@@ -57,6 +57,7 @@ describe("stripe", () => {
       data: {
         object: {
           id: "in_1",
+          billing_reason: "subscription_cycle",
           subscription_details: { metadata: account },
           lines: { data: [{ amount: 2000, price: { id: "price_pro" }, period: { start: 10, end: 20 } }] }
         }
@@ -68,6 +69,7 @@ describe("stripe", () => {
       data: {
         object: {
           id: "in_2",
+          billing_reason: "subscription_create",
           parent: { subscription_details: { metadata: account } },
           lines: {
             data: [
@@ -79,6 +81,23 @@ describe("stripe", () => {
       }
     });
     expect(upgrade).toMatchObject({ plan: "max", start: 15_000 });
+    // A plan change's mid-period invoice, or a proration line, grants nothing.
+    const change = (billing_reason: string, line: Record<string, unknown> = {}) =>
+      parseEvent(env, {
+        ...base,
+        data: {
+          object: {
+            id: "in_4",
+            billing_reason,
+            parent: { subscription_details: { metadata: account } },
+            lines: { data: [{ amount: 4000, price: { id: "price_max" }, period: { start: 15, end: 20 }, ...line }] }
+          }
+        }
+      });
+    expect(change("subscription_update")).toBeUndefined();
+    expect(change("manual")).toBeUndefined();
+    expect(change("subscription_cycle", { proration: true })).toBeUndefined();
+    expect(change("subscription_cycle", { parent: { subscription_item_details: { proration: true } } })).toBeUndefined();
     // No account in the metadata: not ours to apply.
     expect(parseEvent(env, { ...base, data: { object: { id: "in_3", lines: { data: [] } } } })).toBeUndefined();
   });
