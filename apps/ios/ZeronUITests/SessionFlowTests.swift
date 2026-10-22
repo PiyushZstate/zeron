@@ -565,6 +565,30 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(older.staticTexts["This computer needs a newer Zeron to switch provider."].exists)
     }
 
+    /// A computer offering every agent: the switcher scrolls, and the chosen
+    /// provider stays in view as the pages are swiped.
+    func testModelPickerWithEveryProviderKeepsTheChosenOneInView() {
+        let app = launch(["-route", "chat:chat-tabs", "-all-providers"])
+        let input = app.textViews["composer-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        input.tap()
+        app.buttons["composer-chip-model"].tap()
+        let first = app.buttons["model-picker-tab-codex"]
+        XCTAssertTrue(first.waitForExistence(timeout: 5))
+        snapshot(app, "picker-every-provider-start")
+        for id in ["claude-code", "opencode", "cursor", "devin", "grok"] {
+            app.collectionViews.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-list'"))
+                .allElementsBoundByIndex.first { $0.isHittable }?.swipeLeft()
+            let tab = app.buttons["model-picker-tab-\(id)"]
+            expectation(for: NSPredicate(format: "isSelected == true AND isHittable == true"), evaluatedWith: tab)
+            waitForExpectations(timeout: 5)
+        }
+        snapshot(app, "picker-every-provider-middle")
+        app.buttons["model-picker-tab-hermes"].tap()
+        expectation(for: NSPredicate(format: "isSelected == true AND isHittable == true"), evaluatedWith: app.buttons["model-picker-tab-hermes"])
+        waitForExpectations(timeout: 5)
+    }
+
     /// Regression: a drag that starts at the tail re-latched follow at once,
     /// so the list sprang back to the bottom on release while streaming.
     func testScrollingUpWhileStreamingStaysPut() {

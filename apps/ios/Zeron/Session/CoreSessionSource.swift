@@ -283,6 +283,14 @@ final class CoreSessionSource: SessionSource {
                 ModelPickerTab(harness: h.id, label: h.label, footer: "Your next message continues this chat with \(h.label).") { await rows(h.id) }
             }
         }
+        #if DEBUG
+        // Screenshots: `-all-providers` offers every agent there is.
+        if ProcessInfo.processInfo.arguments.contains("-all-providers") {
+            tabs = [tabs[0]] + ["claude-code", "codex", "opencode", "cursor", "devin", "grok", "hermes", "pi", "antigravity"]
+                .filter { $0 != harness }
+                .map { id in ModelPickerTab(harness: id, label: HarnessNames.label(id)) { await rows(id) } }
+        }
+        #endif
         let note: String? = canSwitchProvider ? nil
             : turnRunning ? "You can switch provider when this turn ends."
             : hostSwitchesProviders ? nil

@@ -618,12 +618,19 @@ private final class SkeletonCell: UICollectionViewCell {
 
 /// A capsule track of provider segments (logo + name) with a thumb that
 /// follows the pages under it, finger for finger. When the names don't all
-/// fit, the others shrink to their logos and the chosen one keeps its name.
-private final class ProviderSwitcher: UIView {
+/// fit, the others shrink to their logos and the chosen one keeps its name;
+/// when even that doesn't fit (a computer offering every agent), the track
+/// scrolls, keeps the chosen one in view, and fades out at the edges with
+/// more to see.
+private final class ProviderSwitcher: UIView, UIScrollViewDelegate {
     static let height: CGFloat = 40
     private static let inset: CGFloat = 3
+    private static let fade: CGFloat = 34
 
     var onSelect: ((Int) -> Void)?
+    private let clip = UIView()
+    private let scroller = UIScrollView()
+    private let edges = CAGradientLayer()
     private let thumb = UIView()
     private var segments: [Segment] = []
     private var position: CGFloat = 0
@@ -633,18 +640,29 @@ private final class ProviderSwitcher: UIView {
         backgroundColor = Palette.controlFill
         layer.cornerRadius = Self.height / 2
         layer.cornerCurve = .continuous
+        clip.layer.cornerRadius = Self.height / 2
+        clip.layer.cornerCurve = .continuous
+        clip.clipsToBounds = true
+        addSubview(clip)
+        scroller.showsHorizontalScrollIndicator = false
+        scroller.alwaysBounceHorizontal = false
+        scroller.contentInsetAdjustmentBehavior = .never
+        scroller.delegate = self
+        clip.addSubview(scroller)
+        edges.startPoint = CGPoint(x: 0, y: 0.5)
+        edges.endPoint = CGPoint(x: 1, y: 0.5)
         thumb.backgroundColor = Palette.dual(.white, UIColor(white: 1, alpha: 0.14))
         thumb.layer.cornerCurve = .continuous
         thumb.layer.shadowColor = UIColor.black.cgColor
         thumb.layer.shadowOffset = CGSize(width: 0, height: 1)
         thumb.layer.shadowRadius = 5
-        addSubview(thumb)
+        scroller.addSubview(thumb)
         for (ix, item) in items.enumerated() {
             // The tab is short on room: "Claude", not "Claude Code".
             let segment = Segment(harness: item.harness, title: item.title == "Claude Code" ? "Claude" : item.title)
             segment.addAction(UIAction { [weak self] _ in self?.onSelect?(ix) }, for: .touchUpInside)
             segments.append(segment)
-            addSubview(segment)
+            scroller.addSubview(segment)
         }
         updateShadow()
         registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (self: ProviderSwitcher, _) in self.updateShadow() }
@@ -666,6 +684,8 @@ private final class ProviderSwitcher: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         guard !segments.isEmpty, bounds.width > 0 else { return }
+        clip.frame = bounds
+        scroller.frame = bounds
         let lower = max(0, min(segments.count - 1, Int(position.rounded(.down))))
         let upper = min(segments.count - 1, lower + 1)
         let t = min(max(position - CGFloat(lower), 0), 1)
@@ -683,6 +703,36 @@ private final class ProviderSwitcher: UIView {
         }
         thumb.frame = lerp(a[lower], b[upper], t)
         thumb.layer.cornerRadius = thumb.bounds.height / 2
+        let content = max(bounds.width, (segments.last?.frame.maxX ?? 0) + Self.inset)
+        scroller.contentSize = CGSize(width: content, height: bounds.height)
+        // Keep the chosen provider in the middle of the view.
+        let maxOffset = content - bounds.width
+        if maxOffset > 0 {
+            scroller.contentOffset.x = min(max(thumb.frame.midX - bounds.width / 2, 0), maxOffset)
+        }
+        updateEdges()
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) { updateEdges() }
+
+    /// Fade the side(s) that have more providers past them.
+    private func updateEdges() {
+        let maxOffset = scroller.contentSize.width - bounds.width
+        guard maxOffset > 0.5, bounds.width > 0 else {
+            clip.layer.mask = nil
+            return
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let x = scroller.contentOffset.x
+        let f = Self.fade / bounds.width
+        let start: UIColor = x > 0.5 ? .clear : .black
+        let end: UIColor = x < maxOffset - 0.5 ? .clear : .black
+        edges.frame = clip.bounds
+        edges.colors = [start.cgColor, UIColor.black.cgColor, UIColor.black.cgColor, end.cgColor]
+        edges.locations = [0, NSNumber(value: Double(f)), NSNumber(value: Double(1 - f)), 1]
+        clip.layer.mask = edges
+        CATransaction.commit()
     }
 
     private var available: CGFloat { bounds.width - Self.inset * 2 }
@@ -699,6 +749,7 @@ private final class ProviderSwitcher: UIView {
             let extra = (available - natural.reduce(0, +)) / n
             widths = natural.map { $0 + extra }
         } else {
+            // Past this the track scrolls rather than squeezing logos.
             widths = segments.indices.map { $0 == selected ? natural[$0] : Segment.logoWidth }
             let extra = max(0, (available - widths.reduce(0, +)) / n)
             widths = widths.map { $0 + extra }
