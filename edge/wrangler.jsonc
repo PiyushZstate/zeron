@@ -120,6 +120,9 @@
     //   RUNNER_JWT_PRIVATE_KEY  ES256 private JWK (JSON) that signs runner JWTs
     //   RUNNER_JWT_PUBLIC_KEY   the matching public JWK (JSON); add a "kid" to
     //                           rotate later
+    //   CLOUD_ACCESS            who Cloud is offered to: "everyone", or WorkOS
+    //                           user/org ids (comma or space separated). Unset ⇒
+    //                           nobody. A secret so it changes without a deploy.
     //   ADMIN_TOKEN             operator bearer for GET /admin/cloud/usage
     //                           (unset ⇒ that route 404s)
     //   STRIPE_SECRET_KEY       Stripe API key (billing; src/cloud/stripe.ts)
@@ -202,6 +205,8 @@
         "CLOUD_MACHINE": "default",
         "CLOUD_TEMPLATE": "zeron-cloud-dev",
         "CLOUD_STARTING_CREDITS": "600",
+        // Production keeps Cloud to a beta list: CLOUD_ACCESS is a secret there.
+        "CLOUD_ACCESS": "everyone",
         "BOAT_API_BASE": "https://boat.dev/api/v1",
         "STRIPE_PRICE_BASE": "price_1URyT5Ld6XnizwPIilL1dIYa",
         "STRIPE_PRICE_PRO": "price_1URyT5Ld6XnizwPIBzZSBN6b",

@@ -82,6 +82,11 @@ export interface Env {
   CLOUD_EDGE_URL?: string;
   /** Most sessions awake at once per user (default 5). */
   CLOUD_MAX_AWAKE?: string;
+  /** Who Cloud is offered to: `everyone`, or WorkOS user/org ids separated
+   * by commas or spaces. Anyone else reads Cloud as unavailable, so every
+   * client hides it. Unset ⇒ nobody (everyone under AUTH_MODE=dev). A
+   * secret, so it changes without a deploy. */
+  CLOUD_ACCESS?: string;
   /** Named provider snapshot new session sandboxes start from (engine
    * pre-installed, no identity). Unset ⇒ a blank machine + install. */
   CLOUD_TEMPLATE?: string;

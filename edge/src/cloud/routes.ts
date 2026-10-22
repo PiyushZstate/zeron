@@ -58,6 +58,7 @@ type CloudEnv = Pick<
   | "RUNNER_JWT_PRIVATE_KEY"
   | "AUTH_MODE"
   | "CLOUD_EDGE_URL"
+  | "CLOUD_ACCESS"
 > &
   ProviderEnv &
   StripeEnv;
@@ -84,6 +85,17 @@ export const cloudAvailable = (env: CloudEnv): boolean =>
       sandboxProvider(env) &&
       (env.RUNNER_JWT_PRIVATE_KEY || env.AUTH_MODE === "dev")
   );
+
+/** Whether Cloud is offered to this caller (`CLOUD_ACCESS`): the feature
+ * flag that keeps Cloud to a beta list. A runner acts for its machine's
+ * owner, so it's judged as that user. */
+export const cloudOffered = (env: Pick<Env, "CLOUD_ACCESS" | "AUTH_MODE">, auth: Pick<Verified, "userId" | "orgId">): boolean => {
+  const access = env.CLOUD_ACCESS?.trim();
+  if (!access) return env.AUTH_MODE === "dev";
+  if (access === "everyone") return true;
+  const listed = new Set(access.split(/[\s,]+/).filter(Boolean));
+  return listed.has(auth.userId) || (auth.orgId !== undefined && listed.has(auth.orgId));
+};
 
 const rpc = async <T>(run: () => Promise<CloudResult<T>>): Promise<Response> => {
   try {
@@ -227,6 +239,14 @@ export const handleCloudRoute = async (
   const orgId = parts[1];
   if (!orgId || !ID_RE.test(orgId)) return jsonError(404, "not_found", "Not found.");
   if (auth.orgId !== orgId) return jsonError(403, "forbidden", "Wrong organization.");
+  if (!cloudOffered(env, auth)) {
+    // Off the beta list: Cloud reads as unavailable (clients hide it) and
+    // nothing else answers.
+    if (parts.length === 2 && request.method === "GET") {
+      return json({ state: "off", awakeSessions: 0, maxAwakeSessions: 0, available: false });
+    }
+    return jsonError(404, "not_found", "Cloud isn't available for this account.");
+  }
   // A runner acts for the chat its machine hosts (runner-policy.ts admits
   // only session routes; the CloudAccount checks each is its own delegate).
   const caller =
