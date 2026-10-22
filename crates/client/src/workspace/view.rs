@@ -210,6 +210,9 @@ pub struct WorkspaceSnapshot {
     pub pull_requests: PullRequestGroups,
     pub archived: Vec<Arc<SessionRow>>,
     pub devices: Vec<DeviceView>,
+    /// Cloud's per-session machines: never listed, but a chat hosted on one
+    /// still needs its version and capabilities.
+    cloud_machines: Vec<DeviceView>,
     /// Every chat row (archived and children included), by id.
     pub sessions: HashMap<String, Arc<SessionRow>>,
     children: HashMap<String, Vec<Arc<SessionRow>>>,
@@ -225,8 +228,12 @@ impl WorkspaceSnapshot {
         self.projects.iter().find(|p| p.id == space_id)
     }
 
+    /// Any device by id, a Cloud session machine included.
     pub fn device(&self, device_id: &str) -> Option<&DeviceView> {
-        self.devices.iter().find(|d| d.id == device_id)
+        self.devices
+            .iter()
+            .chain(&self.cloud_machines)
+            .find(|d| d.id == device_id)
     }
 
     /// Execution hosts (new-session / new-project pickers).
@@ -709,17 +716,9 @@ pub(crate) fn derive(
         }
     }
 
-    let mut devices: Vec<DeviceView> = state
+    let (cloud_machines, mut devices): (Vec<DeviceView>, Vec<DeviceView>) = state
         .devices
         .iter()
-        // Cloud's per-session machines aren't devices to pick or list; Cloud
-        // is offered on its own.
-        .filter(|device| {
-            !device
-                .capabilities
-                .iter()
-                .any(|c| c == zeron_proto::CLOUD_SESSION_CAPABILITY)
-        })
         .map(|device| DeviceView {
             id: device.id.clone(),
             name: device_display_name(device).unwrap_or_else(|| "Unknown device".to_owned()),
@@ -736,7 +735,14 @@ pub(crate) fn derive(
             is_self: device.id == cx.self_device_id,
             session_count: active.iter().filter(|c| c.device_id == device.id).count() as u32,
         })
-        .collect();
+        // Cloud's per-session machines aren't devices to pick or list; Cloud
+        // is offered on its own.
+        .partition(|device| {
+            device
+                .capabilities
+                .iter()
+                .any(|c| c == zeron_proto::CLOUD_SESSION_CAPABILITY)
+        });
     devices.sort_by(|a, b| {
         b.is_execution_host
             .cmp(&a.is_execution_host)
@@ -759,6 +765,7 @@ pub(crate) fn derive(
         pull_requests,
         archived,
         devices,
+        cloud_machines,
         sessions: rows,
         children,
         content_hash: 0,
@@ -801,7 +808,7 @@ fn snapshot_hash(s: &WorkspaceSnapshot) -> u64 {
     }
     ids(&mut h, &s.projectless);
     ids(&mut h, &s.archived);
-    for device in &s.devices {
+    for device in s.devices.iter().chain(&s.cloud_machines) {
         device.hash(&mut h);
     }
     let mut all: Vec<(&String, u64)> = s.sessions.iter().map(|(k, v)| (k, v.revision)).collect();
@@ -882,5 +889,8 @@ mod tests {
         assert_eq!(row.device_name.as_deref(), Some("Cloud"));
         let devices: Vec<&str> = snapshot.devices.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(devices, ["mac"]);
+        // Unlisted, but its chats still read what it can do.
+        let machine = snapshot.device("cloud-s1").expect("a Cloud machine is still found by id");
+        assert_eq!(machine.capabilities, ["cloud-session"]);
     }
 }

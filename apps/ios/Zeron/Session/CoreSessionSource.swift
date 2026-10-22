@@ -77,7 +77,9 @@ final class CoreSessionSource: SessionSource {
         var next = SessionChrome()
         next.title = c.title
         let project = row?.project?.name ?? "No project"
-        next.subtitle = c.host.name.map { "\(project) @ \($0)" } ?? project
+        // A Cloud chat's machine is "Cloud", not its own device name.
+        let hostName = row?.isCloud == true ? row?.deviceName : c.host.name
+        next.subtitle = hostName.map { "\(project) @ \($0)" } ?? project
         next.running = c.live.turnRunning
         next.canSteer = c.host.capabilities.midTurnSteering ?? false
         next.placeholder = "Message \(row?.harnessLabel ?? "the agent")"

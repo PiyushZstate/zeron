@@ -5,7 +5,7 @@ import UIKit
 struct ModelPickerTab {
     let harness: String
     let label: String
-    /// Under the list: what picking here does to the chat.
+    /// Over the list: what picking here does to the chat.
     var footer: String? = nil
     let load: () async -> [ModelPickerRow]
 }
@@ -16,18 +16,19 @@ struct ModelPickerRow: Equatable {
     let detail: String?
 }
 
-/// The model picker: a glass sheet sized to its list, with a provider
-/// switcher over swipeable pages (the current provider first) when the chat
-/// may change provider. Only one provider: no switcher, the provider rides in
-/// the title and `note` says why it's the only one.
+/// The model picker: a glass sheet sized to its list. A left-aligned title
+/// says where the chat runs; with more than one provider a switcher sits over
+/// swipeable pages (the current provider first). Models sit right on the
+/// glass — no cards, no rules — and the current one is held in a soft accent
+/// tint.
 final class ModelPickerViewController: UIViewController, UIScrollViewDelegate {
     private let tabs: [ModelPickerTab]
     private let host: (name: String, symbol: String)
-    private let note: String?
     private let onPick: (_ harness: String, _ model: ModelPickerRow) -> Void
 
     private var selected: Int
     private var pages: [Page] = []
+    private let header = UIView()
     private let pager = UIScrollView()
     private var switcher: ProviderSwitcher?
     private weak var sheet: UISheetPresentationController?
@@ -36,9 +37,8 @@ final class ModelPickerViewController: UIViewController, UIScrollViewDelegate {
     /// The picker in its sheet, ready to present.
     static func sheet(tabs: [ModelPickerTab], harness: String, model: String?, host: (name: String, symbol: String), note: String? = nil, onPick: @escaping (String, ModelPickerRow) -> Void) -> UIViewController {
         let picker = ModelPickerViewController(tabs: tabs, harness: harness, model: model, host: host, note: note, onPick: onPick)
-        let nav = UINavigationController(rootViewController: picker)
-        nav.modalPresentationStyle = .pageSheet
-        if let sheet = nav.sheetPresentationController {
+        picker.modalPresentationStyle = .pageSheet
+        if let sheet = picker.sheetPresentationController {
             sheet.detents = [
                 .custom(identifier: .init("fit")) { [weak picker] ctx in
                     picker?.fittedHeight(ctx.maximumDetentValue) ?? ctx.maximumDetentValue * 0.55
@@ -47,20 +47,20 @@ final class ModelPickerViewController: UIViewController, UIScrollViewDelegate {
             ]
             sheet.prefersGrabberVisible = true
             sheet.prefersScrollingExpandsWhenScrolledToEdge = true
+            sheet.preferredCornerRadius = 34
             picker.sheet = sheet
         }
-        return nav
+        return picker
     }
 
     private init(tabs: [ModelPickerTab], harness: String, model: String?, host: (name: String, symbol: String), note: String?, onPick: @escaping (String, ModelPickerRow) -> Void) {
         self.tabs = tabs
         self.host = host
-        self.note = note
         self.onPick = onPick
         self.selected = tabs.firstIndex { $0.harness == harness } ?? 0
         super.init(nibName: nil, bundle: nil)
         pages = tabs.enumerated().map { ix, tab in
-            Page(tab: tab, current: (harness, model), footer: tab.footer ?? (ix == selected ? note : nil))
+            Page(tab: tab, current: (harness, model), notice: tab.footer ?? (ix == selected ? note : nil))
         }
     }
 
@@ -70,14 +70,7 @@ final class ModelPickerViewController: UIViewController, UIScrollViewDelegate {
         super.viewDidLoad()
         // Clear: the sheet's own glass is the surface.
         view.backgroundColor = .clear
-        navigationItem.titleView = titleView()
-        navigationItem.leftBarButtonItem = UIBarButtonItem(systemItem: .close, primaryAction: UIAction { [weak self] _ in
-            self?.dismiss(animated: true)
-        })
-        let bar = UINavigationBarAppearance()
-        bar.configureWithTransparentBackground()
-        navigationItem.standardAppearance = bar
-        navigationItem.scrollEdgeAppearance = bar
+        buildHeader()
 
         pager.isPagingEnabled = true
         pager.showsHorizontalScrollIndicator = false
@@ -92,25 +85,23 @@ final class ModelPickerViewController: UIViewController, UIScrollViewDelegate {
             pager.addSubview(page)
         }
 
-        let top: NSLayoutYAxisAnchor
+        var top = header.bottomAnchor
         if tabs.count > 1 {
             let switcher = ProviderSwitcher(items: tabs.map { ($0.harness, $0.label) })
             switcher.onSelect = { [weak self] ix in self?.select(ix, animated: true) }
             switcher.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(switcher)
             NSLayoutConstraint.activate([
-                switcher.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 6),
+                switcher.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 18),
                 switcher.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 20),
                 switcher.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -20),
                 switcher.heightAnchor.constraint(equalToConstant: ProviderSwitcher.height),
             ])
             self.switcher = switcher
             top = switcher.bottomAnchor
-        } else {
-            top = view.safeAreaLayoutGuide.topAnchor
         }
         NSLayoutConstraint.activate([
-            pager.topAnchor.constraint(equalTo: top, constant: 4),
+            pager.topAnchor.constraint(equalTo: top, constant: 10),
             pager.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             pager.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             pager.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -136,36 +127,66 @@ final class ModelPickerViewController: UIViewController, UIScrollViewDelegate {
         }
     }
 
-    // MARK: Title
+    // MARK: Header
 
-    /// "Model" over where it runs; with one provider, that provider too.
-    private func titleView() -> UIView {
+    /// "Model" over where it runs (with one provider, that provider first),
+    /// and a glass close button.
+    private func buildHeader() {
         let title = UILabel()
         title.text = "Model"
-        title.font = Fonts.ui(.sansSemibold, 16)
+        title.font = Fonts.ui(.sansSemibold, 22)
         title.textColor = Palette.text
+        title.accessibilityTraits = .header
+
         let sub = UILabel()
-        sub.font = Fonts.ui(.sans, 12)
+        sub.font = Fonts.ui(.sans, 13)
         sub.textColor = Palette.secondary
         let icon = UIImageView()
         icon.contentMode = .scaleAspectFit
         icon.tintColor = Palette.secondary
         if tabs.count == 1, let only = tabs.first {
             sub.text = "\(only.label) · \(host.name)"
-            icon.image = BrandMarks.image(for: only.harness, side: 12)
+            icon.image = BrandMarks.image(for: only.harness, side: 13)
         } else {
             sub.text = host.name
-            icon.image = UIImage(systemName: host.symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 10, weight: .medium))
+            icon.image = UIImage(systemName: host.symbol, withConfiguration: UIImage.SymbolConfiguration(pointSize: 11, weight: .medium))
         }
         let line = UIStackView(arrangedSubviews: [icon, sub])
-        line.spacing = 4
+        line.spacing = 5
         line.alignment = .center
-        let stack = UIStackView(arrangedSubviews: [title, line])
-        stack.axis = .vertical
-        stack.alignment = .center
-        stack.spacing = 1
-        stack.accessibilityIdentifier = "model-picker-title"
-        return stack
+        let text = UIStackView(arrangedSubviews: [title, line])
+        text.axis = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.accessibilityIdentifier = "model-picker-title"
+
+        var c = UIButton.Configuration.glass()
+        c.image = UIImage(systemName: "xmark", withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
+        c.baseForegroundColor = Palette.secondary
+        c.cornerStyle = .capsule
+        let close = UIButton(configuration: c, primaryAction: UIAction { [weak self] _ in self?.dismiss(animated: true) })
+        close.accessibilityLabel = "Close"
+        close.accessibilityIdentifier = "model-picker-close"
+
+        for v in [text, close] as [UIView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            header.addSubview(v)
+        }
+        header.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(header)
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: view.topAnchor, constant: 26),
+            header.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
+            header.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -18),
+            text.topAnchor.constraint(equalTo: header.topAnchor),
+            text.bottomAnchor.constraint(equalTo: header.bottomAnchor),
+            text.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            text.trailingAnchor.constraint(lessThanOrEqualTo: close.leadingAnchor, constant: -12),
+            close.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            close.centerYAnchor.constraint(equalTo: title.centerYAnchor, constant: 4),
+            close.widthAnchor.constraint(equalToConstant: 36),
+            close.heightAnchor.constraint(equalToConstant: 36),
+        ])
     }
 
     // MARK: Paging
@@ -205,7 +226,7 @@ final class ModelPickerViewController: UIViewController, UIScrollViewDelegate {
         guard isViewLoaded, view.window != nil, pager.bounds.width > 0 else { return estimate }
         let lists = pages.map(\.contentHeight).max() ?? 0
         guard lists > 0 else { return estimate }
-        return min(maximum * 0.72, max(pager.frame.minY + lists + 8, 280))
+        return min(maximum * 0.78, max(pager.frame.minY + lists, 280))
     }
 
     private func refit() {
@@ -226,8 +247,8 @@ final class ModelPickerViewController: UIViewController, UIScrollViewDelegate {
         for page in pages { page.setCurrent((harness, row.id)) }
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         onPick(harness, row)
-        // A beat to see the check land.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+        // A beat to see the selection land.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self] in
             self?.dismiss(animated: true)
         }
     }
@@ -235,8 +256,9 @@ final class ModelPickerViewController: UIViewController, UIScrollViewDelegate {
 
 // MARK: - A provider's page
 
-/// One provider's models as an inset list; a search field once the list is
-/// long (OpenCode can offer hundreds).
+/// One provider's models, straight on the glass; a notice over them when
+/// there's something to know, and a search field once the list is long
+/// (OpenCode can offer hundreds).
 private final class Page: UIView, UICollectionViewDelegate, UISearchTextFieldDelegate {
     private enum Item: Hashable {
         case model(String)
@@ -248,29 +270,32 @@ private final class Page: UIView, UICollectionViewDelegate, UISearchTextFieldDel
     var onLoaded: (() -> Void)?
     let list: UICollectionView
     private var current: (harness: String, model: String?)
-    private let footer: String?
+    private let notice: String?
     private var rows: [ModelPickerRow]?
     private var byId: [String: ModelPickerRow] = [:]
     private var query = ""
-    private var search: UISearchTextField?
     private var data: UICollectionViewDiffableDataSource<Int, Item>!
     private var started = false
     private var listTop: NSLayoutConstraint!
 
     static let searchThreshold = 12
 
-    init(tab: ModelPickerTab, current: (harness: String, model: String?), footer: String?) {
+    init(tab: ModelPickerTab, current: (harness: String, model: String?), notice: String?) {
         self.tab = tab
         self.current = current
-        self.footer = footer
-        var config = UICollectionLayoutListConfiguration(appearance: .insetGrouped)
-        config.backgroundColor = .clear
-        config.footerMode = footer == nil ? .none : .supplementary
-        config.separatorConfiguration.color = Palette.hairline
-        let layout = UICollectionViewCompositionalLayout { _, env in
-            let section = NSCollectionLayoutSection.list(using: config, layoutEnvironment: env)
-            section.contentInsets.top = 10
-            section.contentInsets.bottom = 12
+        self.notice = notice
+        let layout = UICollectionViewCompositionalLayout { _, _ in
+            let size = NSCollectionLayoutSize(widthDimension: .fractionalWidth(1), heightDimension: .estimated(62))
+            let group = NSCollectionLayoutGroup.vertical(layoutSize: size, subitems: [NSCollectionLayoutItem(layoutSize: size)])
+            let section = NSCollectionLayoutSection(group: group)
+            section.interGroupSpacing = 2
+            section.contentInsets = NSDirectionalEdgeInsets(top: 0, leading: 12, bottom: 20, trailing: 12)
+            if notice != nil {
+                let header = NSCollectionLayoutBoundarySupplementaryItem(
+                    layoutSize: NSCollectionLayoutSize(widthDimension: .fractionalWidth(1), heightDimension: .estimated(48)),
+                    elementKind: UICollectionView.elementKindSectionHeader, alignment: .top)
+                section.boundarySupplementaryItems = [header]
+            }
             return section
         }
         list = UICollectionView(frame: .zero, collectionViewLayout: layout)
@@ -295,30 +320,9 @@ private final class Page: UIView, UICollectionViewDelegate, UISearchTextFieldDel
     required init?(coder: NSCoder) { fatalError() }
 
     private func configureData() {
-        let modelCell = UICollectionView.CellRegistration<UICollectionViewListCell, String> { [weak self] cell, _, id in
+        let modelCell = UICollectionView.CellRegistration<ModelCell, String> { [weak self] cell, _, id in
             guard let self, let row = self.byId[id] else { return }
-            var content = UIListContentConfiguration.subtitleCell()
-            content.text = row.label
-            content.textProperties.font = Fonts.ui(.sansMedium, 16)
-            content.textProperties.color = Palette.text
-            content.secondaryText = row.detail
-            content.secondaryTextProperties.font = Fonts.ui(.sans, 13)
-            content.secondaryTextProperties.color = Palette.secondary
-            content.secondaryTextProperties.numberOfLines = 2
-            content.textToSecondaryTextVerticalPadding = 3
-            content.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 11, leading: 18, bottom: 11, trailing: 14)
-            cell.contentConfiguration = content
-            let isCurrent = self.tab.harness == self.current.harness && id == self.current.model
-            cell.accessories = isCurrent
-                ? [.checkmark(displayed: .always, options: .init(tintColor: Palette.accent))]
-                : []
-            cell.configurationUpdateHandler = { cell, state in
-                var bg = UIBackgroundConfiguration.listCell().updated(for: state)
-                bg.backgroundColor = state.isHighlighted || state.isSelected ? Page.pressed : Palette.rowActive
-                cell.backgroundConfiguration = bg
-            }
-            cell.accessibilityIdentifier = "model-picker-row-\(id)"
-            cell.accessibilityTraits = isCurrent ? [.button, .selected] : .button
+            cell.configure(row, current: self.tab.harness == self.current.harness && id == self.current.model)
         }
         let placeholderCell = UICollectionView.CellRegistration<SkeletonCell, Int> { cell, _, ix in
             cell.configure(seed: ix)
@@ -329,19 +333,13 @@ private final class Page: UIView, UICollectionViewDelegate, UISearchTextFieldDel
             case .placeholder(let ix): list.dequeueConfiguredReusableCell(using: placeholderCell, for: indexPath, item: ix)
             }
         }
-        let footerView = UICollectionView.SupplementaryRegistration<UICollectionViewListCell>(elementKind: UICollectionView.elementKindSectionFooter) { [weak self] view, _, _ in
-            var content = UIListContentConfiguration.footer()
-            content.text = self?.footer
-            content.textProperties.font = Fonts.ui(.sans, 13)
-            content.textProperties.color = Palette.secondary
-            view.contentConfiguration = content
+        let noticeView = UICollectionView.SupplementaryRegistration<NoticeView>(elementKind: UICollectionView.elementKindSectionHeader) { [weak self] view, _, _ in
+            view.text = self?.notice
         }
         data.supplementaryViewProvider = { list, _, indexPath in
-            list.dequeueConfiguredReusableSupplementary(using: footerView, for: indexPath)
+            list.dequeueConfiguredReusableSupplementary(using: noticeView, for: indexPath)
         }
     }
-
-    private static let pressed = Palette.dual(UIColor(white: 0.84, alpha: 0.9), UIColor(white: 1, alpha: 0.13))
 
     func load() {
         guard !started else { return }
@@ -360,9 +358,13 @@ private final class Page: UIView, UICollectionViewDelegate, UISearchTextFieldDel
 
     func setCurrent(_ current: (harness: String, model: String?)) {
         self.current = current
-        var snap = data.snapshot()
-        snap.reconfigureItems(snap.itemIdentifiers)
-        data.apply(snap, animatingDifferences: false)
+        for cell in list.visibleCells {
+            guard let cell = cell as? ModelCell, let ip = list.indexPath(for: cell),
+                  case .model(let id) = data.itemIdentifier(for: ip), let row = byId[id] else { continue }
+            UIView.animate(withDuration: 0.2) {
+                cell.configure(row, current: self.tab.harness == current.harness && id == current.model)
+            }
+        }
     }
 
     /// The list's natural height (search included), for the sheet's fit.
@@ -382,7 +384,7 @@ private final class Page: UIView, UICollectionViewDelegate, UISearchTextFieldDel
         var snap = NSDiffableDataSourceSnapshot<Int, Item>()
         snap.appendSections([0])
         if rows == nil {
-            snap.appendItems((0..<3).map(Item.placeholder))
+            snap.appendItems((0..<4).map(Item.placeholder))
         } else {
             snap.appendItems(visible.map { .model($0.id) })
         }
@@ -420,12 +422,11 @@ private final class Page: UIView, UICollectionViewDelegate, UISearchTextFieldDel
         field.translatesAutoresizingMaskIntoConstraints = false
         addSubview(field)
         NSLayoutConstraint.activate([
-            field.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            field.topAnchor.constraint(equalTo: topAnchor, constant: 2),
             field.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 20),
             field.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -20),
         ])
-        listTop.constant = 52
-        search = field
+        listTop.constant = 48
     }
 
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
@@ -434,7 +435,7 @@ private final class Page: UIView, UICollectionViewDelegate, UISearchTextFieldDel
     }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-        collectionView.deselectItem(at: indexPath, animated: true)
+        collectionView.deselectItem(at: indexPath, animated: false)
         guard case .model(let id) = data.itemIdentifier(for: indexPath), let row = byId[id] else { return }
         onPick?(tab.harness, row)
     }
@@ -445,8 +446,122 @@ private final class Page: UIView, UICollectionViewDelegate, UISearchTextFieldDel
     }
 }
 
+/// A model: its name over one or two lines of what it's for. The current
+/// one sits in a soft accent tint with an accent check; a press dims in.
+private final class ModelCell: UICollectionViewCell {
+    private let plate = UIView()
+    private let name = UILabel()
+    private let detail = UILabel()
+    private let check = UIImageView(image: UIImage(systemName: "checkmark", withConfiguration: UIImage.SymbolConfiguration(pointSize: 14, weight: .bold)))
+    private var isCurrent = false
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        plate.layer.cornerRadius = 18
+        plate.layer.cornerCurve = .continuous
+        name.font = Fonts.ui(.sansMedium, 16)
+        name.textColor = Palette.text
+        detail.font = Fonts.ui(.sans, 13)
+        detail.textColor = Palette.secondary
+        detail.numberOfLines = 2
+        check.tintColor = Palette.accent
+        check.contentMode = .center
+        check.setContentHuggingPriority(.required, for: .horizontal)
+        check.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let text = UIStackView(arrangedSubviews: [name, detail])
+        text.axis = .vertical
+        text.spacing = 3
+        let row = UIStackView(arrangedSubviews: [text, check])
+        row.alignment = .center
+        row.spacing = 12
+        for v in [plate, row] as [UIView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            contentView.addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            plate.topAnchor.constraint(equalTo: contentView.topAnchor),
+            plate.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+            plate.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+            plate.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            row.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 12),
+            row.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -12),
+            row.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -16),
+            check.widthAnchor.constraint(equalToConstant: 20),
+        ])
+        isAccessibilityElement = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(_ row: ModelPickerRow, current: Bool) {
+        name.text = row.label
+        detail.text = row.detail
+        detail.isHidden = (row.detail ?? "").isEmpty
+        isCurrent = current
+        check.alpha = current ? 1 : 0
+        updatePlate()
+        accessibilityLabel = [row.label, row.detail].compactMap { $0 }.joined(separator: ", ")
+        accessibilityTraits = current ? [.button, .selected] : .button
+        accessibilityIdentifier = "model-picker-row-\(row.id)"
+    }
+
+    override var isHighlighted: Bool {
+        didSet { UIView.animate(withDuration: isHighlighted ? 0.06 : 0.3, delay: 0, options: [.beginFromCurrentState, .allowUserInteraction]) { self.updatePlate() } }
+    }
+
+    private func updatePlate() {
+        plate.backgroundColor = isCurrent ? Palette.accentSoft : isHighlighted ? Palette.controlFill : .clear
+        plate.transform = isHighlighted ? CGAffineTransform(scaleX: 0.985, y: 0.985) : .identity
+    }
+}
+
+/// What to know before picking ("Your next message continues this chat
+/// with Codex"): a quiet tinted line over the list.
+private final class NoticeView: UICollectionReusableView {
+    private let label = UILabel()
+
+    var text: String? {
+        get { label.text }
+        set { label.text = newValue }
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        let plate = UIView()
+        plate.backgroundColor = Palette.controlFill
+        plate.layer.cornerRadius = 14
+        plate.layer.cornerCurve = .continuous
+        let icon = UIImageView(image: UIImage(systemName: "info.circle", withConfiguration: UIImage.SymbolConfiguration(pointSize: 13, weight: .medium)))
+        icon.tintColor = Palette.secondary
+        icon.setContentHuggingPriority(.required, for: .horizontal)
+        label.font = Fonts.ui(.sans, 13)
+        label.textColor = Palette.secondary
+        label.numberOfLines = 0
+        let row = UIStackView(arrangedSubviews: [icon, label])
+        row.spacing = 8
+        row.alignment = .firstBaseline
+        for v in [plate, row] as [UIView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            plate.topAnchor.constraint(equalTo: topAnchor),
+            plate.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+            plate.leadingAnchor.constraint(equalTo: leadingAnchor),
+            plate.trailingAnchor.constraint(equalTo: trailingAnchor),
+            row.topAnchor.constraint(equalTo: plate.topAnchor, constant: 11),
+            row.bottomAnchor.constraint(equalTo: plate.bottomAnchor, constant: -11),
+            row.leadingAnchor.constraint(equalTo: plate.leadingAnchor, constant: 14),
+            row.trailingAnchor.constraint(equalTo: plate.trailingAnchor, constant: -14),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+}
+
 /// A loading row: two soft bars that breathe until the models arrive.
-private final class SkeletonCell: UICollectionViewListCell {
+private final class SkeletonCell: UICollectionViewCell {
     private let title = UIView()
     private let detail = UIView()
     private var widths: [NSLayoutConstraint] = []
@@ -455,23 +570,20 @@ private final class SkeletonCell: UICollectionViewListCell {
         super.init(frame: frame)
         for bar in [title, detail] {
             bar.backgroundColor = Palette.controlFill
-            bar.layer.cornerRadius = 4
+            bar.layer.cornerRadius = 5
             bar.layer.cornerCurve = .continuous
             bar.translatesAutoresizingMaskIntoConstraints = false
             contentView.addSubview(bar)
         }
         NSLayoutConstraint.activate([
-            title.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 17),
-            title.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 18),
-            title.heightAnchor.constraint(equalToConstant: 12),
+            title.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 16),
+            title.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 14),
+            title.heightAnchor.constraint(equalToConstant: 13),
             detail.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 9),
             detail.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            detail.heightAnchor.constraint(equalToConstant: 9),
-            detail.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -17),
+            detail.heightAnchor.constraint(equalToConstant: 10),
+            detail.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -16),
         ])
-        var bg = UIBackgroundConfiguration.listCell()
-        bg.backgroundColor = Palette.rowActive
-        backgroundConfiguration = bg
         isUserInteractionEnabled = false
     }
 
@@ -479,11 +591,11 @@ private final class SkeletonCell: UICollectionViewListCell {
 
     func configure(seed: Int) {
         NSLayoutConstraint.deactivate(widths)
-        let t: [CGFloat] = [0.34, 0.42, 0.28]
-        let d: [CGFloat] = [0.62, 0.5, 0.56]
+        let t: [CGFloat] = [0.3, 0.38, 0.26, 0.34]
+        let d: [CGFloat] = [0.6, 0.48, 0.55, 0.42]
         widths = [
-            title.widthAnchor.constraint(equalTo: contentView.widthAnchor, multiplier: t[seed % 3]),
-            detail.widthAnchor.constraint(equalTo: contentView.widthAnchor, multiplier: d[seed % 3]),
+            title.widthAnchor.constraint(equalTo: contentView.widthAnchor, multiplier: t[seed % 4]),
+            detail.widthAnchor.constraint(equalTo: contentView.widthAnchor, multiplier: d[seed % 4]),
         ]
         NSLayoutConstraint.activate(widths)
         guard !UIAccessibility.isReduceMotionEnabled else { return }

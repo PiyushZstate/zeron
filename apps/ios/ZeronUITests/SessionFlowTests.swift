@@ -510,7 +510,8 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(list.waitForExistence(timeout: 5), "the picker opens")
         let row = list.cells.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-row-'")).element(boundBy: 1)
         XCTAssertTrue(row.waitForExistence(timeout: 5), "models load")
-        let picked = row.staticTexts.element(boundBy: 0).label
+        // A row reads "name, what it's for".
+        let picked = row.label.components(separatedBy: ", ").first ?? row.label
         row.tap()
         expectation(for: NSPredicate(format: "label == %@", picked), evaluatedWith: chip)
         waitForExpectations(timeout: 5)
@@ -544,7 +545,8 @@ final class SessionFlowTests: XCTestCase {
         claude.tap()
         let row = app.collectionViews["model-picker-list-claude-code"].cells.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-row-'")).element(boundBy: 0)
         XCTAssertTrue(row.waitForExistence(timeout: 5), "Claude's models load")
-        let picked = row.staticTexts.element(boundBy: 0).label
+        // A row reads "name, what it's for".
+        let picked = row.label.components(separatedBy: ", ").first ?? row.label
         row.tap()
         expectation(for: NSPredicate(format: "label == %@", picked), evaluatedWith: chip)
         waitForExpectations(timeout: 5)
