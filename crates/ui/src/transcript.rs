@@ -9164,20 +9164,23 @@ fn error_chip(
         None => "Error",
     };
     let button = sign_in.map(|on_click| {
+        // The app's button metrics (popover::btn_*), compact for the card,
+        // tinted in the card's red rather than a solid fill.
+        let danger = theme.danger;
         div()
             .id("error-sign-in")
             .flex_none()
-            .h(px(26.0))
-            .px(px(12.0))
-            .rounded_full()
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
             .flex()
             .items_center()
-            .bg(theme.danger_muted)
-            .text_color(theme.bg)
+            .bg(danger.opacity(0.14))
+            .text_color(theme.danger_muted)
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_size(px(12.0))
+            .text_size(crate::typography::ui_rems(12.0))
             .cursor_pointer()
-            .hover(|s| s.opacity(0.9))
+            .hover(move |s| s.bg(danger.opacity(0.22)))
             .on_click(on_click)
             .child(problem.map_or("Log in", ProviderProblem::action_label))
     });
