@@ -236,21 +236,22 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
         let device = runsOnCloud ? Self.cloudModelsKey : deviceId
         guard device != modelsDevice else { return refreshChips() }
         modelsDevice = device
-        if device == Self.cloudModelsKey {
+        let cloud = device == Self.cloudModelsKey
+        if cloud {
             // Cloud runs the agents it has accounts for: Claude Code, Codex.
-            models = Self.catalogModels().filter { ["claude-code", "codex"].contains($0.harness) }
+            models = Self.modelCache[device] ?? Self.catalogModels().filter { AppModel.cloudHarnesses.contains($0.harness) }
             if !models.contains(where: { $0.harness == draft.harness }), let first = models.first {
                 draft.harness = first.harness
                 draft.model = nil
                 draft.effort = nil
             }
-            return refreshChips()
+        } else {
+            models = Self.modelCache[device] ?? Self.catalogModels()
         }
-        models = Self.modelCache[device] ?? Self.catalogModels()
         refreshChips()
         Task { [weak self] in
             guard let self else { return }
-            let fresh = await self.app.models(for: device)
+            let fresh = cloud ? await self.app.cloudModels() : await self.app.models(for: device)
             guard !fresh.isEmpty else { return }
             Self.modelCache[device] = fresh
             guard self.modelsDevice == device else { return }

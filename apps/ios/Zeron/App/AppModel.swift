@@ -404,10 +404,13 @@ final class AppModel {
             if row.status == .working { counts.working += 1 }
             if row.status == .awaiting { counts.awaiting += 1 }
         }
+        // A row's own content (its model, say) counts even when the lists
+        // don't show it: open sessions read their chips from it.
+        let rowsChanged = all.count != rows.count || all.contains { rows[$0.key]?.revision != $0.value.revision }
         rows = all
         // Devices coming and going (Settings, host pickers) count as changes.
         let hosts = hostOptions
-        let changed = page != frontPage || archivedVMs != archived || counts != live || hosts != lastHosts
+        let changed = rowsChanged || page != frontPage || archivedVMs != archived || counts != live || hosts != lastHosts
         lastHosts = hosts
         live = counts
         frontPage = page
@@ -597,6 +600,21 @@ final class AppModel {
         for h in harnesses where h.offered {
             let models = (try? await client.listModels(deviceId: deviceId, harness: h.id)) ?? fallbackModels(harness: h.id)
             out += models.map { ModelChoice(harness: h.id, harnessLabel: h.label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels, detail: $0.description) }
+        }
+        return out
+    }
+
+    /// The agents Cloud runs.
+    static let cloudHarnesses = ["claude-code", "codex"]
+
+    /// Cloud's models, as one of the user's own computers reports them (a
+    /// Cloud machine is never dialed for a catalog).
+    func cloudModels() async -> [ModelChoice] {
+        guard let client else { return [] }
+        var out: [ModelChoice] = []
+        for h in Self.cloudHarnesses {
+            let label = HarnessNames.label(h)
+            out += await client.cloudModels(harness: h).map { ModelChoice(harness: h, harnessLabel: label, id: $0.id, label: $0.label, efforts: $0.reasoningLevels, detail: $0.description) }
         }
         return out
     }

@@ -506,8 +506,10 @@ final class SessionFlowTests: XCTestCase {
         let chip = app.buttons["composer-chip-model"]
         XCTAssertTrue(chip.waitForExistence(timeout: 5))
         chip.tap()
-        let list = app.collectionViews.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-list'")).firstMatch
-        XCTAssertTrue(list.waitForExistence(timeout: 5), "the picker opens")
+        let lists = app.collectionViews.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-list'"))
+        XCTAssertTrue(lists.firstMatch.waitForExistence(timeout: 5), "the picker opens")
+        // The page on screen (the others sit beside it, swipeable).
+        let list = lists.allElementsBoundByIndex.first { $0.isHittable } ?? lists.firstMatch
         let row = list.cells.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-row-'")).element(boundBy: 1)
         XCTAssertTrue(row.waitForExistence(timeout: 5), "models load")
         // A row reads "name, what it's for".

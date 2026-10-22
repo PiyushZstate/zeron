@@ -386,6 +386,19 @@ impl CoreClient {
             .collect()
     }
 
+    /// Cloud's model catalog for `harness`: from one of the user's online
+    /// computers (never a Cloud machine), else cached, else the static list.
+    pub async fn cloud_models(&self, harness: String) -> Vec<ModelInfo> {
+        let client = self.client.clone();
+        let fallback = harness.clone();
+        on_runtime(async move { Ok(client.cloud_models(&harness).await) })
+            .await
+            .unwrap_or_else(|_| zc::catalog::fallback_models(&fallback))
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
     /// Ask for session notifications on this device (APNs token as hex,
     /// "production" | "sandbox", and which kinds).
     pub async fn register_push_target(

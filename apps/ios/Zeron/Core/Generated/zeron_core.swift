@@ -1055,6 +1055,12 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
      */
     func closeSession(chatId: String) 
     
+    /**
+     * Cloud's model catalog for `harness`: from one of the user's online
+     * computers (never a Cloud machine), else cached, else the static list.
+     */
+    func cloudModels(harness: String) async  -> [ModelInfo]
+    
     func connectivity()  -> Connectivity
     
     /**
@@ -1523,6 +1529,27 @@ open func closeSession(chatId: String)  {try! rustCall() {
         FfiConverterString.lower(chatId),uniffiCallStatus
     )
 }
+}
+    
+    /**
+     * Cloud's model catalog for `harness`: from one of the user's online
+     * computers (never a Cloud machine), else cached, else the static list.
+     */
+open func cloudModels(harness: String)async  -> [ModelInfo]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_cloud_models(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(harness)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeModelInfo.lift,
+            errorHandler: nil
+            
+        )
 }
     
 open func connectivity() -> Connectivity  {
@@ -19681,6 +19708,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_close_session() != 11270) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_cloud_models() != 33439) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_connectivity() != 51284) {
