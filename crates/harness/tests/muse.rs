@@ -209,6 +209,22 @@ async fn a_turn_streams_text_and_usage_then_ends_on_turn_completed() {
             window: Some(1007997)
         }
     )));
+    // The account's subscription meters, from `usage/changed` (hand-added to
+    // the recording: Muse sends it to opted-in connections only).
+    let plan = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::PlanUsage {
+                windows,
+                plan_label,
+            } => Some((windows.clone(), plan_label.clone())),
+            _ => None,
+        })
+        .expect("PlanUsage");
+    assert_eq!(plan.1.as_deref(), Some("pro"));
+    assert_eq!(plan.0[0].label, "Session");
+    assert!((plan.0[0].used_fraction - 0.12).abs() < 1e-6);
+    assert_eq!(plan.0[1].label, "Week");
     assert_eq!(
         done(&events),
         (DoneStatus::Completed, None, Some(session.clone()))

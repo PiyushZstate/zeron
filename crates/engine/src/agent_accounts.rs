@@ -3010,6 +3010,11 @@ impl AgentAccounts {
             let usage = lock(&self.inner.usage);
             let mut inflight = lock(&self.inner.inflight_probes);
             for &(harness, slot, active) in targets {
+                // Muse reports its usage from runs (`record_muse_usage`); a
+                // probe's fresh host has observed none.
+                if harness == HarnessId::Muse {
+                    continue;
+                }
                 let key = usage_key(harness, &slot.account_key);
                 let credentials = credentials_fingerprint(&slot.credentials);
                 if let Some(entry) = usage.get(&key)
@@ -3057,6 +3062,11 @@ impl AgentAccounts {
         usage.retain(|key, _| live.contains(key));
         // Persist under the lock: overlapping lists must not interleave
         // writes of the same file.
+        self.persist_usage(&usage);
+    }
+
+    /// Write the usage cache; the caller holds [`Inner::usage`].
+    fn persist_usage(&self, usage: &HashMap<String, UsageEntry>) {
         let file = UsageCacheFile {
             entries: usage.clone(),
         };
@@ -3084,7 +3094,6 @@ impl AgentAccounts {
             HarnessId::Cursor => self.cursor_usage(slot).await,
             HarnessId::Grok => self.grok_usage(slot, is_active).await,
             HarnessId::Devin => self.devin_usage(slot).await,
-            HarnessId::Muse => self.muse_usage(slot).await,
             HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes => {
                 self.keyed_usage(harness, slot).await
             }

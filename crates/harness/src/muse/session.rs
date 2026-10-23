@@ -213,7 +213,9 @@ impl Runner {
     /// the stored one is gone, with a notice (the engine would otherwise try
     /// the same dead id forever).
     async fn open(&mut self, backlog: &mut Vec<Inbound>) -> Result<Value, HarnessError> {
-        self.host.initialize(self.read_only).await?;
+        // Experimental: `usage/changed` (the subscription meters, observed
+        // from Meta's model stream) is delivered only on opted-in connections.
+        self.host.initialize_with(self.read_only, true).await?;
         if let Some(id) = self.request.resume.clone() {
             let mut params = json!({
                 "sessionId": id,
@@ -523,8 +525,22 @@ impl Runner {
     }
 
     async fn notification(&mut self, method: &str, params: Value) -> Result<(), HarnessError> {
-        // Account-wide, so it names no session.
-        if method == "usage/changed" || string(&params, "sessionId") != self.session {
+        // Account-wide, so it names no session: the engine records it on the
+        // account this run uses.
+        if method == "usage/changed" {
+            if let Some(usage) = super::account::MuseUsage::parse(&params) {
+                self.emit(AgentEvent::PlanUsage {
+                    windows: usage.windows(),
+                    // Muse 1.4 reports the tier as an opaque numeric id:
+                    // a label only when it reads as one.
+                    plan_label: Some(usage.tier)
+                        .filter(|tier| tier.chars().any(|c| c.is_alphabetic())),
+                })
+                .await?;
+            }
+            return Ok(());
+        }
+        if string(&params, "sessionId") != self.session {
             return Ok(());
         }
         let turn = params["turnId"]

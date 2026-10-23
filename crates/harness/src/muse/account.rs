@@ -78,7 +78,29 @@ pub struct MuseUsage {
 }
 
 impl MuseUsage {
-    fn parse(value: &Value) -> Option<Self> {
+    /// The meters as the accounts page shows them: the current window, then
+    /// the week; over-quota percentages pin at full.
+    pub fn windows(&self) -> Vec<zeron_proto::AgentUsageWindow> {
+        let resets = |ms: Option<i64>| ms.and_then(chrono::DateTime::from_timestamp_millis);
+        let fraction = |percent: f64| (percent / 100.0).clamp(0.0, 1.0) as f32;
+        vec![
+            zeron_proto::AgentUsageWindow {
+                label: zeron_proto::plan_usage::codex_window_label(
+                    self.window.duration_mins.unwrap_or(0) * 60,
+                )
+                .to_string(),
+                used_fraction: fraction(self.window.used_percent),
+                resets_at: resets(self.window.resets_at_ms),
+            },
+            zeron_proto::AgentUsageWindow {
+                label: "Week".into(),
+                used_fraction: fraction(self.weekly.used_percent),
+                resets_at: resets(self.weekly.resets_at_ms),
+            },
+        ]
+    }
+
+    pub(super) fn parse(value: &Value) -> Option<Self> {
         let window = |v: &Value| {
             Some(MuseUsageWindow {
                 used_percent: v.get("usedPercent")?.as_f64()?,

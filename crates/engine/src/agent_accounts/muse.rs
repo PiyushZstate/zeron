@@ -28,8 +28,8 @@ use zeron_harness::muse::account as msp;
 use zeron_proto::{AgentLoginMode, AgentLoginStart, AgentUsageWindow, HarnessId};
 
 use super::{
-    AgentAccounts, EngineError, LoginFlow, ProbeError, Slot, SlotProfile, TaskLoginState,
-    UsageSnapshot, lock, new_id, now_ms, private_dir, slot_id_for,
+    AgentAccounts, EngineError, LoginFlow, Slot, SlotProfile, TaskLoginState, UsageSnapshot, lock,
+    new_id, now_ms, private_dir, slot_id_for,
 };
 
 /// The selected zeron-kept account's slot id (absent: Muse's own login).
@@ -100,28 +100,6 @@ fn mirror_config(_real: &Path, _root: &Path) -> std::io::Result<()> {
         std::io::ErrorKind::Unsupported,
         "Muse accounts kept by Zeron need macOS or Linux",
     ))
-}
-
-/// Usage windows as the accounts page shows them.
-fn usage_snapshot(usage: msp::MuseUsage) -> UsageSnapshot {
-    let resets = |ms: Option<i64>| ms.and_then(chrono::DateTime::from_timestamp_millis);
-    let fraction = |percent: f64| (percent / 100.0).clamp(0.0, 1.0) as f32;
-    UsageSnapshot {
-        windows: vec![
-            AgentUsageWindow {
-                label: super::codex_window_label(usage.window.duration_mins.unwrap_or(0) * 60)
-                    .to_string(),
-                used_fraction: fraction(usage.window.used_percent),
-                resets_at: resets(usage.window.resets_at_ms),
-            },
-            AgentUsageWindow {
-                label: "Week".into(),
-                used_fraction: fraction(usage.weekly.used_percent),
-                resets_at: resets(usage.weekly.resets_at_ms),
-            },
-        ],
-        plan_label: Some(usage.tier).filter(|tier| !tier.is_empty()),
-    }
 }
 
 fn muse_error(err: impl std::fmt::Display) -> EngineError {
@@ -358,21 +336,31 @@ impl AgentAccounts {
         Ok(())
     }
 
-    /// One kept account's subscription usage, as Muse last observed it.
-    pub(super) async fn muse_usage(&self, slot: &Slot) -> Result<UsageSnapshot, ProbeError> {
-        let unavailable = || ProbeError::Network { timeout: false };
-        let cli = self.muse_cli().map_err(|_| unavailable())?;
-        let env = self.muse_env(&slot.id).map_err(|_| unavailable())?;
-        match msp::usage(&cli, &env).await {
-            Ok(Some(usage)) => Ok(usage_snapshot(usage)),
-            // `usage/read` answers what THIS host process observed, and a
-            // probe's host is fresh: until usage is carried over from the
-            // session hosts, Muse shows no meters rather than an error.
-            Ok(None) => Err(ProbeError::NoCredentials {
-                why: super::NoCredentials::Unsupported,
-            }),
-            Err(_) => Err(unavailable()),
-        }
+    /// A run of kept account `slot_id` reported the subscription's usage:
+    /// it becomes that account's meters (Muse observes usage only on the
+    /// host doing the work, so a probe would never see any).
+    pub(super) fn record_muse_usage(
+        &self,
+        slot_id: &str,
+        windows: Vec<AgentUsageWindow>,
+        plan_label: Option<String>,
+    ) {
+        let Some(slot) = self.read_slot(HarnessId::Muse, slot_id) else {
+            return;
+        };
+        let mut usage = lock(&self.inner.usage);
+        usage
+            .entry(super::usage_key(HarnessId::Muse, &slot.account_key))
+            .or_default()
+            .record(
+                Ok(UsageSnapshot {
+                    windows,
+                    plan_label,
+                }),
+                String::new(),
+                now_ms(),
+            );
+        self.persist_usage(&usage);
     }
 
     /// Remove a kept account: Muse signs it out (revoking the session,
@@ -425,6 +413,19 @@ impl crate::registry::RunEnvironment for MuseRunEnvironment {
                     .map(|(_, fingerprint)| fingerprint)
             })
             .flatten()
+    }
+
+    async fn record_usage(
+        &self,
+        harness: HarnessId,
+        credential: &str,
+        windows: Vec<AgentUsageWindow>,
+        plan_label: Option<String>,
+    ) {
+        // Muse's own login (no kept account) has no row to show it on.
+        if harness == HarnessId::Muse && credential != OWN_LOGIN {
+            self.0.record_muse_usage(credential, windows, plan_label);
+        }
     }
 }
 
@@ -507,6 +508,7 @@ for line in sys.stdin:
         json.dump({"email": email}, open(auth, "w"))
         send({"jsonrpc": "2.0", "method": "account/loginCompleted", "params": {"outcome": "granted"}})
     elif method == "usage/read":
+        open(os.path.join(fake, "usage-probed"), "w").write("1")
         send({"jsonrpc": "2.0", "id": rid, "result": {"usage": {"observedAtMs": 1, "tier": "pro",
             "window": {"usedPercent": 25, "resetsAtMs": 1000, "windowDurationMins": 300},
             "weekly": {"usedPercent": 50, "resetsAtMs": 2000}}}})
@@ -632,10 +634,26 @@ for line in sys.stdin:
             (listed[1].0.as_str(), listed[1].1),
             ("b@example.com", false)
         );
+        // Usage arrives from a run on that account (never from a probe).
+        let window = |label: &str| AgentUsageWindow {
+            label: label.into(),
+            used_fraction: 0.25,
+            resets_at: None,
+        };
+        env.record_usage(
+            HarnessId::Muse,
+            &listed[0].2,
+            vec![window("Session"), window("Week")],
+            Some("pro".into()),
+        )
+        .await;
         let usage = accounts.list(false).await.unwrap();
         let a = usage.accounts.iter().find(|a| a.id == listed[0].2).unwrap();
         assert_eq!(a.usage_windows.len(), 2);
         assert_eq!(a.plan_label.as_deref(), Some("pro"));
+        let b = usage.accounts.iter().find(|a| a.id == listed[1].2).unwrap();
+        assert!(b.usage_windows.is_empty(), "only the account that ran");
+        assert!(!fake.join("usage-probed").exists());
 
         // A run gets the selected account's root; switching changes it.
         let mut request = run_request();
@@ -747,27 +765,5 @@ for line in sys.stdin:
             accounts.forget(HarnessId::Muse, &row.id).await.unwrap();
         }
         assert_eq!(rows.len(), 1);
-    }
-
-    #[test]
-    fn usage_maps_the_window_and_the_week() {
-        let snapshot = usage_snapshot(msp::MuseUsage {
-            tier: "pro".into(),
-            window: msp::MuseUsageWindow {
-                used_percent: 42.0,
-                resets_at_ms: Some(1_000),
-                duration_mins: Some(300),
-            },
-            weekly: msp::MuseUsageWindow {
-                used_percent: 130.0,
-                resets_at_ms: Some(2_000),
-                duration_mins: None,
-            },
-        });
-        assert_eq!(snapshot.windows[0].label, "Session");
-        assert!((snapshot.windows[0].used_fraction - 0.42).abs() < 1e-6);
-        assert_eq!(snapshot.windows[1].label, "Week");
-        assert_eq!(snapshot.windows[1].used_fraction, 1.0);
-        assert_eq!(snapshot.plan_label.as_deref(), Some("pro"));
     }
 }

@@ -774,6 +774,15 @@ pub enum AgentEvent {
         tokens: Option<u64>,
         window: Option<u64>,
     },
+    /// The subscription's usage as the provider reported it mid-run (Muse's
+    /// `usage/changed`): the engine records it on the account the run used,
+    /// for the Providers meters. Never persisted to docs.
+    #[serde(rename_all = "camelCase")]
+    PlanUsage {
+        windows: Vec<crate::AgentUsageWindow>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_label: Option<String>,
+    },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {

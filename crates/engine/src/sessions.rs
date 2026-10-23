@@ -4311,6 +4311,24 @@ async fn drive_run(
                 continue;
             }
         }
+        // The subscription's usage, reported mid-run: it belongs to the account
+        // the run started with, never to the transcript or the turn.
+        if let AgentEvent::PlanUsage {
+            windows,
+            plan_label,
+        } = &event
+        {
+            let credential = lock(&inner.runs)
+                .get(&chat_id)
+                .and_then(|h| h.credential.clone());
+            if let Some(credential) = credential {
+                inner
+                    .registry
+                    .record_plan_usage(harness_id, &credential, windows.clone(), plan_label.clone())
+                    .await;
+            }
+            continue;
+        }
         // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
         if let AgentEvent::ContextUsage { tokens, window } = &event {
             if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {

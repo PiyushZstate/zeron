@@ -148,3 +148,85 @@ async fn an_approved_device_login_runs_real_turns_and_signs_out() {
     let out = account::logout(&bin, &env).await.unwrap();
     assert!(!out.signed_in());
 }
+
+/// One real turn on an account that is already signed in (a Zeron-kept
+/// root: `MUSE_LIVE_ROOT=<agent-accounts/muse-homes/<slot>/config>`), with the
+/// session opted into Muse's experimental surface: the turn completes and
+/// the subscription's usage arrives as `PlanUsage`.
+#[tokio::test]
+#[ignore]
+async fn a_real_turn_reports_the_subscriptions_usage() {
+    use futures::StreamExt;
+    use zeron_harness::{CancellationToken, Harness, MuseHarness, RunControls, TurnControl};
+    use zeron_proto::{AgentEvent, RunRequest, SandboxLevel};
+    let (Some(bin), Some(root)) = (
+        std::env::var_os("MUSE_LIVE_BIN"),
+        std::env::var_os("MUSE_LIVE_ROOT"),
+    ) else {
+        return;
+    };
+    let env = BTreeMap::from([
+        (
+            "XDG_CONFIG_HOME".to_string(),
+            root.to_string_lossy().into_owned(),
+        ),
+        ("TBH_CREDENTIAL_BACKEND".to_string(), "file".to_string()),
+    ]);
+    let work = tempfile::tempdir().unwrap();
+    let (_steer, steering) = tokio::sync::mpsc::channel(1);
+    let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
+        steering,
+        interrupt: CancellationToken::new(),
+        request_input: Box::new(|_| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(vec![]);
+            rx
+        }),
+        turn: TurnControl::default(),
+    };
+    let request = RunRequest {
+        prompt: "Reply with exactly the word: pong".into(),
+        harness: None,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: work.path().display().to_string(),
+        sandbox: SandboxLevel::ReadOnly,
+        auto_approve: false,
+        resume: None,
+        attachments: vec![],
+        worktree: None,
+        mcp: None,
+        env,
+    };
+    let mut stream = MuseHarness::new()
+        .with_executable(std::path::PathBuf::from(bin))
+        .run(request, controls)
+        .await
+        .unwrap();
+    let mut plan = None;
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(180), stream.next())
+            .await
+            .expect("Muse went quiet")
+            .expect("stream ended")
+            .unwrap();
+        match event {
+            AgentEvent::PlanUsage {
+                windows,
+                plan_label,
+            } => {
+                println!("plan usage: {plan_label:?} {windows:?}");
+                plan = Some(windows);
+            }
+            AgentEvent::Done { status, error, .. } => {
+                println!("done: {status:?} {error:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(plan.is_some(), "no usage/changed during the turn");
+}

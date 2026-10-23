@@ -141,6 +141,17 @@ pub trait RunEnvironment: Send + Sync {
     async fn credential(&self, _harness: HarnessId) -> Option<String> {
         None
     }
+
+    /// A run of `harness` that started with `credential` reported the
+    /// subscription's usage (see [`zeron_proto::AgentEvent::PlanUsage`]).
+    async fn record_usage(
+        &self,
+        _harness: HarnessId,
+        _credential: &str,
+        _windows: Vec<zeron_proto::AgentUsageWindow>,
+        _plan_label: Option<String>,
+    ) {
+    }
 }
 
 enum Slot {
@@ -320,6 +331,22 @@ impl HarnessRegistry {
             }
         }
         None
+    }
+
+    /// Hand a run's reported subscription usage to every provider (the
+    /// account it belongs to records it).
+    pub async fn record_plan_usage(
+        &self,
+        harness: HarnessId,
+        credential: &str,
+        windows: Vec<zeron_proto::AgentUsageWindow>,
+        plan_label: Option<String>,
+    ) {
+        for environment in self.environments() {
+            environment
+                .record_usage(harness, credential, windows.clone(), plan_label.clone())
+                .await;
+        }
     }
 
     /// Whether `id` exists on this device at all (a Cloud device registers
