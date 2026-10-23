@@ -1940,6 +1940,8 @@ fn forwardable(method: &str) -> bool {
             | methods::CANCEL_INSTALL
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
+            | methods::GET_COMMIT_CREDIT
+            | methods::SET_COMMIT_CREDIT
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_SKILLS
@@ -2385,6 +2387,26 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({}))
             }
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
+            methods::GET_COMMIT_CREDIT => match self.registry.commit_credit() {
+                Some(credit) => RpcReply::value(&credit.status()),
+                None => Err(RpcError::Failed(
+                    "Commit credit isn't available on this engine.".into(),
+                )),
+            },
+            methods::SET_COMMIT_CREDIT => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    enabled: bool,
+                }
+                let p: Params = parse_params(params)?;
+                let credit = self.registry.commit_credit().ok_or_else(|| {
+                    RpcError::Failed("Commit credit isn't available on this engine.".into())
+                })?;
+                let status = credit
+                    .set(p.enabled)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&status)
+            }
             methods::SET_TITLE_SETTINGS => {
                 let p: crate::registry::TitleSettings = parse_params(params)?;
                 self.registry
