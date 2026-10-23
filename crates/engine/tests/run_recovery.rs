@@ -5,7 +5,9 @@
 //! - a graceful shutdown marks the turns it cuts off and the next boot picks
 //!   them back up, while a user's Stop is never undone;
 //! - a transient start failure retries with backoff, a deterministic one
-//!   surfaces at once.
+//!   surfaces at once;
+//! - a resume id the provider says is gone is retried once in a fresh
+//!   session, which then replaces the stored id.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -677,5 +679,56 @@ async fn a_deterministic_start_failure_surfaces_at_once() {
     .await;
     settle().await;
     assert_eq!(requests.lock().unwrap().len(), 1, "no retry");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_resume_the_provider_rejects_retries_in_a_fresh_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let requests: RequestLog = Default::default();
+    {
+        let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-gone"));
+        pre_title(&core);
+        queue_run(&core, "first", "msg-user-1");
+        wait_for(|| complete_assistant_count(&core) == 1, "first turn").await;
+        core.shutdown().await;
+    }
+    // The provider has since lost that conversation (its store was wiped).
+    let core = assemble(
+        &dir,
+        ScriptedHarness {
+            requests: requests.clone(),
+            script: Arc::new(|request, _| {
+                Ok(match &request.resume {
+                    Some(id) => vec![AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(format!(
+                            "Mock exited unexpectedly (exit code 1): No conversation found with session ID: {id}"
+                        )),
+                        session_id: None,
+                    }],
+                    None => completed_turn("hs-fresh", "fresh start"),
+                })
+            }),
+        },
+    );
+    queue_run(&core, "second", "msg-user-2");
+    wait_for(|| complete_assistant_count(&core) == 2, "second turn").await;
+    {
+        let log = requests.lock().unwrap();
+        assert_eq!(log.len(), 3, "{log:#?}");
+        assert_eq!(log[1].resume.as_deref(), Some("hs-gone"));
+        assert_eq!(log[2].resume, None, "the retry starts a fresh session");
+        assert_eq!(log[2].prompt, "second");
+    }
+    // The fresh session replaces the dead id: the next turn resumes it.
+    queue_run(&core, "third", "msg-user-3");
+    wait_for(|| complete_assistant_count(&core) == 3, "third turn").await;
+    assert_eq!(
+        requests.lock().unwrap()[3].resume.as_deref(),
+        Some("hs-fresh")
+    );
     core.shutdown().await;
 }

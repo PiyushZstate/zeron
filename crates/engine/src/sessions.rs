@@ -1970,7 +1970,9 @@ impl Inner {
     // ACP conversion made stale ids a harness-internal fallback — only ever
     // meant a child STARTUP failure, and permanently severed good
     // conversations (user incident 2026-08-13). A truly stale id simply
-    // yields a fresh session whose SessionStarted overwrites the row.
+    // yields a fresh session whose SessionStarted overwrites the row. The
+    // one in-memory tombstone left is the startup-crash retry's, set only
+    // when the provider itself says the session is gone (`resume_rejected`).
 
     /// The session id to resume for a run of `harness` in `chat_id` launching
     /// from `cwd` (zeron sessions.ts:736, looked up on every dispatch):
@@ -2582,6 +2584,22 @@ fn transient_start_failure(err: &zeron_harness::HarnessError) -> bool {
     )
         // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION have no kind of their own.
         || (cfg!(windows) && matches!(err.raw_os_error(), Some(32 | 33)))
+}
+
+/// Whether a failed start says the provider no longer has the session it
+/// was asked to resume (Claude: "No conversation found with session ID").
+/// Deliberately narrow: reading an ordinary startup failure this way starts
+/// a good conversation over (user incident 2026-08-13).
+fn resume_rejected(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "no conversation found",
+        "conversation not found",
+        "session not found",
+        "thread not found",
+    ]
+    .iter()
+    .any(|phrase| error.contains(phrase))
 }
 
 /// A turn is in flight: streaming, or parked on a question it is still owed an
@@ -4016,6 +4034,9 @@ async fn drive_run(
         // user entry, resume and all, in case the crash was transient. A
         // helper that is down hard fails the retry too and surfaces its
         // crash text (the harness now appends exit status + stderr).
+        // The one exception is the provider SAYING the session is gone
+        // (`resume_rejected`): resuming it again can only fail again, so the
+        // retry starts a fresh session instead.
         if resume_state.resume_injected
             && !resume_state.idle
             && !resume_state.startup_retry
@@ -4031,13 +4052,35 @@ async fn drive_run(
             )
             && let Some(retry) = retry_request.take()
         {
-            tracing::warn!(
-                chat = %chat_id,
-                "run died before session start; retrying once (resume kept)"
+            let rejected = matches!(
+                &event,
+                AgentEvent::Done { error: Some(error), .. } if resume_rejected(error)
             );
-            // The resumed session still holds the revived turn.
-            if let Some(revival) = resume_state.revival.clone() {
-                lock(&inner.revivals).insert(chat_id.clone(), revival);
+            if rejected {
+                tracing::warn!(
+                    chat = %chat_id,
+                    "provider no longer has the resumed session; retrying once in a fresh one"
+                );
+                // The in-memory "do not resume" tombstone: the fresh run's
+                // SessionStarted replaces it, and nothing durable is lost if
+                // that run fails too (a restart re-reads the stored id).
+                lock(&inner.harness_sessions).insert(
+                    chat_id.clone(),
+                    HarnessSessionRef {
+                        session_id: String::new(),
+                        cwd: run_cwd.clone(),
+                        harness: Some(harness_id),
+                    },
+                );
+            } else {
+                tracing::warn!(
+                    chat = %chat_id,
+                    "run died before session start; retrying once (resume kept)"
+                );
+                // The resumed session still holds the revived turn.
+                if let Some(revival) = resume_state.revival.clone() {
+                    lock(&inner.revivals).insert(chat_id.clone(), revival);
+                }
             }
             inner.remove_run(&chat_id, &run_id);
             let engine = SessionsEngine {
@@ -5317,6 +5360,19 @@ mod tests {
             transient_start_failure(&HarnessError::Io(Error::from_raw_os_error(32))),
             cfg!(windows)
         );
+    }
+
+    #[test]
+    fn resume_rejection_is_read_narrowly() {
+        assert!(resume_rejected(
+            "Claude exited unexpectedly (exit code 1): No conversation found with session ID: abc"
+        ));
+        assert!(resume_rejected("Session not found"));
+        assert!(!resume_rejected("claude: command not found"));
+        assert!(!resume_rejected(
+            "failed to create session: node executable not found"
+        ));
+        assert!(!resume_rejected("exited unexpectedly (exit code 1): boom"));
     }
 
     #[test]
