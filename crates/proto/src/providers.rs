@@ -8,7 +8,7 @@ use crate::HarnessId;
 /// command — named in the empty-state copy, zeron settings.agents.tsx
 /// `PROVIDERS`). Every agent with a login of its own is here; what each one
 /// supports is documented engine-side (`agent_accounts` module docs).
-pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 10] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Cursor, "Cursor", "cursor-agent"),
@@ -18,6 +18,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 9] = [
     (HarnessId::Opencode, "OpenCode", "opencode auth login"),
     (HarnessId::Pi, "Pi", "pi"),
     (HarnessId::Hermes, "Hermes", "hermes auth add"),
+    (HarnessId::Muse, "Muse Code", "muse login"),
 ];
 
 /// Whether `harness` has an Accounts section (and sign-in flow). Pure.
@@ -61,6 +62,10 @@ pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
         HarnessId::Hermes => Some(
             "Hermes manages its own credential pool and rotates through it. Accounts added \
              here go through `hermes auth add`; remove one with `hermes auth remove`.",
+        ),
+        HarnessId::Muse => Some(
+            "Zeron keeps each Muse account added here as its own login, so you can switch \
+             between them. With none selected, Muse uses its own login (`muse login`).",
         ),
         _ => None,
     }

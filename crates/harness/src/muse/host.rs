@@ -7,7 +7,6 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// The protocol envelope this driver speaks.
 const SCHEMA_VERSION: u64 = 1;
@@ -88,7 +87,7 @@ impl Host {
             }
         })?);
         let tail = crate::StderrTail::default();
-        let mut lines = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
+        let mut lines = crate::lossy_lines::LossyLines::new(child.stderr.take().expect("piped stderr"));
         let stderr = tail.clone();
         let stderr_task = tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {
@@ -116,6 +115,16 @@ impl Host {
 
     /// The SS1.4 handshake: `initialize`, the envelope check, `initialized`.
     pub async fn initialize(&mut self, read_only: bool) -> Result<(), HarnessError> {
+        self.initialize_with(read_only, false).await
+    }
+
+    /// [`Self::initialize`], opting into Muse's experimental surface when
+    /// `experimental` (the account methods live there in 1.4).
+    pub async fn initialize_with(
+        &mut self,
+        read_only: bool,
+        experimental: bool,
+    ) -> Result<(), HarnessError> {
         let result = self
             .call(
                 "initialize",
@@ -127,6 +136,7 @@ impl Host {
                     },
                     "capabilities": {
                         "requestedCapabilities": if read_only { json!([]) } else { json!(["sessionMcp"]) },
+                        "experimentalApi": experimental,
                     },
                 }),
                 &mut Vec::new(),

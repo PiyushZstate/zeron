@@ -335,6 +335,9 @@ impl EngineCore {
         // the P2P service, which serves it to that device alone.
         let agent_accounts =
             AgentAccounts::with_callback_routes(agent_accounts_config, previews.callback_routes());
+        registry.set_account_environment(Arc::new(agent_accounts::MuseRunEnvironment(
+            agent_accounts.clone(),
+        )));
         let harness_updates =
             harness_updates::HarnessUpdateCoordinator::new(data_dir, registry.clone());
         harness_updates.start();

@@ -104,9 +104,11 @@ pub struct RelayedCallback {
     pub location: Option<String>,
 }
 
+mod muse;
 mod oauth;
 #[cfg(test)]
 mod provider_tests;
+pub use muse::MuseRunEnvironment;
 mod stores;
 mod usage;
 
@@ -206,6 +208,9 @@ pub struct AgentAccountsConfig {
     pub pi_agent_dir: PathBuf,
     /// Hermes' `HERMES_HOME` (default `~/.hermes`) — holds `auth.json`.
     pub hermes_home: PathBuf,
+    /// The user's real config root (`$XDG_CONFIG_HOME` or `~/.config`): what
+    /// each zeron-kept Muse account's root mirrors (see [`muse`]).
+    pub muse_config_root: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -242,6 +247,10 @@ impl AgentAccountsConfig {
             opencode_auth_file: stores::default_opencode_auth_file(),
             pi_agent_dir: stores::default_pi_agent_dir(),
             hermes_home: stores::default_hermes_home(),
+            muse_config_root: std::env::var_os("XDG_CONFIG_HOME")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home_dir().join(".config")),
         }
     }
 
@@ -263,6 +272,7 @@ impl AgentAccountsConfig {
             opencode_auth_file: root.join("opencode").join("auth.json"),
             pi_agent_dir: root.join("pi"),
             hermes_home: root.join("hermes"),
+            muse_config_root: root.join("xdg-config"),
         }
     }
 
@@ -983,10 +993,18 @@ impl AgentAccounts {
             HarnessId::Devin,
             HarnessId::Opencode,
             HarnessId::Pi,
+            HarnessId::Muse,
         ]
         .into_iter()
         .map(|harness| (harness, self.read_slots(harness)))
         .collect();
+        // Muse: the zeron-kept account runs use (none: Muse's own login).
+        if let Some(slot) = self.muse_active() {
+            active_keys
+                .entry(HarnessId::Muse)
+                .or_default()
+                .insert(slot.account_key);
+        }
         let (hermes, hermes_active) = self.hermes_slots();
         active_keys.insert(HarnessId::Hermes, hermes_active);
         providers.push((HarnessId::Hermes, hermes));
@@ -1143,6 +1161,8 @@ impl AgentAccounts {
                 self.write_grok_entry(slot.store_key.as_deref(), &slot.credentials)?
             }
             HarnessId::Devin => self.write_devin_credentials(&slot.credentials)?,
+            // Nothing is swapped: runs are pointed at this account's root.
+            HarnessId::Muse => self.set_muse_active(Some(&slot.id))?,
             HarnessId::Opencode | HarnessId::Pi => {
                 let key = slot.store_key.as_deref().ok_or_else(|| {
                     EngineError::Other("That saved login names no provider.".into())
@@ -1453,6 +1473,11 @@ impl AgentAccounts {
             ));
         }
         let _ops = self.inner.ops.lock().await;
+        if harness == HarnessId::Muse {
+            // Its own root, not a live store: signed out and deleted alone.
+            self.forget_muse(account_id).await?;
+            return self.list_locked(false).await;
+        }
         let snapshot = self.list_locked(false).await?;
         let row = snapshot
             .accounts
@@ -1530,6 +1555,7 @@ impl AgentAccounts {
             HarnessId::Antigravity => self.start_antigravity_login(requester),
             HarnessId::Grok => self.start_grok_login(requester).await?,
             HarnessId::Devin => self.start_devin_login(requester)?,
+            HarnessId::Muse => self.start_muse_login().await?,
             HarnessId::Opencode => match provider.unwrap_or("openai") {
                 "openai" => {
                     self.start_openai_login(HarnessId::Opencode, "openai")
@@ -3055,6 +3081,7 @@ impl AgentAccounts {
             HarnessId::Cursor => self.cursor_usage(slot).await,
             HarnessId::Grok => self.grok_usage(slot, is_active).await,
             HarnessId::Devin => self.devin_usage(slot).await,
+            HarnessId::Muse => self.muse_usage(slot).await,
             HarnessId::Opencode | HarnessId::Pi | HarnessId::Hermes => {
                 self.keyed_usage(harness, slot).await
             }

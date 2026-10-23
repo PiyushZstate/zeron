@@ -14,6 +14,7 @@
 //!   host (`--disable-shell --disable-write --no-session-log`).
 //! - The host's environment drops an inherited `META_API_KEY` (so the
 //!   user's own Muse login is used) and turns off Muse's self-update.
+pub mod account;
 mod catalog;
 mod host;
 mod normalize;
