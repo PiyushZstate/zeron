@@ -230,3 +230,46 @@ async fn a_crash_during_the_handshake_reports_without_waiting_for_eof() {
         started.elapsed()
     );
 }
+
+/// auth_required on session/new: the run authenticates with the agent's own
+/// default method once and retries.
+#[tokio::test]
+async fn auth_required_signs_in_with_the_default_method_and_retries() {
+    let mut run = start(&harness(), request("auth")).await;
+    let events = run.until_done().await;
+    assert_eq!(texts(&events), ["signed in"]);
+    assert_eq!(done_of(&events), (DoneStatus::Completed, None));
+}
+
+#[tokio::test]
+async fn a_terminal_only_sign_in_is_refused_with_a_clear_message() {
+    let mut run = start(&harness(), request("auth-terminal")).await;
+    let events = run.until_done().await;
+    let (status, error) = done_of(&events);
+    assert_eq!(status, DoneStatus::Errored);
+    let error = error.unwrap_or_default();
+    assert!(error.contains("Grok isn't signed in"), "{error}");
+    assert!(
+        error.contains("(terminal) can't run inside a chat"),
+        "{error}"
+    );
+}
+
+/// An agent advertising session/resume but not loadSession is restored with
+/// resume, not a load it never offered.
+#[tokio::test]
+async fn resume_uses_the_advertised_restore_method() {
+    let mut req = request("resume");
+    req.resume = Some("old-session".into());
+    let mut run = start(&harness(), req).await;
+    let events = run.until_done().await;
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::SessionStarted { session_id, .. } if session_id == "old-session"
+    )));
+    assert_eq!(texts(&events), ["resumed old-session"]);
+}

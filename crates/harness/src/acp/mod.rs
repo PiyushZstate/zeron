@@ -72,6 +72,11 @@ const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(90);
 /// Bound on one session control call (model / config option switch).
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// `session/load`'s own budget, on top of the handshake's: it replays the
+/// whole transcript, which on a long chat takes far longer than the rest of
+/// setup. Past it the run starts fresh (with a visible notice) rather than
+/// failing.
+const SESSION_LOAD_TIMEOUT: Duration = Duration::from_secs(90);
 /// A stopped turn normally settles `cancelled` within moments. An agent still
 /// holding the prompt past this is wedged on the cancel (a tool that ignores
 /// it, a dead model stream): the turn is closed as stopped and the process
@@ -3332,21 +3337,135 @@ fn windows_noop_browser(executable: &Path) -> Result<String, HarnessError> {
     Ok(format!("\"{executable}\" --noop-browser %s"))
 }
 
-/// `session/new`. Agents that sign in from Settings never start a browser
-/// sign-in mid-chat; an auth_required answer points the user there instead.
-async fn new_session(
+/// How a resumed run restores its session: `session/load` replays the whole
+/// transcript, `session/resume` only reattaches it. Each is used only when
+/// advertised; Antigravity prefers resume because its load replays every
+/// tool call, which on a long chat outlasts the handshake. An agent
+/// declaring neither still gets a load attempt — a refusal falls back to a
+/// fresh session like any failed restore.
+fn restore_method(init: &Value, harness: HarnessId) -> &'static str {
+    let capabilities = &init["agentCapabilities"];
+    let load = capabilities["loadSession"].as_bool() == Some(true);
+    let resume = !capabilities["sessionCapabilities"]["resume"].is_null();
+    match (load, resume) {
+        (true, true) if harness == HarnessId::Antigravity => "session/resume",
+        (false, true) => "session/resume",
+        _ => "session/load",
+    }
+}
+
+/// `session/new`, or for a resumed run the advertised restore with a visible
+/// fallback to a fresh session. auth_required propagates so setup can sign
+/// in and retry.
+async fn open_session(
     client: &RpcClient,
     incoming: &mut mpsc::Receiver<Incoming>,
-    params: Value,
+    init: &Value,
+    harness: HarnessId,
+    request: &RunRequest,
     agent_name: &str,
-    signs_in_from_settings: bool,
-) -> Result<Value, HarnessError> {
-    match request_draining(client, incoming, "session/new", params).await {
-        Err(error) if signs_in_from_settings && is_auth_required(&error) => {
-            Err(HarnessError::Protocol(not_signed_in(agent_name)))
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+) -> Result<(String, Value), HarnessError> {
+    let params = json!({
+        "cwd": request.cwd,
+        "mcpServers": acp_mcp_servers(request.mcp.as_ref()),
+    });
+    if let Some(resume) = &request.resume {
+        let method = restore_method(init, harness);
+        let mut restore = params.clone();
+        restore["sessionId"] = Value::String(resume.clone());
+        let restored = if method == "session/load" {
+            tokio::time::timeout(
+                SESSION_LOAD_TIMEOUT,
+                request_draining(client, incoming, method, restore),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(HarnessError::Protocol(format!(
+                    "session/load: the history replay did not finish within {}s",
+                    SESSION_LOAD_TIMEOUT.as_secs()
+                )))
+            })
+        } else {
+            request_draining(client, incoming, method, restore).await
+        };
+        match restored {
+            Ok(response) => return Ok((resume.clone(), response)),
+            Err(e) if is_auth_required(&e) => return Err(e),
+            // A missing/foreign session falls back to a fresh one.
+            Err(e) => {
+                tracing::debug!(
+                    target: "zeron_harness::acp",
+                    "{method} failed (starting fresh): {e}"
+                );
+                let _ = send(event_tx, AgentEvent::Error {
+                    message: format!("{agent_name} could not restore session {resume}; starting a new session without the previous context: {e}"),
+                }).await;
+            }
         }
-        other => other,
     }
+    let new = request_draining(client, incoming, "session/new", params).await?;
+    let session_id = new
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok((session_id, new))
+}
+
+/// The sign-in a run may perform on its own after auth_required: the method
+/// the agent itself names as its default (`_meta.defaultAuthMethodId` — Grok's
+/// `cached_token`, which re-reads its stored login). Not just any advertised
+/// method: the others open a browser sign-in nobody is watching. `Err` names
+/// the kind of a method that cannot run here at all (terminal, env var).
+fn run_auth_method(init: &Value) -> Result<Option<String>, String> {
+    let Some(default) = init["_meta"]["defaultAuthMethodId"].as_str() else {
+        return Ok(None);
+    };
+    let Some(method) = init["authMethods"]
+        .as_array()
+        .and_then(|methods| methods.iter().find(|m| m["id"].as_str() == Some(default)))
+    else {
+        return Ok(None);
+    };
+    match method["type"].as_str() {
+        None | Some("agent") => Ok(Some(default.to_owned())),
+        Some(kind) => Err(kind.replace('_', " ")),
+    }
+}
+
+/// Answer auth_required once from the run itself (see [`run_auth_method`]),
+/// so a login the agent can restore by itself does not fail the chat.
+async fn authenticate_for_run(
+    client: &RpcClient,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    init: &Value,
+    agent_name: &str,
+    required: &HarnessError,
+) -> Result<(), HarnessError> {
+    let method = match run_auth_method(init) {
+        Ok(Some(method)) => method,
+        Ok(None) => return Err(HarnessError::Protocol(signed_out(agent_name, required))),
+        Err(kind) => {
+            return Err(HarnessError::Protocol(format!(
+                "{agent_name} isn't signed in, and its sign-in ({kind}) can't run inside a \
+                 chat. Sign in from a terminal, then send the message again."
+            )));
+        }
+    };
+    request_draining(
+        client,
+        incoming,
+        "authenticate",
+        json!({ "methodId": method }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| HarnessError::Protocol(signed_out(agent_name, &e)))
+}
+
+fn signed_out(agent_name: &str, error: &HarnessError) -> String {
+    format!("{agent_name} isn't signed in: {error}")
 }
 
 /// acp reserves -32000 for auth_required.
@@ -3507,7 +3626,7 @@ async fn request_draining(
     method: &'static str,
     params: Value,
 ) -> Result<Value, HarnessError> {
-    let loading_session = matches!(method, "session/new" | "session/load");
+    let loading_session = matches!(method, "session/new" | "session/load" | "session/resume");
     let requested_session = params
         .get("sessionId")
         .and_then(Value::as_str)
@@ -3887,60 +4006,33 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({
-            "cwd": request.cwd,
-            "mcpServers": acp_mcp_servers(request.mcp.as_ref()),
-        });
-        let (session_id, session_response) = if let Some(resume) = &request.resume {
-            let mut load = session_params.clone();
-            load["sessionId"] = Value::String(resume.clone());
-            match request_draining(&client, &mut incoming, "session/load", load).await {
-                Ok(resp) => (resume.clone(), resp),
-                Err(e) if auth_method.is_some() && is_auth_required(&e) => {
-                    return Err(HarnessError::Protocol(not_signed_in(agent_name)));
-                }
-                // A missing/foreign session falls back to a fresh one.
-                Err(e) => {
-                    tracing::debug!(
-                        target: "zeron_harness::acp",
-                        "session/load failed (starting fresh): {e}"
-                    );
-                    let _ = send(&event_tx, AgentEvent::Error {
-                        message: format!("{agent_name} could not restore session {resume}; starting a new session without the previous context: {e}"),
-                    }).await;
-                    let new = new_session(
-                        &client,
-                        &mut incoming,
-                        session_params.clone(),
-                        agent_name,
-                        auth_method.is_some(),
-                    )
-                    .await?;
-                    (
-                        new.get("sessionId")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        new,
-                    )
-                }
-            }
-        } else {
-            let new = new_session(
+        // auth_required gets one sign-in and retry; agents that sign in
+        // from Settings never start a sign-in mid-chat and point there.
+        let mut authenticated = false;
+        let (session_id, session_response) = loop {
+            match open_session(
                 &client,
                 &mut incoming,
-                session_params,
+                &init,
+                harness,
+                &request,
                 agent_name,
-                auth_method.is_some(),
+                &event_tx,
             )
-            .await?;
-            (
-                new.get("sessionId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                new,
-            )
+            .await
+            {
+                Err(e) if is_auth_required(&e) && auth_method.is_some() => {
+                    return Err(HarnessError::Protocol(not_signed_in(agent_name)));
+                }
+                Err(e) if is_auth_required(&e) && !authenticated => {
+                    authenticated = true;
+                    authenticate_for_run(&client, &mut incoming, &init, agent_name, &e).await?;
+                }
+                Err(e) if is_auth_required(&e) => {
+                    return Err(HarnessError::Protocol(signed_out(agent_name, &e)));
+                }
+                other => break other?,
+            }
         };
         if session_id.is_empty() {
             return Err(HarnessError::Protocol(
@@ -3972,11 +4064,16 @@ async fn run_session(session: Session) {
     };
     let mut setup_exit = None;
     let mut setup_drain_deadline = None;
+    let setup_budget = if request.resume.is_some() {
+        handshake_timeout + SESSION_LOAD_TIMEOUT
+    } else {
+        handshake_timeout
+    };
     // Scoped: the setup future borrows `incoming` until it is dropped.
     let res = {
         let setup = unless_sign_in_prompted(setup, &sign_in_prompted, agent_name);
         tokio::pin!(setup);
-        let handshake_deadline = tokio::time::sleep(handshake_timeout);
+        let handshake_deadline = tokio::time::sleep(setup_budget);
         tokio::pin!(handshake_deadline);
         loop {
             tokio::select! {
@@ -3990,7 +4087,7 @@ async fn run_session(session: Session) {
                         "{agent_name} did not complete the ACP handshake within {}s \
                          (the agent may be waiting for a login — try running it once \
                          in a terminal)",
-                        handshake_timeout.as_secs()
+                        setup_budget.as_secs()
                     )));
                 }
                 // A crash mid-handshake must not sit out the whole bound: a
@@ -5162,8 +5259,6 @@ async fn run_session(session: Session) {
                         "{agent_name} did not settle a stopped turn within {}s; retiring the process",
                         stop_timeout.as_secs()
                     );
-                    turn = None;
-                    stopping = false;
                     let (prev, _next) = rotate(&mut assistant_message_id);
                     let _ = send(
                         &event_tx,
@@ -5847,6 +5942,83 @@ mod tests {
                 "the pinned digest needs no registry archive"
             );
         }
+    }
+
+    #[test]
+    fn restore_prefers_what_the_agent_advertises() {
+        let init = |load: bool, resume: bool| {
+            let mut capabilities = json!({ "loadSession": load });
+            if resume {
+                capabilities["sessionCapabilities"] = json!({ "resume": {} });
+            }
+            json!({ "agentCapabilities": capabilities })
+        };
+        assert_eq!(
+            restore_method(&init(true, true), HarnessId::Grok),
+            "session/load"
+        );
+        assert_eq!(
+            restore_method(&init(true, true), HarnessId::Antigravity),
+            "session/resume"
+        );
+        assert_eq!(
+            restore_method(&init(false, true), HarnessId::Grok),
+            "session/resume"
+        );
+        assert_eq!(
+            restore_method(&init(true, false), HarnessId::Antigravity),
+            "session/load"
+        );
+        // Undeclared: a load attempt, whose refusal starts fresh.
+        assert_eq!(
+            restore_method(&json!({}), HarnessId::Hermes),
+            "session/load"
+        );
+    }
+
+    #[test]
+    fn a_run_signs_in_only_with_the_agents_own_default_method() {
+        // Grok 1.0.46's initialize.
+        let grok = json!({
+            "authMethods": [
+                { "id": "cached_token", "name": "cached_token" },
+                { "id": "grok.com", "name": "Grok" },
+            ],
+            "_meta": { "defaultAuthMethodId": "cached_token" },
+        });
+        assert_eq!(run_auth_method(&grok), Ok(Some("cached_token".into())));
+        // Devin advertises only a browser login and names no default.
+        let devin = json!({
+            "authMethods": [{ "id": "devin-browser", "name": "Log in with browser" }],
+        });
+        assert_eq!(run_auth_method(&devin), Ok(None));
+        // A default that is not advertised is not trusted either.
+        let stale = json!({ "authMethods": [], "_meta": { "defaultAuthMethodId": "gone" } });
+        assert_eq!(run_auth_method(&stale), Ok(None));
+        for (kind, named) in [("terminal", "terminal"), ("env_var", "env var")] {
+            let init = json!({
+                "authMethods": [{ "id": "m", "name": "M", "type": kind }],
+                "_meta": { "defaultAuthMethodId": "m" },
+            });
+            assert_eq!(run_auth_method(&init), Err(named.to_owned()));
+        }
+    }
+
+    #[test]
+    fn grok_cancel_carries_the_gesture_and_others_stay_bare() {
+        assert_eq!(
+            cancel_params(HarnessId::Grok, "s"),
+            json!({ "sessionId": "s", "_meta": { "cancelTrigger": "ctrl_c" } })
+        );
+        assert_eq!(
+            cancel_params(HarnessId::Devin, "s"),
+            json!({ "sessionId": "s" })
+        );
+        assert_eq!(
+            initialize_params(HarnessId::Grok)["_meta"],
+            json!({ "clientType": "extension" })
+        );
+        assert!(initialize_params(HarnessId::Hermes).get("_meta").is_none());
     }
 
     #[test]
