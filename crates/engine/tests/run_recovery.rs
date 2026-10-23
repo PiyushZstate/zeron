@@ -3,7 +3,9 @@
 //!   the provider already worked on it, and leaves alone what it must not
 //!   revive (native commands, open questions, an exhausted revival budget);
 //! - a graceful shutdown marks the turns it cuts off and the next boot picks
-//!   them back up, while a user's Stop is never undone.
+//!   them back up, while a user's Stop is never undone;
+//! - a transient start failure retries with backoff, a deterministic one
+//!   surfaces at once.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -612,5 +614,68 @@ async fn a_shutdown_after_sign_out_is_not_revived() {
     let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
     settle().await;
     assert!(requests.lock().unwrap().is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_transient_start_failure_retries_with_backoff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let requests: RequestLog = Default::default();
+    // Antivirus holding a freshly updated CLI: two refused spawns.
+    let core = assemble(
+        &dir,
+        ScriptedHarness {
+            requests: requests.clone(),
+            script: Arc::new(|request, call| {
+                if call < 2 {
+                    Err(HarnessError::Io(std::io::Error::from(
+                        std::io::ErrorKind::PermissionDenied,
+                    )))
+                } else {
+                    Ok(completed_turn("hs-1", &format!("ack: {}", request.prompt)))
+                }
+            }),
+        },
+    );
+    pre_title(&core);
+    queue_run(&core, "hello", "msg-user-1");
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "the retried turn to complete",
+    )
+    .await;
+    assert_eq!(requests.lock().unwrap().len(), 3, "two retries");
+    let entries = entries_now(&core);
+    assert_eq!(entries.len(), 2, "one user entry, one reply: {entries:#?}");
+    assert!(error_notes(&entries[1]).is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_deterministic_start_failure_surfaces_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let requests: RequestLog = Default::default();
+    let core = assemble(
+        &dir,
+        ScriptedHarness {
+            requests: requests.clone(),
+            script: Arc::new(|_, _| Err(HarnessError::NotInstalled("install mock".into()))),
+        },
+    );
+    pre_title(&core);
+    queue_run(&core, "hello", "msg-user-1");
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Errored)
+        },
+        "the start failure to surface",
+    )
+    .await;
+    settle().await;
+    assert_eq!(requests.lock().unwrap().len(), 1, "no retry");
     core.shutdown().await;
 }

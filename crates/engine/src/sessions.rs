@@ -573,7 +573,7 @@ impl SessionsEngine {
                 _ => break,
             }
         }
-        self.dispatch_inner(chat_id, HarnessId::Codex, request, None, false, true)
+        self.dispatch_inner(chat_id, HarnessId::Codex, request, None, false, 0, true)
             .await
     }
 
@@ -607,14 +607,15 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
-        self.dispatch_with(chat_id, harness_id, request, message_id, false)
+        self.dispatch_with(chat_id, harness_id, request, message_id, false, 0)
             .await
     }
 
-    /// [`Self::dispatch`] with the startup-crash retry marker: the retry
+    /// [`Self::dispatch`] with the retry markers: the startup-crash retry
     /// re-dispatches with `startup_retry = true`, which makes that attempt
-    /// final (its own startup death surfaces instead of retrying again).
-    /// Boxed future: `drive_run` re-enters this for that retry, and the
+    /// final (its own startup death surfaces instead of retrying again);
+    /// `spawn_attempt` counts the transient start failures retried so far.
+    /// Boxed future: `drive_run` re-enters this for those retries, and the
     /// erasure breaks the opaque-type cycle the recursion would otherwise form.
     fn dispatch_with<'a>(
         &'a self,
@@ -623,6 +624,7 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
         startup_retry: bool,
+        spawn_attempt: u8,
     ) -> futures::future::BoxFuture<'a, Result<String, EngineError>> {
         Box::pin(self.dispatch_inner(
             chat_id,
@@ -630,10 +632,12 @@ impl SessionsEngine {
             request,
             message_id,
             startup_retry,
+            spawn_attempt,
             false,
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_inner(
         &self,
         chat_id: &str,
@@ -641,6 +645,7 @@ impl SessionsEngine {
         mut request: RunRequest,
         mut message_id: Option<String>,
         startup_retry: bool,
+        spawn_attempt: u8,
         idle: bool,
     ) -> Result<String, EngineError> {
         // Project-less chats store a home-relative cwd (the creating device
@@ -830,7 +835,7 @@ impl SessionsEngine {
         };
         // A message the user sent breaks a chain of recovery revivals: only
         // consecutive revive-and-die-again cycles spend the budget.
-        if !idle && revival.is_none() && !startup_retry {
+        if !idle && revival.is_none() && !startup_retry && spawn_attempt == 0 {
             self.inner.journal.clear_resume_attempts(chat_id);
         }
         if !idle {
@@ -980,6 +985,7 @@ impl SessionsEngine {
                 user_message_id: user_id,
                 resume_injected,
                 startup_retry,
+                spawn_attempt,
                 revival,
                 fork_history_sent,
                 started,
@@ -2549,6 +2555,35 @@ fn revival_prompt(harness: HarnessId, original: &str) -> String {
 /// The note a turn the engine's own shutdown cut off ends with.
 const SHUTDOWN_NOTE: &str = "Run interrupted by engine shutdown";
 
+/// Backoff before each retry of a transient start failure.
+const SPAWN_RETRY_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(3),
+];
+
+/// Whether a run's start failure is plausibly transient: the OS refused the
+/// spawn for a moment (antivirus holding a freshly updated CLI on Windows,
+/// `ETXTBSY` while an update rewrites it, a busy or interrupted call).
+/// Deterministic failures — not installed, not signed in, protocol errors —
+/// surface at once.
+fn transient_start_failure(err: &zeron_harness::HarnessError) -> bool {
+    use std::io::ErrorKind;
+    let zeron_harness::HarnessError::Io(err) = err else {
+        return false;
+    };
+    matches!(
+        err.kind(),
+        ErrorKind::PermissionDenied
+            | ErrorKind::ResourceBusy
+            | ErrorKind::ExecutableFileBusy
+            | ErrorKind::WouldBlock
+            | ErrorKind::Interrupted
+    )
+        // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION have no kind of their own.
+        || (cfg!(windows) && matches!(err.raw_os_error(), Some(32 | 33)))
+}
+
 /// A turn is in flight: streaming, or parked on a question it is still owed an
 /// answer to. Notably NOT a persistent session that has parked between turns —
 /// that holds a warm child with nothing outstanding.
@@ -2838,6 +2873,8 @@ struct RunResumeState {
     user_message_id: String,
     resume_injected: bool,
     startup_retry: bool,
+    /// Transient start failures retried before this attempt.
+    spawn_attempt: u8,
     /// This run picks back up a turn the engine cut off; retries carry it on.
     revival: Option<Revival>,
     fork_history_sent: Arc<std::sync::atomic::AtomicBool>,
@@ -3115,6 +3152,108 @@ async fn drive_run(
                 .started
                 .store(true, std::sync::atomic::Ordering::Release);
             stream
+        }
+        // A start failure that is plausibly transient (see
+        // `transient_start_failure`) is retried with backoff before it
+        // surfaces: re-dispatched against the same user entry, like the
+        // startup-crash retry below (a separate failure point: that one is a
+        // stream that died, this one a stream that never opened). A Stop
+        // during the wait ends the run instead.
+        Err(err)
+            if !resume_state.idle
+                && usize::from(resume_state.spawn_attempt) < SPAWN_RETRY_DELAYS.len()
+                && transient_start_failure(&err) =>
+        {
+            let delay = SPAWN_RETRY_DELAYS[usize::from(resume_state.spawn_attempt)];
+            tracing::warn!(
+                chat = %chat_id,
+                harness = ?harness_id,
+                error = %err,
+                attempt = resume_state.spawn_attempt + 1,
+                delay_ms = delay.as_millis() as u64,
+                "run failed to start; retrying (transient)"
+            );
+            let stopped = *cancel_rx.borrow()
+                || tokio::select! {
+                    _ = tokio::time::sleep(delay) => false,
+                    // A Stop, or the handle replaced (its sender dropped).
+                    _ = cancel_rx.changed() => true,
+                };
+            // A Cloud machine's setup chips close here; a retry runs without them.
+            if writer.is_some()
+                && let Err(err) = finish_segment(
+                    doc_ref,
+                    writer.take(),
+                    &entry_id,
+                    &device_id,
+                    segment_started,
+                    &folded,
+                    if stopped {
+                        MessageStatus::Aborted
+                    } else {
+                        MessageStatus::Complete
+                    },
+                )
+            {
+                tracing::warn!(chat = %chat_id, error = %err, "setup entry finish failed");
+            }
+            let ours = lock(&inner.runs)
+                .get(&chat_id)
+                .is_some_and(|h| h.run_id == run_id);
+            if !ours {
+                return;
+            }
+            inner.remove_run(&chat_id, &run_id);
+            if stopped {
+                inner.publish(
+                    &chat_id,
+                    &AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                );
+                inner.set_status_with_completion(
+                    &chat_id,
+                    SessionStatus::Idle,
+                    false,
+                    None,
+                    Some(DoneStatus::Interrupted),
+                );
+                return;
+            }
+            let Some(retry) = retry_request.take() else {
+                return;
+            };
+            if let Some(revival) = resume_state.revival.clone() {
+                lock(&inner.revivals).insert(chat_id.clone(), revival);
+            }
+            let engine = SessionsEngine {
+                inner: inner.clone(),
+            };
+            let message_id = resume_state.user_message_id.clone();
+            let startup_retry = resume_state.startup_retry;
+            let attempt = resume_state.spawn_attempt + 1;
+            tokio::spawn(async move {
+                if let Err(err) = engine
+                    .dispatch_with(
+                        &chat_id,
+                        harness_id,
+                        retry,
+                        Some(message_id),
+                        startup_retry,
+                        attempt,
+                    )
+                    .await
+                {
+                    tracing::error!(chat = %chat_id, error = %err, "start retry dispatch failed");
+                    engine
+                        .inner
+                        .set_status(&chat_id, SessionStatus::Errored, false);
+                }
+            });
+            return;
         }
         Err(err) => {
             let message = err.to_string();
@@ -3910,7 +4049,7 @@ async fn drive_run(
                 // The user entry write inside dispatch is idempotent by
                 // message id; `startup_retry` makes this attempt final.
                 if let Err(err) = engine
-                    .dispatch_with(&chat, harness_id, retry, Some(message_id), true)
+                    .dispatch_with(&chat, harness_id, retry, Some(message_id), true, 0)
                     .await
                 {
                     tracing::error!(chat = %chat, error = %err, "startup-crash retry dispatch failed");
@@ -5143,6 +5282,41 @@ mod tests {
             entry("a1", MessageRole::Assistant, "  "),
         ];
         assert!(!answered_in(&blank, "u1"));
+    }
+
+    #[test]
+    fn only_transient_start_failures_retry() {
+        use std::io::{Error, ErrorKind};
+        use zeron_harness::HarnessError;
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::ResourceBusy,
+            ErrorKind::ExecutableFileBusy,
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(
+                transient_start_failure(&HarnessError::Io(Error::from(kind))),
+                "{kind:?}"
+            );
+        }
+        assert!(!transient_start_failure(&HarnessError::Io(Error::from(
+            ErrorKind::BrokenPipe
+        ))));
+        assert!(!transient_start_failure(&HarnessError::NotInstalled(
+            "claude".into()
+        )));
+        assert!(!transient_start_failure(&HarnessError::NotSignedIn(
+            "sign in".into()
+        )));
+        assert!(!transient_start_failure(&HarnessError::Protocol(
+            "bad frame".into()
+        )));
+        // A sharing violation (antivirus scanning a just-updated CLI).
+        assert_eq!(
+            transient_start_failure(&HarnessError::Io(Error::from_raw_os_error(32))),
+            cfg!(windows)
+        );
     }
 
     #[test]
