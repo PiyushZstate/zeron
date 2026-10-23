@@ -5322,21 +5322,10 @@ async fn run_session(session: Session) {
                         AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
                     )
                     .await;
-                    // Winding down like an interrupt (open subagents settle
-                    // Interrupted), but this Done is the stream's last.
+                    // Wind down like an interrupt: open subagents settle
+                    // Interrupted, then the terminal bookkeeping sends the
+                    // turn's Done { Interrupted }.
                     interrupted = true;
-                    done_after_interrupt = true;
-                    done_current = true;
-                    let _ = send(
-                        &event_tx,
-                        AgentEvent::Done {
-                            status: DoneStatus::Interrupted,
-                            result: None,
-                            error: None,
-                            session_id: Some(session_id.clone()),
-                        },
-                    )
-                    .await;
                     break 'main;
                 }
             },
