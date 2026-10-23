@@ -17,6 +17,12 @@ struct TurnWire {
     interrupt: tokio_util::sync::CancellationToken,
     steering: Option<mpsc::Sender<crate::SteerMessage>>,
     polls: Arc<std::sync::atomic::AtomicUsize>,
+    /// SSE connections accepted (a reconnect adds one).
+    bus_connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// Pending-request list GETs answered.
+    listings: Arc<std::sync::atomic::AtomicUsize>,
+    /// The `pending` lists served to a reconnect sweep.
+    pending: Arc<std::sync::Mutex<Value>>,
     command_failure_release: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
     run: tokio::task::JoinHandle<()>,
@@ -100,11 +106,23 @@ impl TurnWire {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (bus, bus_rx) = mpsc::unbounded_channel::<Value>();
-        let bus_rx = Arc::new(tokio::sync::Mutex::new(Some(bus_rx)));
+        let bus_rx = Arc::new(tokio::sync::Mutex::new(bus_rx));
+        let bus_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connected = bus_connections.clone();
+        let (superseded, _) = tokio::sync::watch::channel(0_usize);
+        let superseded = Arc::new(superseded);
+        let pending: Arc<std::sync::Mutex<Value>> =
+            Arc::new(std::sync::Mutex::new(overrides["pending"].clone()));
+        let listed = pending.clone();
+        let sweeps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listings = sweeps.clone();
         let (request_tx, requests) = mpsc::unbounded_channel();
         let posts = Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = posts.clone();
         let hold_prompt = overrides["holdPrompt"].as_bool().unwrap_or(false);
+        let drop_prompt = overrides["dropPrompt"].as_bool().unwrap_or(false);
+        let message_exists = overrides["messageExists"].as_bool().unwrap_or(false);
+        let fail_replies = overrides["failReplies"].as_bool().unwrap_or(false);
         let busy_polls = overrides["busyPolls"].as_u64().unwrap_or(0) as usize;
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server_polls = polls.clone();
@@ -119,6 +137,10 @@ impl TurnWire {
                 let recorded = recorded.clone();
                 let polls = server_polls.clone();
                 let command_failure_wait = command_failure_wait.clone();
+                let connected = connected.clone();
+                let superseded = superseded.clone();
+                let listed = listed.clone();
+                let listed_count = sweeps.clone();
                 connections.spawn(async move {
                     let mut request = Vec::new();
                     let mut buf = [0; 4096];
@@ -144,12 +166,23 @@ impl TurnWire {
                     }
                     if is_post { recorded.lock().unwrap().push((path.clone(), serde_json::from_slice(&request[header_end..header_end+length]).unwrap_or(Value::Null))); }
                     if path == "/global/event" || path == "/api/event" {
+                        // A reconnect supersedes the previous stream before
+                        // it consumes another event; `"close"` ends one.
+                        let generation = connected.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        superseded.send_replace(generation);
+                        let mut superseded = superseded.subscribe();
+                        let mut events = bus_rx.lock().await;
                         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: connected\n\n").await.unwrap();
-                        let mut events = bus_rx.lock().await.take().unwrap();
-                        while let Some(event) = events.recv().await {
-                            if socket.write_all(format!("data: {event}\n\n").as_bytes()).await.is_err() { break; }
+                        loop {
+                            tokio::select! {
+                                event = events.recv() => {
+                                    let Some(event) = event else { return };
+                                    if event == "close" { return; }
+                                    if socket.write_all(format!("data: {event}\n\n").as_bytes()).await.is_err() { return; }
+                                }
+                                _ = superseded.changed() => return,
+                            }
                         }
-                        return;
                     }
                     if command_failure && is_post && path.ends_with("/command") {
                         socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\nConnection: close\r\n\r\nbad command!").await.unwrap();
@@ -158,6 +191,18 @@ impl TurnWire {
                     if hold_prompt && (path.ends_with("/prompt_async") || path.ends_with("/prompt")) {
                         let _ = request_tx.send(path);
                         std::future::pending::<()>().await;
+                        return;
+                    }
+                    // The prompt is read, then the connection drops before
+                    // any answer: the client cannot tell whether it landed.
+                    if drop_prompt && (path.ends_with("/prompt_async") || path.ends_with("/prompt")) {
+                        let _ = request_tx.send(path);
+                        return;
+                    }
+                    // The stored prompt, found under the id it was posted with.
+                    if message_exists && !is_post && let Some(id) = path.strip_prefix("/session/fixture/message/") {
+                        let body = json!({"info": {"id": id, "role": "user"}}).to_string();
+                        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                         return;
                     }
                     if path == "/session/status" || path == "/api/session/active" {
@@ -189,6 +234,27 @@ impl TurnWire {
                             )
                             .await
                             .unwrap();
+                        return;
+                    }
+                    if fail_replies && is_post && path.contains("/permission") {
+                        let body = r#"{"name":"UnknownError"}"#;
+                        socket.write_all(format!("HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                        return;
+                    }
+                    // Pending-request lists (`pending` override: per kind).
+                    let route = path.split('?').next().unwrap_or_default();
+                    let kind = match route {
+                        "/permission" if !v2 => Some("permission"),
+                        "/question" if !v2 => Some("question"),
+                        _ if v2 && route.ends_with("/permission") => Some("permission"),
+                        _ if v2 && route.ends_with("/form") => Some("form"),
+                        _ => None,
+                    };
+                    if !is_post && let Some(kind) = kind {
+                        let list = listed.lock().unwrap()[kind].as_array().cloned().unwrap_or_default();
+                        let body = if v2 { json!({"data": list}) } else { json!(list) }.to_string();
+                        listed_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                         return;
                     }
                     let missing_resume = path == "/session/missing" || path == "/api/session/missing";
@@ -300,6 +366,9 @@ impl TurnWire {
             interrupt,
             steering: retained_steering,
             polls,
+            bus_connections,
+            listings,
+            pending,
             command_failure_release: matches!(
                 native_command_reply,
                 Some(NativeCommandReply::DelayedHttp404)
@@ -1064,7 +1133,9 @@ fn prompt_body_carries_model_variant_and_attachments() {
         Some(("anthropic", "claude-opus-5")),
         Some("high"),
         &["/tmp/shot.png".to_owned()],
+        Some("msg_1"),
     );
+    assert_eq!(body["messageID"], "msg_1");
     assert_eq!(body["model"]["providerID"], "anthropic");
     assert_eq!(body["model"]["modelID"], "claude-opus-5");
     assert_eq!(body["variant"], "high");
@@ -1126,7 +1197,7 @@ fn reasoning_ahead_of_its_message_role_is_held_and_replayed() {
     assert_eq!(feed.pending_parts.len(), 1);
     // The role lands; replay drains the held part.
     feed.assistant_messages.insert("msg_a".into(), true);
-    let mut turn = TurnState::begin(None);
+    let mut turn = TurnState::begin(None, false);
     let events = replay_pending(&mut feed, "msg_a", true, &mut turn);
     assert!(matches!(
         events.as_slice(),
@@ -1728,8 +1799,9 @@ fn v2_model_list_folds_into_provider_catalog() {
 
 #[test]
 fn prompt_body_v2_carries_text_and_files_only() {
-    let body = prompt_body_v2("hello", &["/tmp/shot.png".to_owned()]);
+    let body = prompt_body_v2("hello", &["/tmp/shot.png".to_owned()], Some("msg_1"));
     assert_eq!(body["text"], "hello");
+    assert_eq!(body["id"], "msg_1");
     assert_eq!(body["files"][0]["uri"], "file:///tmp/shot.png");
     assert_eq!(body["files"][0]["name"], "shot.png");
     assert!(
@@ -2010,14 +2082,17 @@ async fn v2_model_selection_and_prompt_use_the_documented_bodies() {
             .1,
         json!({"model":{"providerID":"opencode","id":"muse","variant":"low"}})
     );
-    assert_eq!(
-        posts
-            .iter()
-            .find(|(p, _)| p == "/api/session/fixture/prompt")
-            .unwrap()
-            .1,
-        json!({"text":"first","files":[]})
-    );
+    let mut prompt = posts
+        .iter()
+        .find(|(p, _)| p == "/api/session/fixture/prompt")
+        .unwrap()
+        .1
+        .clone();
+    // A client-minted id makes a retried POST idempotent.
+    let id = prompt["id"].take();
+    assert!(id.as_str().is_some_and(|id| id.starts_with("msg_")), "{id}");
+    prompt.as_object_mut().unwrap().remove("id");
+    assert_eq!(prompt, json!({"text":"first","files":[]}));
 }
 
 #[tokio::test]
@@ -2198,7 +2273,7 @@ fn v2_command_bodies_follow_server_version() {
         let attachments = vec!["/workspace/image.png".into()];
         assert_eq!(
             command_body_v2(Some(&version), "test", "args", &attachments)["files"],
-            prompt_body_v2("args", &attachments)["files"]
+            prompt_body_v2("args", &attachments, None)["files"]
         );
     }
 }
@@ -2488,22 +2563,112 @@ async fn stalled_prompt_post_does_not_block_bus_completion() {
 
 #[tokio::test]
 async fn stalled_prompt_post_has_a_bounded_timeout() {
+    for v2 in [false, true] {
+        let mut wire = TurnWire::start_config(
+            false,
+            v2,
+            true,
+            None,
+            "2.0.11",
+            json!({"holdPrompt": true}),
+            false,
+        )
+        .await;
+        if v2 {
+            wire.request("/api/model").await;
+        }
+        wire.request(if v2 { "/prompt" } else { "/prompt_async" })
+            .await;
+        tokio::task::yield_now().await;
+        // The server never shows the prompt (not running, no message under
+        // its id): one retry, then the turn fails instead of spinning. The
+        // paused clock is stepped by hand: a timer of the test's own would
+        // fire early while loopback IO is in flight.
+        tokio::time::pause();
+        let mut status = None;
+        for _ in 0..200 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            while let Ok(event) = wire.events.try_recv() {
+                if let AgentEvent::Done { status: done, .. } = event.unwrap() {
+                    status = Some(done);
+                }
+            }
+            if status.is_some() {
+                break;
+            }
+        }
+        tokio::time::resume();
+        assert_eq!(status, Some(DoneStatus::Errored));
+        let prompts: Vec<Value> = wire
+            .posts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p.ends_with("/prompt") || p.ends_with("/prompt_async"))
+            .map(|(_, body)| body[if v2 { "id" } else { "messageID" }].clone())
+            .collect();
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        assert_eq!(prompts[0], prompts[1], "a retry reuses the message id");
+    }
+}
+
+/// A prompt POST that dies without an answer, for a turn the bus shows
+/// running, was taken by the server: the turn lives on and completes.
+#[tokio::test]
+async fn unanswered_prompt_post_of_a_running_turn_keeps_the_turn() {
     let mut wire = TurnWire::start_config(
         false,
         false,
         true,
         None,
         "1.18.31",
-        json!({"holdPrompt": true}),
+        json!({"dropPrompt": true}),
         false,
     )
     .await;
     wire.request("/prompt_async").await;
     wire.status("busy");
-    tokio::task::yield_now().await;
-    tokio::time::pause();
-    tokio::time::advance(CALL_TIMEOUT + Duration::from_secs(1)).await;
-    assert_eq!(wire.done().await.0, DoneStatus::Errored);
+    // The retry fails the same way; the bus still shows the turn running.
+    wire.request("/prompt_async").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    wire.bus.send(json!({"type":"message.updated", "properties":{"info":{"id":"answer", "sessionID":"fixture", "role":"assistant"}}})).unwrap();
+    wire.bus.send(json!({"type":"message.part.updated", "properties":{"part":{"id":"text", "messageID":"answer", "sessionID":"fixture", "type":"text", "text":"STILL_HERE"}}})).unwrap();
+    wire.status("idle");
+    wire.idle();
+    assert_eq!(
+        wire.done().await,
+        (DoneStatus::Completed, "STILL_HERE".to_owned())
+    );
+}
+
+/// A prompt POST that dies without an answer is not posted again when the
+/// session already holds a message under the id it was sent with.
+#[tokio::test]
+async fn unanswered_prompt_found_by_its_message_id_is_not_reposted() {
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        "1.18.31",
+        json!({"dropPrompt": true, "messageExists": true}),
+        false,
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    wire.status("busy");
+    wire.status("idle");
+    wire.idle();
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
+    let prompts = wire
+        .posts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, _)| p.ends_with("/prompt_async"))
+        .count();
+    assert_eq!(prompts, 1);
 }
 
 #[tokio::test]
@@ -2808,9 +2973,9 @@ fn attachment_urls_survive_reserved_characters_and_windows_paths() {
     ] {
         assert_eq!(file_url(path), url, "{path}");
     }
-    let body = prompt_body("x", None, None, &[r"C:\Users\me\a b.png".to_owned()]);
+    let body = prompt_body("x", None, None, &[r"C:\Users\me\a b.png".to_owned()], None);
     assert_eq!(body["parts"][1]["url"], "file:///C:/Users/me/a%20b.png");
-    let body = prompt_body_v2("x", &["/tmp/a#b.png".to_owned()]);
+    let body = prompt_body_v2("x", &["/tmp/a#b.png".to_owned()], None);
     assert_eq!(body["files"][0]["uri"], "file:///tmp/a%23b.png");
     assert_eq!(body["files"][0]["name"], "a#b.png");
 }
@@ -2823,6 +2988,189 @@ fn windows_directories_encode_like_encode_uri_component() {
         "C%3A%5CUsers%5CZo%C3%AB%5Cmy%20proj"
     );
     assert_eq!(encode_directory(r"\\srv\share"), "%5C%5Csrv%5Cshare");
+}
+
+#[test]
+fn prompt_message_ids_sort_like_the_servers() {
+    let ids: Vec<String> = (0..64).map(|_| prompt_message_id()).collect();
+    for id in &ids {
+        assert_eq!(id.len(), 30, "{id}");
+        assert!(id.starts_with("msg_"), "{id}");
+        assert!(id[4..16].bytes().all(|b| b.is_ascii_hexdigit()), "{id}");
+        assert!(id[16..].bytes().all(|b| b.is_ascii_alphanumeric()), "{id}");
+    }
+    // The time prefix strictly ascends, within a millisecond too.
+    for pair in ids.windows(2) {
+        assert!(pair[0][..16] < pair[1][..16], "{pair:?}");
+    }
+    // 1.x mints the same shape: 12 hex digits of ms*4096+counter.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let stamp = u64::from_str_radix(&ids[63][4..16], 16).unwrap();
+    assert!((stamp >> 12).abs_diff(now & 0xF_FFFF_FFFF) < 10_000);
+}
+
+/// The bus never replays: requests asked while it reconnected are listed
+/// and answered (permissions approved, questions put to the user), and
+/// ones the live bus already delivered are not answered twice.
+#[tokio::test]
+async fn reconnect_sweep_answers_requests_asked_in_the_gap() {
+    for v2 in [false, true] {
+        let pending = if v2 {
+            json!({
+                "permission": [
+                    {"id": "per_live", "sessionID": "fixture"},
+                    {"id": "per_gap", "sessionID": "fixture"},
+                    {"id": "per_foreign", "sessionID": "foreign"},
+                ],
+                "form": [{
+                    "id": "frm_gap", "sessionID": "fixture", "title": "Questions",
+                    "metadata": {"kind": "question"},
+                    "fields": [{"key": "q0", "title": "Color", "description": "Which?",
+                                "type": "string", "options": [{"value": "Yes", "label": "Yes"}]}],
+                }],
+            })
+        } else {
+            json!({
+                "permission": [
+                    {"id": "per_live", "sessionID": "fixture"},
+                    {"id": "per_gap", "sessionID": "fixture"},
+                    {"id": "per_foreign", "sessionID": "foreign"},
+                ],
+                "question": [{
+                    "id": "que_gap", "sessionID": "fixture",
+                    "questions": [{"header": "Choice", "question": "Continue?",
+                                   "options": [{"label": "Yes"}]}],
+                }],
+            })
+        };
+        let mut wire = TurnWire::start_config(
+            false,
+            v2,
+            true,
+            Some(true),
+            "2.0.11",
+            json!({"pending": pending}),
+            false,
+        )
+        .await;
+        if v2 {
+            wire.request("/api/model").await;
+        }
+        wire.request(if v2 { "/prompt" } else { "/prompt_async" })
+            .await;
+        if v2 {
+            wire.v2("session.execution.started", json!({"sessionID": "fixture"}));
+            wire.v2(
+                "permission.asked",
+                json!({"id": "per_live", "sessionID": "fixture"}),
+            );
+        } else {
+            wire.status("busy");
+            wire.bus.send(json!({"type": "permission.asked", "properties": {"id": "per_live", "sessionID": "fixture"}})).unwrap();
+        }
+        let live = if v2 {
+            "/api/session/fixture/permission/per_live/reply"
+        } else {
+            "/permission/per_live/reply"
+        };
+        wire.posted(live).await;
+        // The stream drops; the reconnect sweeps what was asked meanwhile.
+        wire.bus.send(json!("close")).unwrap();
+        let gap = if v2 {
+            "/api/session/fixture/permission/per_gap/reply"
+        } else {
+            "/permission/per_gap/reply"
+        };
+        let answer_route = if v2 {
+            "/api/session/fixture/form/frm_gap/reply"
+        } else {
+            "/question/que_gap/reply"
+        };
+        let approval = wire.posted(gap).await;
+        let answer = wire.posted(answer_route).await;
+        assert_eq!(
+            approval,
+            if v2 {
+                json!({"decision": "once"})
+            } else {
+                json!({"reply": "once"})
+            }
+        );
+        assert_eq!(
+            answer,
+            if v2 {
+                json!({"answer": {"q0": "Yes"}})
+            } else {
+                json!({"answers": [["Yes"]]})
+            }
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            wire.bus_connections
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(wire.listings.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        let posts = wire.posts.lock().unwrap();
+        let replies = |suffix: &str| posts.iter().filter(|(p, _)| p.ends_with(suffix)).count();
+        assert_eq!(
+            replies(live),
+            1,
+            "a request the live bus delivered is answered once"
+        );
+        assert_eq!(replies(gap), 1);
+        assert!(!posts.iter().any(|(p, _)| p.contains("per_foreign")));
+        drop(posts);
+        let _ = wire.pending.lock().unwrap().take();
+    }
+}
+
+/// A permission approval that cannot be delivered leaves the agent waiting
+/// forever: after its retries the turn ends, visibly.
+#[tokio::test]
+async fn undeliverable_permission_reply_ends_the_turn_with_an_error() {
+    let mut wire = TurnWire::start_config(
+        false,
+        false,
+        true,
+        None,
+        "1.18.31",
+        json!({"failReplies": true}),
+        false,
+    )
+    .await;
+    wire.request("/prompt_async").await;
+    wire.status("busy");
+    wire.bus
+        .send(json!({"type": "permission.asked", "properties": {"id": "per_1", "sessionID": "fixture"}}))
+        .unwrap();
+    let (status, error, surfaced) = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut surfaced = None;
+        loop {
+            match wire.events.recv().await.unwrap().unwrap() {
+                AgentEvent::Error { message } => surfaced = Some(message),
+                AgentEvent::Done { status, error, .. } => return (status, error, surfaced),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, DoneStatus::Errored);
+    let error = error.unwrap();
+    assert!(error.contains("Could not approve"), "{error}");
+    assert!(error.contains("500"), "{error}");
+    assert_eq!(surfaced.as_deref(), Some(error.as_str()));
+    let posts = wire.posts.lock().unwrap();
+    let attempts = posts
+        .iter()
+        .filter(|(p, _)| p == "/permission/per_1/reply")
+        .count();
+    assert_eq!(attempts, REPLY_ATTEMPTS as usize);
+    assert!(posts.iter().any(|(p, _)| p.ends_with("/abort")));
 }
 
 /// A server that dies mid-turn is noticed within the process poll, with its

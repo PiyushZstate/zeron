@@ -50,9 +50,12 @@
 //! Attempt ≥ [`RETRY_REPORT_ATTEMPT`] surfaces an error chip; attempt ≥
 //! [`RETRY_ABORT_ATTEMPT`] aborts the turn instead of retrying forever.
 //! A prompt that produces NO session-scoped event within
-//! [`default_stall_bound`] (`ZERON_OPENCODE_STALL_MS`, 0 disables) errors
-//! out instead of spinning "Working" forever. A server process that dies
-//! is noticed within [`SERVER_POLL`].
+//! [`default_stall_bound`] (`ZERON_OPENCODE_STALL_MS`, 0 disables) of the
+//! server accepting it errors out instead of spinning "Working" forever.
+//! Both wires report busy within milliseconds of accepting a prompt, before
+//! any provider bootstrap, so a slow first turn never trips it (verified
+//! live, 1.18.31 and 2.1.2). A server process that dies is noticed within
+//! [`SERVER_POLL`], and a bus silent past [`BUS_SILENCE`] is reconnected.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -107,6 +110,15 @@ const BUS_SILENCE: Duration = Duration::from_secs(45);
 /// crash otherwise surfaces only once the bus exhausts its reconnects, and
 /// each refused loopback connect costs about 2s on Windows.
 const SERVER_POLL: Duration = Duration::from_millis(500);
+
+/// Prompt deliveries: one retry. 2.x admits a repeated message id once, and
+/// 1.x is checked for the message before posting it again.
+const PROMPT_ATTEMPTS: u32 = 2;
+const PROMPT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Permission and question replies: the agent blocks until one lands.
+const REPLY_ATTEMPTS: u32 = 3;
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Budget for aborting a stopped turn's subagent sessions.
 const CHILD_ABORT_BUDGET: Duration = Duration::from_secs(15);
@@ -1171,6 +1183,78 @@ impl Server {
         self.child.as_mut()?.try_wait().ok().flatten()
     }
 
+    /// Did a prompt whose POST went unanswered reach the session anyway?
+    /// Running means it did; so does its message existing under the id we
+    /// minted (both wires store the prompt under it).
+    async fn prompt_landed(&self, session_id: &str, message_id: &str, dir: Option<&str>) -> bool {
+        let bound = Duration::from_secs(5);
+        if let Ok(Ok(true)) =
+            tokio::time::timeout(bound, self.session_running(session_id, dir)).await
+        {
+            return true;
+        }
+        let path = match self.protocol().await {
+            Protocol::V1 => format!("/session/{session_id}/message/{message_id}"),
+            Protocol::V2 => format!("/api/session/{session_id}/message/{message_id}"),
+        };
+        match tokio::time::timeout(bound, self.get_json(&path, dir)).await {
+            Ok(Ok(message)) => [
+                message.pointer("/info/id"),
+                message.pointer("/data/id"),
+                message.get("id"),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|id| id.as_str() == Some(message_id)),
+            _ => false,
+        }
+    }
+
+    /// Requests still waiting on an answer, as bus payloads. The bus never
+    /// replays, so a `permission.asked` or question emitted while it was
+    /// reconnecting exists only here; unanswered, it blocks the turn for
+    /// good. 1.x lists every pending request of the directory; 2.x lists
+    /// them per session (forms from 2.0.11). Ownership is checked where the
+    /// payloads are handled, like live ones. Best effort: a failed list adds
+    /// nothing.
+    async fn pending_requests(&self, sessions: &[String], dir: Option<&str>) -> Vec<Value> {
+        let mut payloads = Vec::new();
+        let listed = |path: String| async move {
+            match self.get_json(&path, dir).await {
+                Ok(list) => unwrap_data(list).as_array().cloned().unwrap_or_default(),
+                Err(e) => {
+                    tracing::debug!(
+                        target: "zeron_harness::opencode",
+                        "pending request sweep: {e}"
+                    );
+                    Vec::new()
+                }
+            }
+        };
+        let asked = |kind: &str, properties: Value| json!({"type": kind, "properties": properties});
+        match self.protocol().await {
+            Protocol::V1 => {
+                for request in listed("/permission".into()).await {
+                    payloads.push(asked("permission.asked", request));
+                }
+                for request in listed("/question".into()).await {
+                    payloads.push(asked("question.asked", request));
+                }
+            }
+            Protocol::V2 => {
+                for session in sessions {
+                    for request in listed(format!("/api/session/{session}/permission")).await {
+                        payloads.push(asked("permission.asked", request));
+                    }
+                    for form in listed(format!("/api/session/{session}/form")).await {
+                        payloads.extend(v2_question_form_payload(&form));
+                    }
+                }
+            }
+        }
+        payloads
+    }
+
     /// Abort `known` subagent sessions after their root was stopped. Only
     /// foreground subagents end with their parent; a background one keeps
     /// running (and spending) on a server a stopped turn leaves up. 1.x also
@@ -1606,7 +1690,6 @@ enum BusMsg {
     /// re-syncs from `GET /session/status`.
     Connected,
     Event(Value),
-    CommandFailed(String),
     /// The stream is gone past the reconnect budget (or the reader saw the
     /// consumer close).
     Disconnected,
@@ -1670,6 +1753,11 @@ struct TurnState {
     aborted_for_retry: bool,
     /// Deadline for the first session-scoped event after the prompt.
     stall_deadline: Option<tokio::time::Instant>,
+    /// The prompt POST has not been answered yet. The stall clock waits for
+    /// it: a server slow to admit a prompt (a contended database on Windows)
+    /// has not yet had the chance to make progress, and the POST is bounded
+    /// on its own.
+    prompt_in_flight: bool,
     /// Main-session tool calls started and not yet finished.
     open_tools: std::collections::HashSet<String>,
     /// Aborted to deliver a steer immediately: its idle/interrupted frame is
@@ -1677,13 +1765,25 @@ struct TurnState {
     preempted: bool,
 }
 
-/// A detached native-command HTTP request failed. `generation` binds the
-/// response to the turn that launched it: the synchronous command endpoint
-/// can return after the event bus has already settled that turn and started a
-/// queued successor.
-struct NativeCommandFailure {
+/// What a detached turn request reports back. `generation` binds it to the
+/// turn that launched it: the synchronous command endpoint (or a slow
+/// prompt, or a reply the user took minutes to give) can answer after the
+/// event bus has already settled that turn and started a queued successor.
+struct TurnUpdate {
     generation: u64,
-    message: String,
+    signal: TurnSignal,
+}
+
+enum TurnSignal {
+    /// The server took the prompt: the stall clock starts now.
+    PromptAccepted,
+    /// The prompt never reached the server's queue.
+    PromptFailed(String),
+    /// The native command endpoint answered with an error.
+    CommandFailed(String),
+    /// A permission or question answer could not be delivered: the agent is
+    /// blocked on a reply it will never get.
+    ReplyFailed(String),
 }
 
 /// A canonical leading command or provider-backed skill was selected in the
@@ -1713,8 +1813,11 @@ fn selected_native_command(prompt: &str, harness: HarnessId) -> bool {
 }
 
 impl TurnState {
-    fn begin(stall: Option<Duration>) -> Self {
+    /// `prompt_in_flight`: [`post_prompt`] posted a prompt whose acceptance
+    /// will be reported (a native command reports only failure).
+    fn begin(stall: Option<Duration>, prompt_in_flight: bool) -> Self {
         Self {
+            prompt_in_flight,
             active: true,
             idle_ready: false,
             idle_confirmations: 0,
@@ -1941,50 +2044,55 @@ async fn run_session(session: Session) {
         );
     }
     let stall = stall_bound();
-    let (command_failure_tx, mut command_failure_rx) = mpsc::unbounded_channel();
+    let (updates_tx, mut updates_rx) = mpsc::unbounded_channel::<TurnUpdate>();
     let mut turn_generation = 0_u64;
-    if let Err(e) = post_prompt(
+    let first_post = post_prompt(
         &server,
-        &bus_tx,
         &session_id,
         dir,
         &commands,
         &request.prompt,
         initial_native_command_selected,
         turn_generation,
-        &command_failure_tx,
+        &updates_tx,
         TurnSpec {
             model: model.as_ref(),
             variant: variant.as_deref(),
             attachments: &request.attachments,
         },
     )
-    .await
-    {
-        let _ = send(
-            &event_tx,
-            AgentEvent::Error {
-                message: e.to_string(),
-            },
-        )
-        .await;
-        let _ = send(
-            &event_tx,
-            AgentEvent::Done {
-                status: DoneStatus::Errored,
-                result: None,
-                error: Some(e.to_string()),
-                session_id: Some(session_id.clone()),
-            },
-        )
-        .await;
-        bus_handle.abort();
-        server.shutdown(kill_grace).await;
-        return;
-    }
-    let mut turn = TurnState::begin(stall);
+    .await;
+    let awaiting_ack = match first_post {
+        Ok(awaiting_ack) => awaiting_ack,
+        Err(e) => {
+            let _ = send(
+                &event_tx,
+                AgentEvent::Error {
+                    message: e.to_string(),
+                },
+            )
+            .await;
+            let _ = send(
+                &event_tx,
+                AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    result: None,
+                    error: Some(e.to_string()),
+                    session_id: Some(session_id.clone()),
+                },
+            )
+            .await;
+            bus_handle.abort();
+            server.shutdown(kill_grace).await;
+            return;
+        }
+    };
+    let mut turn = TurnState::begin(stall, awaiting_ack);
     let mut server_poll = tokio::time::interval(SERVER_POLL);
     server_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Permission and question ids already handled: a reconnect's sweep
+    // re-lists requests the live bus may also have delivered.
+    let mut seen_requests: std::collections::HashSet<String> = Default::default();
 
     // ---- main loop --------------------------------------------------------
     let mut main_feed = SessionFeed::default();
@@ -2086,14 +2194,13 @@ async fn run_session(session: Session) {
                 let sent = match adopted {
                     Ok(()) => post_prompt(
                         &server,
-                        &bus_tx,
                         &session_id,
                         dir,
                         &commands,
                         &steer,
                         native_command_selected,
                         turn_generation,
-                        &command_failure_tx,
+                        &updates_tx,
                         TurnSpec {
                             model: model.as_ref(),
                             variant: variant.as_deref(),
@@ -2104,8 +2211,8 @@ async fn run_session(session: Session) {
                     Err(e) => Err(e),
                 };
                 match sent {
-                    Ok(()) => {
-                        turn = TurnState::begin(stall);
+                    Ok(awaiting_ack) => {
+                        turn = TurnState::begin(stall, awaiting_ack);
                         continue $label;
                     }
                     Err(e) => {
@@ -2215,6 +2322,47 @@ async fn run_session(session: Session) {
         }};
     }
 
+    // Route one bus payload through the turn engine and act on the outcome.
+    macro_rules! dispatch_bus_event {
+        ($label:lifetime, $event:expr) => {{
+            let event: Value = $event;
+            let outcome = handle_bus_event(BusCtx {
+                event: &event,
+                session_id: &session_id,
+                server: &server,
+                dir,
+                event_tx: &event_tx,
+                request_input: &request_input,
+                main_feed: &mut main_feed,
+                children: &mut children,
+                pending_spawns: &mut pending_spawns,
+                unbound_children: &mut unbound_children,
+                turn: &mut turn,
+                pending_usage: &mut pending_usage,
+                context_windows: &context_windows,
+                seen_requests: &mut seen_requests,
+                generation: turn_generation,
+                updates_tx: &updates_tx,
+            })
+            .await;
+            match outcome {
+                BusOutcome::Continue => maybe_preempt!(),
+                BusOutcome::ConsumerGone => break $label,
+                BusOutcome::TurnIdle => settle_idle!($label),
+                // Our own steer preempt: a steer boundary.
+                BusOutcome::TurnInterrupted
+                    if turn.preempted && !interrupt_requested && !stopping =>
+                {
+                    settle_idle!($label)
+                }
+                BusOutcome::TurnInterrupted => {
+                    interrupt_requested = true;
+                    settle_idle!($label);
+                }
+            }
+        }};
+    }
+
     // After the root is aborted (stop or interrupt), its subagent sessions
     // go too; detached, so the turn settles on the root's own idle.
     macro_rules! abort_children {
@@ -2239,7 +2387,7 @@ async fn run_session(session: Session) {
         // proved the turn alive and disarmed it). Computed by value each
         // iteration so the future doesn't hold a borrow of `turn`.
         let deadline = abort_deadline.or_else(|| {
-            (turn.active && !turn.saw_activity)
+            (turn.active && !turn.saw_activity && !turn.prompt_in_flight)
                 .then_some(turn.stall_deadline)
                 .flatten()
         });
@@ -2333,21 +2481,57 @@ async fn run_session(session: Session) {
                 }
             }
 
-            failure = command_failure_rx.recv() => {
-                let Some(failure) = failure else { continue 'main; };
-                if failure.generation != turn_generation || !turn.active || interrupt_requested || stopping {
+            update = updates_rx.recv() => {
+                let Some(update) = update else { continue 'main; };
+                if update.generation != turn_generation || !turn.active || interrupt_requested || stopping {
                     tracing::debug!(
                         target: "zeron_harness::opencode",
-                        failed_generation = failure.generation,
+                        update_generation = update.generation,
                         active_generation = turn_generation,
-                        "ignoring native-command HTTP failure from a retired turn"
+                        "ignoring a request outcome from a retired turn"
                     );
                     continue 'main;
                 }
+                let message = match update.signal {
+                    TurnSignal::PromptAccepted => {
+                        turn.prompt_in_flight = false;
+                        if !turn.saw_activity {
+                            turn.stall_deadline = stall.map(|d| tokio::time::Instant::now() + d);
+                        }
+                        continue 'main;
+                    }
+                    // Its POST failed, but the bus already shows the turn
+                    // running: the server took the prompt after all.
+                    TurnSignal::PromptFailed(message) if turn.idle_ready => {
+                        tracing::warn!(
+                            target: "zeron_harness::opencode",
+                            "prompt POST failed but the turn is running: {message}"
+                        );
+                        turn.prompt_in_flight = false;
+                        continue 'main;
+                    }
+                    TurnSignal::PromptFailed(message) | TurnSignal::CommandFailed(message) => message,
+                    TurnSignal::ReplyFailed(message) => {
+                        // Whatever waits on the reply would never resume.
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            server.abort_session(&session_id, dir),
+                        )
+                        .await;
+                        message
+                    }
+                };
+                // A request that failed because the server died reports the
+                // crash, not the transport error it caused.
+                if let Some(status) = server.exited() {
+                    server.stderr_tail.wait_closed().await;
+                    settle_lost_server!('main, Some(status));
+                }
+                settle_children(&mut children, &event_tx, DoneStatus::Interrupted).await;
                 let _ = send(
                     &event_tx,
                     AgentEvent::Error {
-                        message: failure.message.clone(),
+                        message: message.clone(),
                     },
                 )
                 .await;
@@ -2356,7 +2540,7 @@ async fn run_session(session: Session) {
                     AgentEvent::Done {
                         status: DoneStatus::Errored,
                         result: None,
-                        error: Some(failure.message),
+                        error: Some(message),
                         session_id: Some(session_id.clone()),
                     },
                 )
@@ -2406,14 +2590,13 @@ async fn run_session(session: Session) {
                             let sent = match adopted {
                                 Ok(()) => post_prompt(
                                     &server,
-                                    &bus_tx,
                                     &session_id,
                                     dir,
                                     &commands,
                                     &prompt,
                                     native_command_selected,
                                     turn_generation,
-                                    &command_failure_tx,
+                                    &updates_tx,
                                     TurnSpec {
                                         model: model.as_ref(),
                                         variant: variant.as_deref(),
@@ -2424,7 +2607,7 @@ async fn run_session(session: Session) {
                                 Err(e) => Err(e),
                             };
                             match sent {
-                                Ok(()) => turn = TurnState::begin(stall),
+                                Ok(awaiting_ack) => turn = TurnState::begin(stall, awaiting_ack),
                                 Err(error) => {
                                     let message = error.to_string();
                                     let _ = send(
@@ -2485,7 +2668,11 @@ async fn run_session(session: Session) {
                     stall.unwrap_or(DEFAULT_STALL_BOUND).as_secs()
                 );
                 let _ = send(&event_tx, AgentEvent::Error { message: message.clone() }).await;
-                let _ = server.abort_session(&session_id, dir).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    server.abort_session(&session_id, dir),
+                )
+                .await;
                 settle_children(&mut children, &event_tx, DoneStatus::Interrupted).await;
                 let _ = send(&event_tx, AgentEvent::Done {
                     status: DoneStatus::Errored,
@@ -2511,22 +2698,32 @@ async fn run_session(session: Session) {
             msg = bus_rx.recv() => {
                 let Some(msg) = msg else { break 'main };
                 match msg {
-                    BusMsg::CommandFailed(_) if interrupt_requested || stopping => {}
-                    BusMsg::CommandFailed(message) => {
-                        let _ = send(&event_tx, AgentEvent::Done {
-                            status: DoneStatus::Errored, result: None,
-                            error: Some(message), session_id: Some(session_id.clone()),
-                        }).await;
-                        done_sent = true;
-                        break 'main;
-                    }
                     BusMsg::Connected => {
-                        // A RECONNECT mid-turn may have swallowed our idle
-                        // (no replay): re-sync from the server's own status
-                        // surface — not running means idle. Can't tell:
-                        // leave the turn running; the next disconnect or
-                        // event decides.
+                        // A RECONNECT may have swallowed frames (no replay).
+                        // Requests asked in the gap are re-listed and handled
+                        // like live ones (the agent waits on them), then the
+                        // turn re-syncs from the server's own status surface
+                        // — not running means idle. Can't tell: leave the
+                        // turn running; the next disconnect or event decides.
+                        if !interrupt_requested && !stopping {
+                            let sessions: Vec<String> = std::iter::once(session_id.clone())
+                                .chain(children.keys().cloned())
+                                .chain(unbound_children.keys().cloned())
+                                .collect();
+                            let pending = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                server.pending_requests(&sessions, dir),
+                            )
+                            .await
+                            .unwrap_or_default();
+                            for event in pending {
+                                dispatch_bus_event!('main, event);
+                            }
+                        }
+                        // A prompt the server has not answered yet may simply
+                        // not be queued yet: not running proves nothing.
                         if turn.active
+                            && !turn.prompt_in_flight
                             && !server
                                 .session_running(&session_id, dir)
                                 .await
@@ -2558,36 +2755,7 @@ async fn run_session(session: Session) {
                             if ours && idle { settle_idle!('main); }
                             continue;
                         }
-                        let outcome = handle_bus_event(BusCtx {
-                            event: &event,
-                            session_id: &session_id,
-                            server: &server,
-                            dir,
-                            event_tx: &event_tx,
-                            request_input: &request_input,
-                            main_feed: &mut main_feed,
-                            children: &mut children,
-                            pending_spawns: &mut pending_spawns,
-                            unbound_children: &mut unbound_children,
-                            turn: &mut turn,
-                            pending_usage: &mut pending_usage,
-                            context_windows: &context_windows,
-                        }).await;
-                        match outcome {
-                            BusOutcome::Continue => maybe_preempt!(),
-                            BusOutcome::ConsumerGone => break 'main,
-                            BusOutcome::TurnIdle => settle_idle!('main),
-                            // Our own steer preempt: a steer boundary.
-                            BusOutcome::TurnInterrupted
-                                if turn.preempted && !interrupt_requested && !stopping =>
-                            {
-                                settle_idle!('main)
-                            }
-                            BusOutcome::TurnInterrupted => {
-                                interrupt_requested = true;
-                                settle_idle!('main);
-                            }
-                        }
+                        dispatch_bus_event!('main, event);
                     }
                 }
             }
@@ -2803,20 +2971,21 @@ fn prompt_body(
     model: Option<(&str, &str)>,
     variant: Option<&str>,
     attachments: &[String],
+    message_id: Option<&str>,
 ) -> Value {
     let mut parts = vec![json!({ "type": "text", "text": prompt })];
     for path in attachments {
         parts.push(json!({
             "type": "file",
             "mime": mime_for(path),
-            "filename": std::path::Path::new(path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            "filename": attachment_name(path),
             "url": file_url(path),
         }));
     }
     let mut body = serde_json::Map::new();
+    if let Some(id) = message_id {
+        body.insert("messageID".into(), json!(id));
+    }
     body.insert("parts".into(), Value::Array(parts));
     if let Some((provider, model)) = model {
         body.insert(
@@ -2833,20 +3002,23 @@ fn prompt_body(
 /// 2.x prompt body: plain text plus `{uri, name}` file attachments. Model
 /// and variant do NOT ride here — they were set on the session at run
 /// start (`POST /api/session/{id}/model`).
-fn prompt_body_v2(prompt: &str, attachments: &[String]) -> Value {
+fn prompt_body_v2(prompt: &str, attachments: &[String], message_id: Option<&str>) -> Value {
     let files: Vec<Value> = attachments
         .iter()
-        .map(|path| {
-            json!({
-                "uri": file_url(path),
-                "name": std::path::Path::new(path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-            })
-        })
+        .map(|path| json!({ "uri": file_url(path), "name": attachment_name(path) }))
         .collect();
-    json!({ "text": prompt, "files": files })
+    let mut body = json!({ "text": prompt, "files": files });
+    if let Some(id) = message_id {
+        body["id"] = json!(id);
+    }
+    body
+}
+
+fn attachment_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// `path` as the `file:` URL Node's `fileURLToPath` (how both wires read an
@@ -2914,7 +3086,7 @@ fn command_body_v2(
     {
         let mut body = json!({"name": name, "text": text});
         if !attachments.is_empty() {
-            body["files"] = prompt_body_v2(text, attachments)["files"].clone();
+            body["files"] = prompt_body_v2(text, attachments, None)["files"].clone();
         }
         body
     } else {
@@ -2928,18 +3100,21 @@ fn command_body_v2(
 /// Both are fire-and-forget for the loop: the command endpoint is
 /// synchronous on the wire, so it rides a detached task and the bus
 /// delivers the actual turn.
+///
+/// `Ok(true)`: a prompt whose acceptance (or failure) `updates` will carry;
+/// `Ok(false)`: a native command, which reports only failure.
+#[allow(clippy::too_many_arguments)]
 async fn post_prompt(
     server: &Server,
-    bus_tx: &mpsc::Sender<BusMsg>,
     session_id: &str,
     dir: Option<&str>,
     commands: &[SlashCommand],
     prompt: &str,
     native_command_selected: bool,
     turn_generation: u64,
-    command_failure_tx: &mpsc::UnboundedSender<NativeCommandFailure>,
+    updates: &mpsc::UnboundedSender<TurnUpdate>,
     spec: TurnSpec<'_>,
-) -> Result<(), HarnessError> {
+) -> Result<bool, HarnessError> {
     let TurnSpec {
         model,
         variant,
@@ -2966,22 +3141,11 @@ async fn post_prompt(
                 command_body_v2(server.version.get(), name, &arguments, attachments),
             ),
         };
-        let server_base = server.base.clone();
-        let auth = server.auth.clone();
+        let server = server.handle();
         let dir_owned = dir.map(str::to_owned);
         let path_owned = path.clone();
-        let protocol = server.protocol.clone();
-        let command_failure_tx = command_failure_tx.clone();
+        let updates = updates.clone();
         tokio::spawn(async move {
-            let server = Server {
-                child: None,
-                base: server_base,
-                auth,
-                client: http_client(),
-                stderr_tail: crate::StderrTail::default(),
-                protocol,
-                version: tokio::sync::OnceCell::new(),
-            };
             // The command endpoint blocks for the whole turn; the bus
             // carries the real events, so this response is ignored —
             // but it must not be cut off mid-turn by CALL_TIMEOUT.
@@ -2999,14 +3163,15 @@ async fn post_prompt(
                 Err(error) => Some(format!("opencode POST {path_owned}: {error}")),
             };
             if let Some(message) = failure {
-                let _ = command_failure_tx.send(NativeCommandFailure {
+                let _ = updates.send(TurnUpdate {
                     generation: turn_generation,
-                    message,
+                    signal: TurnSignal::CommandFailed(message),
                 });
             }
         });
-        return Ok(());
+        return Ok(false);
     }
+    let message_id = prompt_message_id();
     let (path, body) = match protocol {
         Protocol::V1 => (
             format!("/session/{session_id}/prompt_async"),
@@ -3015,32 +3180,116 @@ async fn post_prompt(
                 model.map(|(provider, model)| (provider.as_str(), model.as_str())),
                 variant,
                 attachments,
+                Some(&message_id),
             ),
         ),
         Protocol::V2 => (
             format!("/api/session/{session_id}/prompt"),
-            prompt_body_v2(prompt, attachments),
+            prompt_body_v2(prompt, attachments, Some(&message_id)),
         ),
     };
-    let server = Server {
-        child: None,
-        base: server.base.clone(),
-        auth: server.auth.clone(),
-        client: server.client.clone(),
-        stderr_tail: crate::StderrTail::default(),
-        protocol: server.protocol.clone(),
-        version: tokio::sync::OnceCell::new(),
-    };
-    let bus_tx = bus_tx.clone();
+    let server = server.handle();
+    let session_id = session_id.to_owned();
+    let updates = updates.clone();
     let dir = dir.map(str::to_owned);
     // The bus owns turn completion. A stalled HTTP acknowledgement must not
-    // prevent cancellation or event consumption; post_json bounds the request.
+    // prevent cancellation or event consumption; each POST is bounded.
     tokio::spawn(async move {
-        if let Err(error) = server.post_json(&path, dir.as_deref(), &body).await {
-            let _ = bus_tx.send(BusMsg::CommandFailed(error.to_string())).await;
-        }
+        let signal = match deliver_prompt(
+            &server,
+            &path,
+            &body,
+            &session_id,
+            &message_id,
+            dir.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => TurnSignal::PromptAccepted,
+            Err(message) => TurnSignal::PromptFailed(message),
+        };
+        let _ = updates.send(TurnUpdate {
+            generation: turn_generation,
+            signal,
+        });
     });
-    Ok(())
+    Ok(true)
+}
+
+/// POST a prompt until the server has it. A 4xx is a definitive rejection.
+/// A timeout, a dropped connection or a 5xx is ambiguous — the server may
+/// have queued the prompt and only the answer was lost — so before posting
+/// again (and before giving up) the session is checked for it: running, or
+/// holding the message under the id we minted. A repeat is therefore never
+/// a duplicate turn: 2.x admits an id once anyway, and 1.x only gets the
+/// prompt again when it has no message under that id.
+async fn deliver_prompt(
+    server: &Server,
+    path: &str,
+    body: &Value,
+    session_id: &str,
+    message_id: &str,
+    dir: Option<&str>,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..PROMPT_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(PROMPT_RETRY_DELAY * attempt).await;
+            if server.prompt_landed(session_id, message_id, dir).await {
+                return Ok(());
+            }
+        }
+        match server.post_json_raw(path, dir, body).await {
+            Ok((status, _)) if status.is_success() => return Ok(()),
+            // A retried id the server already admitted conflicts (2.x).
+            Ok((reqwest::StatusCode::CONFLICT, _)) if attempt > 0 => return Ok(()),
+            Ok((status, text)) if status.is_client_error() => {
+                return Err(post_error_message(path, status, &text));
+            }
+            Ok((status, text)) => last_error = post_error_message(path, status, &text),
+            Err(error) => last_error = error.to_string(),
+        }
+        tracing::warn!(
+            target: "zeron_harness::opencode",
+            attempt,
+            "prompt POST failed: {last_error}"
+        );
+    }
+    if server.prompt_landed(session_id, message_id, dir).await {
+        return Ok(());
+    }
+    Err(last_error)
+}
+
+/// A message id in opencode's own ascending form: `msg_`, 12 hex digits of
+/// the millisecond clock ×4096 plus a per-millisecond counter, then 14
+/// base62 characters. Sessions order their messages by id, so ours must
+/// sort like one the server would mint at the same moment. Both wires take
+/// it on the prompt (1.x `messageID`, 2.x `id`), which makes a lost answer
+/// checkable and a retry safe ([`deliver_prompt`]).
+fn prompt_message_id() -> String {
+    static CLOCK: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let counter = {
+        let mut clock = CLOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if clock.0 != now {
+            *clock = (now, 0);
+        }
+        clock.1 += 1;
+        clock.1
+    };
+    let stamp = now.wrapping_mul(0x1000).wrapping_add(counter) & 0xFFFF_FFFF_FFFF;
+    const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let random: String = uuid::Uuid::new_v4().as_bytes()[..14]
+        .iter()
+        .map(|b| BASE62[usize::from(*b) % BASE62.len()] as char)
+        .collect();
+    format!("msg_{stamp:012x}{random}")
 }
 
 /// Resolve a delivered leading slash command against the run's live,
@@ -3105,6 +3354,59 @@ struct BusCtx<'a> {
     turn: &'a mut TurnState,
     pending_usage: &'a mut Option<AgentEvent>,
     context_windows: &'a HashMap<String, u64>,
+    /// Permission/question ids already handled (a reconnect re-lists them).
+    seen_requests: &'a mut std::collections::HashSet<String>,
+    /// The live turn, for reply failures.
+    generation: u64,
+    updates_tx: &'a mpsc::UnboundedSender<TurnUpdate>,
+}
+
+/// Deliver an answer the agent is blocked on. Each round tries `routes` in
+/// order (1.x keeps a session-scoped fallback); a timeout, a transport fault
+/// or a 5xx retries with backoff. A request every route reports missing
+/// (404) is no longer pending — answered elsewhere, or gone with its turn —
+/// so that counts as delivered rather than failing the turn.
+async fn deliver_reply(
+    server: &Server,
+    routes: &[(String, Value)],
+    dir: Option<&str>,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..REPLY_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(1) * attempt).await;
+        }
+        let mut missing = 0;
+        let mut retryable = false;
+        for (path, body) in routes {
+            match tokio::time::timeout(REPLY_TIMEOUT, server.post_json_raw(path, dir, body)).await {
+                Ok(Ok((status, _))) if status.is_success() => return Ok(()),
+                Ok(Ok((status, text))) => {
+                    missing += usize::from(status == reqwest::StatusCode::NOT_FOUND);
+                    retryable |= !status.is_client_error();
+                    last_error = post_error_message(path, status, &text);
+                }
+                Ok(Err(error)) => {
+                    retryable = true;
+                    last_error = error.to_string();
+                }
+                Err(_) => {
+                    retryable = true;
+                    last_error = format!(
+                        "opencode POST {path}: no answer within {}s",
+                        REPLY_TIMEOUT.as_secs()
+                    );
+                }
+            }
+        }
+        if missing == routes.len() {
+            return Ok(());
+        }
+        if !retryable {
+            break;
+        }
+    }
+    Err(last_error)
 }
 
 /// Wrap an event as subagent-attributed traffic.
@@ -3156,6 +3458,9 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         turn,
         pending_usage,
         context_windows,
+        seen_requests,
+        generation,
+        updates_tx,
     } = ctx;
     // Envelope styles: /global/event wraps ({payload: {...}}); a bare
     // /event feed (tests) delivers the payload directly.
@@ -3233,7 +3538,11 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                         if !send(event_tx, AgentEvent::Error { message: msg }).await {
                             return BusOutcome::ConsumerGone;
                         }
-                        let _ = server.abort_session(session_id, dir).await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            server.abort_session(session_id, dir),
+                        )
+                        .await;
                     } else if attempt >= RETRY_REPORT_ATTEMPT && !turn.retry_reported {
                         turn.retry_reported = true;
                         let msg = format!(
@@ -3471,6 +3780,9 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             let Some(id) = props.get("id").and_then(Value::as_str) else {
                 return BusOutcome::Continue;
             };
+            if !seen_requests.insert(id.to_owned()) {
+                return BusOutcome::Continue;
+            }
             let session = session.to_owned();
             let protocol = server.protocol().await;
             // 1.x: global permission endpoint + a session-scoped fallback;
@@ -3486,10 +3798,9 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     None,
                 ),
             };
-            let base = server.base.clone();
-            let auth = server.auth.clone();
+            let server = server.handle();
             let dir_owned = dir.map(str::to_owned);
-            let protocol_cell = server.protocol.clone();
+            let updates_tx = updates_tx.clone();
             let reply_key = if protocol == Protocol::V2
                 && server
                     .version
@@ -3502,37 +3813,23 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 "reply"
             };
             tokio::spawn(async move {
-                let server = Server {
-                    child: None,
-                    base,
-                    auth,
-                    client: http_client(),
-                    stderr_tail: crate::StderrTail::default(),
-                    protocol: protocol_cell,
-                    version: tokio::sync::OnceCell::new(),
-                };
                 // Like Claude and Codex, normal Zeron sessions run unattended,
                 // regardless of RunRequest.auto_approve. Approve each owned
                 // request without writing durable permission rules via "always".
                 // Genuine agent questions use the separate question.asked path.
                 let reply = "once";
-                if server
-                    .post_json(
-                        &reply_path,
-                        dir_owned.as_deref(),
-                        &json!({ reply_key: reply }),
-                    )
-                    .await
-                    .is_err()
-                    && let Some(fallback_path) = fallback_path
-                {
-                    let _ = server
-                        .post_json(
-                            &fallback_path,
-                            dir_owned.as_deref(),
-                            &json!({ "response": reply }),
-                        )
-                        .await;
+                let mut routes = vec![(reply_path, json!({ reply_key: reply }))];
+                if let Some(fallback_path) = fallback_path {
+                    routes.push((fallback_path, json!({ "response": reply })));
+                }
+                if let Err(error) = deliver_reply(&server, &routes, dir_owned.as_deref()).await {
+                    let _ = updates_tx.send(TurnUpdate {
+                        generation,
+                        signal: TurnSignal::ReplyFailed(format!(
+                            "Could not approve an opencode permission request, so the \
+                             agent cannot continue: {error}"
+                        )),
+                    });
                 }
             });
             BusOutcome::Continue
@@ -3554,7 +3851,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             // Panel ids are minted per question, like Claude and Codex; the
             // paired key is what a 2.x form reply addresses.
             let pairs = map_questions(props);
-            if pairs.is_empty() {
+            if pairs.is_empty() || !seen_requests.insert(id.to_owned()) {
                 return BusOutcome::Continue;
             }
             // 2.x (2.0.24+) ships the `question` tool as a session form; its
@@ -3568,31 +3865,16 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             // no resolver knew — the QuestionPanel answered that twin and the
             // run never resumed (the same fix Claude and Codex got).
             let rx = (request_input)(pairs.iter().map(|(_, question)| question.clone()).collect());
-            let base = server.base.clone();
-            let auth = server.auth.clone();
+            let server = server.handle();
             let dir_owned = dir.map(str::to_owned);
             let request_id = id.to_owned();
-            let protocol_cell = server.protocol.clone();
+            let updates_tx = updates_tx.clone();
             tokio::spawn(async move {
-                let server = Server {
-                    child: None,
-                    base,
-                    auth,
-                    client: http_client(),
-                    stderr_tail: crate::StderrTail::default(),
-                    protocol: protocol_cell,
-                    version: tokio::sync::OnceCell::new(),
-                };
-                let reply = match rx.await {
-                    Ok(answers) if is_form => {
-                        server
-                            .post_json(
-                                &format!("/api/session/{session}/form/{request_id}/reply"),
-                                dir_owned.as_deref(),
-                                &form_answer_body(&pairs, &answers),
-                            )
-                            .await
-                    }
+                let answer = match rx.await {
+                    Ok(answers) if is_form => Some((
+                        format!("/api/session/{session}/form/{request_id}/reply"),
+                        form_answer_body(&pairs, &answers),
+                    )),
                     Ok(answers) => {
                         let ordered: Vec<Vec<String>> = pairs
                             .iter()
@@ -3604,35 +3886,44 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                                     .unwrap_or_default()
                             })
                             .collect();
-                        server
-                            .post_json(
-                                &format!("/question/{request_id}/reply"),
-                                dir_owned.as_deref(),
-                                &json!({ "answers": ordered }),
-                            )
-                            .await
+                        Some((
+                            format!("/question/{request_id}/reply"),
+                            json!({ "answers": ordered }),
+                        ))
                     }
                     // A dropped resolver means the run — and with it this
                     // OpenCode child — is already going away. Pending forms
                     // are instance state and die with it, so there is nothing
                     // left to cancel; only the 1.x route gets an explicit
                     // reject.
-                    Err(_) if is_form => Ok(Value::Null),
+                    Err(_) if is_form => None,
                     Err(_) => {
-                        server
+                        if let Err(e) = server
                             .post_json(
                                 &format!("/question/{request_id}/reject"),
                                 dir_owned.as_deref(),
                                 &Value::Null,
                             )
                             .await
+                        {
+                            tracing::debug!(
+                                target: "zeron_harness::opencode",
+                                "question reject failed: {e}"
+                            );
+                        }
+                        None
                     }
                 };
-                if let Err(e) = reply {
-                    tracing::debug!(
-                        target: "zeron_harness::opencode",
-                        "question reply failed: {e}"
-                    );
+                if let Some(route) = answer
+                    && let Err(error) = deliver_reply(&server, &[route], dir_owned.as_deref()).await
+                {
+                    let _ = updates_tx.send(TurnUpdate {
+                        generation,
+                        signal: TurnSignal::ReplyFailed(format!(
+                            "Could not deliver the answer to opencode, so the agent \
+                             cannot continue: {error}"
+                        )),
+                    });
                 }
             });
             BusOutcome::Continue
