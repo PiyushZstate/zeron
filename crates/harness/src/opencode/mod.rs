@@ -95,6 +95,13 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const BUS_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 const BUS_RECONNECT_ATTEMPTS: u32 = 40;
 
+/// Longest the bus may stay silent before the stream is presumed wedged and
+/// reconnected (the reconnect re-syncs status and pending requests). Both
+/// generations keep an idle stream talking: 1.x sends a `server.heartbeat`
+/// event every 10s (1.14.17 through 1.18.31), 2.x a `: heartbeat` comment
+/// every 15s (2.1.2); both verified live.
+const BUS_SILENCE: Duration = Duration::from_secs(45);
+
 /// Provider-retry surfacing: report at 3 (a chip; the turn keeps trying),
 /// abort at 8 (opencode itself would retry forever — #169's silent loop).
 const RETRY_REPORT_ATTEMPT: u64 = 3;
@@ -1836,6 +1843,7 @@ async fn run_session(session: Session) {
         server.auth.clone(),
         server.protocol().await,
         bus_tx.clone(),
+        BUS_SILENCE,
     ));
 
     // ---- first prompt -----------------------------------------------------
@@ -4522,6 +4530,7 @@ async fn bus_task(
     auth: Option<String>,
     protocol: Protocol,
     tx: mpsc::Sender<BusMsg>,
+    silence: Duration,
 ) {
     let client = http_client();
     let url = match protocol {
@@ -4541,19 +4550,28 @@ async fn bus_task(
         if let Some(auth) = &auth {
             req = req.header(reqwest::header::AUTHORIZATION, auth.clone());
         }
-        match req.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                failures = 0;
-                stream_bus(
+        // A server that accepts the connection but never answers it must
+        // not park the bus forever either.
+        match tokio::time::timeout(silence, req.send()).await {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                let framed = stream_bus(
                     &tx,
                     resp,
                     protocol,
+                    silence,
                     &mut v2_tool_names,
                     &mut v2_session_models,
                 )
                 .await;
                 if tx.is_closed() {
                     return;
+                }
+                // Only a stream that delivered a frame proves the server
+                // healthy: one accepted and closed (or wedged) before its
+                // first frame keeps counting toward the budget, or an
+                // accept-then-close server would be retried forever.
+                if framed {
+                    failures = 0;
                 }
             }
             _ => {}
@@ -4569,70 +4587,146 @@ async fn bus_task(
     }
 }
 
+/// Forward one stream's events; returns whether it delivered a frame. A
+/// stream silent for `silence` (heartbeats included) is abandoned so the
+/// caller reconnects.
 async fn stream_bus(
     tx: &mpsc::Sender<BusMsg>,
     resp: reqwest::Response,
     protocol: Protocol,
+    silence: Duration,
     v2_tool_names: &mut HashMap<V2ToolKey, String>,
     v2_session_models: &mut HashMap<String, V2ModelIdentity>,
-) {
+) -> bool {
     let mut stream = resp.bytes_stream();
-    let mut buf: Vec<u8> = Vec::new();
+    let mut decoder = SseDecoder::default();
     let mut announced = false;
-    while let Some(chunk) = stream.next().await {
-        let Ok(bytes) = chunk else {
-            return;
+    loop {
+        let bytes = match tokio::time::timeout(silence, stream.next()).await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(Some(Err(_)) | None) => return announced,
+            Err(_) => {
+                tracing::warn!(
+                    target: "zeron_harness::opencode",
+                    "event bus silent for {}s; reconnecting",
+                    silence.as_secs()
+                );
+                return announced;
+            }
         };
-        if !announced {
+        let events = decoder.feed(&bytes);
+        if !announced && decoder.frames > 0 {
             announced = true;
             if tx.send(BusMsg::Connected).await.is_err() {
-                return;
+                return announced;
             }
         }
-        buf.extend_from_slice(&bytes);
-        // SSE frames are blank-line separated; each data line is one event.
-        while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-            let frame: Vec<u8> = buf.drain(..pos + 2).collect();
-            let Ok(frame) = std::str::from_utf8(&frame) else {
+        for data in events {
+            let Ok(event) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
-            for line in frame.lines() {
-                let Some(data) = line
-                    .strip_prefix("data: ")
-                    .or_else(|| line.strip_prefix("data:"))
-                else {
-                    continue;
-                };
-                let Ok(event) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-                if protocol == Protocol::V2 {
-                    let payloads = normalize_v2_frame_with_session_models(
-                        event,
-                        v2_tool_names,
-                        v2_session_models,
-                    );
-                    if v2_tool_names.len() > MAX_PENDING_V2_TOOLS {
-                        let _ = tx.send(BusMsg::Disconnected).await;
-                        return;
+            if protocol == Protocol::V2 {
+                let payloads =
+                    normalize_v2_frame_with_session_models(event, v2_tool_names, v2_session_models);
+                if v2_tool_names.len() > MAX_PENDING_V2_TOOLS {
+                    let _ = tx.send(BusMsg::Disconnected).await;
+                    return announced;
+                }
+                // Model identity only feeds usage frames. Dropping the
+                // cache degrades to "window preserved" and refills on the
+                // next step.started, so — unlike leaked pending tools — it
+                // must not fail the run, especially now that the cache
+                // survives reconnects.
+                if v2_session_models.len() > MAX_V2_SESSION_MODELS {
+                    v2_session_models.clear();
+                }
+                for payload in payloads {
+                    if tx.send(BusMsg::Event(payload)).await.is_err() {
+                        return announced;
                     }
-                    // Model identity only feeds usage frames. Dropping the
-                    // cache degrades to "window preserved" and refills on the
-                    // next step.started, so — unlike leaked pending tools — it
-                    // must not fail the run, especially now that the cache
-                    // survives reconnects.
-                    if v2_session_models.len() > MAX_V2_SESSION_MODELS {
-                        v2_session_models.clear();
-                    }
-                    for payload in payloads {
-                        if tx.send(BusMsg::Event(payload)).await.is_err() {
-                            return;
-                        }
-                    }
-                } else if tx.send(BusMsg::Event(event)).await.is_err() {
-                    return;
+                }
+            } else if tx.send(BusMsg::Event(event)).await.is_err() {
+                return announced;
+            }
+        }
+    }
+}
+
+/// Incremental `text/event-stream` decoder (the WHATWG framing). Lines end
+/// in LF, CR or CRLF — a CR closing one chunk may pair with the LF opening
+/// the next — `:` lines are comments, an event's `data` lines join with LF,
+/// and a blank line dispatches it. Each line decodes lossily on its own, so
+/// an invalid byte costs a character rather than the event, and every byte
+/// is scanned once however large a frame grows.
+#[derive(Default)]
+struct SseDecoder {
+    line: Vec<u8>,
+    data: String,
+    has_data: bool,
+    /// The current block has seen a line (a comment or any field).
+    in_frame: bool,
+    /// The last chunk ended in CR: an LF opening the next one belongs to it.
+    after_cr: bool,
+    /// The first line has been read (a leading byte-order mark is dropped).
+    started: bool,
+    /// Complete blocks seen, comment-only ones (heartbeats) included.
+    frames: u64,
+}
+
+impl SseDecoder {
+    /// Feed one chunk; returns the data of every event it completed.
+    fn feed(&mut self, mut bytes: &[u8]) -> Vec<String> {
+        let mut events = Vec::new();
+        if bytes.is_empty() {
+            return events;
+        }
+        if std::mem::take(&mut self.after_cr) && bytes[0] == b'\n' {
+            bytes = &bytes[1..];
+        }
+        while let Some(end) = bytes.iter().position(|b| matches!(b, b'\n' | b'\r')) {
+            self.line.extend_from_slice(&bytes[..end]);
+            let cr = bytes[end] == b'\r';
+            bytes = &bytes[end + 1..];
+            if cr {
+                match bytes.first() {
+                    Some(b'\n') => bytes = &bytes[1..],
+                    Some(_) => {}
+                    None => self.after_cr = true,
                 }
             }
+            self.end_line(&mut events);
+        }
+        self.line.extend_from_slice(bytes);
+        events
+    }
+
+    fn end_line(&mut self, events: &mut Vec<String>) {
+        let raw = std::mem::take(&mut self.line);
+        let decoded = String::from_utf8_lossy(&raw);
+        let mut line: &str = &decoded;
+        if !std::mem::replace(&mut self.started, true) {
+            line = line.strip_prefix('\u{feff}').unwrap_or(line);
+        }
+        if line.is_empty() {
+            if std::mem::take(&mut self.in_frame) {
+                self.frames += 1;
+            }
+            if std::mem::take(&mut self.has_data) {
+                events.push(std::mem::take(&mut self.data));
+            }
+            return;
+        }
+        self.in_frame = true;
+        if line.starts_with(':') {
+            return;
+        }
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        if field == "data" {
+            if self.has_data {
+                self.data.push('\n');
+            }
+            self.data.push_str(value.strip_prefix(' ').unwrap_or(value));
+            self.has_data = true;
         }
     }
 }

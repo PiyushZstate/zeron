@@ -2661,3 +2661,129 @@ fn native_skill_catalog_rejects_unrepresentable_commands() {
         assert_eq!(invocation_links(&invocation.link())[0].1, invocation);
     }
 }
+
+fn sse_feed(chunks: &[&[u8]]) -> (Vec<String>, u64) {
+    let mut decoder = SseDecoder::default();
+    let mut events = Vec::new();
+    for chunk in chunks {
+        events.extend(decoder.feed(chunk));
+    }
+    (events, decoder.frames)
+}
+
+#[test]
+fn sse_decoder_frames_every_line_ending_even_split_across_chunks() {
+    for chunks in [
+        &[b"data: a\n\ndata: b\n\n".as_slice()][..],
+        &[b"data: a\r\n\r\ndata: b\r\n\r\n"],
+        &[b"data: a\r\rdata: b\r\r"],
+        // A CR ends one chunk and its LF opens the next: one line ending.
+        &[b"data: a\r", b"\n\r", b"\ndata: b\r\n", b"\r\n"],
+        // A lone CR at a chunk's end is a complete line ending too.
+        &[b"data: a\r", b"\r", b"data: b\n", b"\n"],
+        &[b"da", b"ta:", b" a\n", b"\n", b"data: b", b"\n\n"],
+    ] {
+        assert_eq!(
+            sse_feed(chunks),
+            (vec!["a".into(), "b".into()], 2),
+            "{chunks:?}"
+        );
+    }
+}
+
+#[test]
+fn sse_decoder_joins_data_lines_and_skips_comments_and_other_fields() {
+    let (events, frames) = sse_feed(&[
+        b"\xEF\xBB\xBF: connected\n\n",
+        b"event: message\nid: 7\nretry: 10\ndata: {\"a\":\ndata:1}\n\n",
+        b": heartbeat\n\n",
+        b"data\n\n",
+    ]);
+    assert_eq!(events, vec!["{\"a\":\n1}".to_owned(), String::new()]);
+    // Comment-only blocks (the 2.x heartbeat) count as frames.
+    assert_eq!(frames, 4);
+    // An unterminated event is not dispatched.
+    assert_eq!(sse_feed(&[b"data: partial\n"]).0, Vec::<String>::new());
+}
+
+#[test]
+fn sse_decoder_replaces_invalid_utf8_instead_of_dropping_the_event() {
+    let (events, _) = sse_feed(&[
+        b"data: {\"text\":\"a\xFFb\"}\n",
+        b"\n",
+        b"data: {\"ok\":\xE2\x9C",
+        b"\x93}\n\n",
+    ]);
+    assert_eq!(events[0], "{\"text\":\"a\u{FFFD}b\"}");
+    // A character split across chunks still decodes whole.
+    assert_eq!(events[1], "{\"ok\":\u{2713}}");
+    assert!(serde_json::from_str::<Value>(&events[0]).is_ok());
+}
+
+#[test]
+fn sse_decoder_scans_a_large_frame_once() {
+    let payload = format!("data: {{\"text\":\"{}\"}}\n\n", "x".repeat(8 << 20));
+    let mut decoder = SseDecoder::default();
+    let start = std::time::Instant::now();
+    let mut events = Vec::new();
+    for chunk in payload.as_bytes().chunks(4096) {
+        events.extend(decoder.feed(chunk));
+    }
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].len(), (8 << 20) + 11);
+    // Rescanning the buffer per chunk took minutes at this size.
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// One SSE response per accepted connection, from `bodies` in turn; each
+/// connection is held open after its body for `hold`.
+async fn sse_server(bodies: Vec<&'static [u8]>, hold: Duration) -> String {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        for body in bodies {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = socket.write_all(body).await;
+            tokio::spawn(async move {
+                tokio::time::sleep(hold).await;
+                drop(socket);
+            });
+        }
+    });
+    base
+}
+
+#[tokio::test]
+async fn stream_bus_counts_only_framed_streams_and_abandons_silent_ones() {
+    let base = sse_server(
+        vec![b"", b"data: {\"payload\":{\"type\":\"x\"}}\n\n"],
+        Duration::from_secs(30),
+    )
+    .await;
+    let (tx, mut rx) = mpsc::channel(8);
+    let mut tools = HashMap::new();
+    let mut models = HashMap::new();
+    // Accepted, then nothing: not a healthy stream (the reconnect budget
+    // must keep counting), and never announced.
+    let resp = reqwest::get(format!("{base}/global/event")).await.unwrap();
+    let silence = Duration::from_millis(300);
+    assert!(!stream_bus(&tx, resp, Protocol::V1, silence, &mut tools, &mut models).await);
+    assert!(rx.try_recv().is_err());
+    // A frame, then silence past the bound: abandoned for a reconnect.
+    let resp = reqwest::get(format!("{base}/global/event")).await.unwrap();
+    let start = tokio::time::Instant::now();
+    assert!(stream_bus(&tx, resp, Protocol::V1, silence, &mut tools, &mut models).await);
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(matches!(rx.try_recv(), Ok(BusMsg::Connected)));
+    assert!(matches!(rx.try_recv(), Ok(BusMsg::Event(_))));
+}
