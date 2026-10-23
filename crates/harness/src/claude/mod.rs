@@ -355,7 +355,7 @@ impl ClaudeHarness {
                 .await
                 .map_err(HarnessError::Io)?;
             stdin.flush().await.map_err(HarnessError::Io)?;
-            let mut lines = BufReader::new(stdout).lines();
+            let mut lines = crate::lossy_lines::lossy_lines(stdout);
             while let Some(line) = lines.next_line().await.map_err(HarnessError::Io)? {
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else {
                     continue;
@@ -636,7 +636,7 @@ impl ClaudeHarness {
         if let Some(stderr) = child.stderr.take() {
             let tail = stderr_tail.clone();
             tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
+                let mut lines = crate::lossy_lines::lossy_lines(stderr);
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::debug!(target: "zeron_harness::claude", "stderr: {line}");
                     tail.push(&line);
@@ -672,7 +672,7 @@ impl ClaudeHarness {
             normalizer,
             title_only,
             child,
-            stdout_lines: BufReader::new(stdout).lines(),
+            stdout_lines: crate::lossy_lines::lossy_lines(stdout),
             first_command,
             stdin_tx,
             event_tx,
@@ -798,7 +798,7 @@ struct Session {
     normalizer: Normalizer,
     title_only: bool,
     child: Child,
-    stdout_lines: tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
+    stdout_lines: crate::lossy_lines::LossyLines<crate::process::ChildStdout>,
     /// The uuid the opening prompt was written with.
     first_command: String,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,

@@ -850,7 +850,7 @@ fn spawn_app_server(exe: &Path, request: &RunRequest) -> Result<AppServer, Harne
     if let Some(stderr) = child.stderr.take() {
         let tail = stderr_tail.clone();
         tokio::spawn(async move {
-            let mut lines = tokio::io::BufReader::new(stderr).lines();
+            let mut lines = crate::lossy_lines::lossy_lines(stderr);
             while let Ok(Some(line)) = lines.next_line().await {
                 tracing::debug!(target: "zeron_harness::codex", "stderr: {line}");
                 tail.push(&line);

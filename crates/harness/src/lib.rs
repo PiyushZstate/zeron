@@ -301,6 +301,7 @@ pub mod cursor;
 pub(crate) mod executable;
 pub mod install;
 pub(crate) mod jsonrpc;
+pub(crate) mod lossy_lines;
 pub mod mock;
 mod model_context;
 pub mod opencode;

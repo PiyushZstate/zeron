@@ -149,7 +149,7 @@ impl PiHarness {
             .transpose()?;
         let mut child = Child::new(cmd.spawn()?);
         let tail = crate::StderrTail::default();
-        let mut lines = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
+        let mut lines = crate::lossy_lines::lossy_lines(child.stderr.take().expect("piped stderr"));
         let stderr = tail.clone();
         let stderr_task = tokio::spawn(async move {
             while let Ok(Some(line)) = lines.next_line().await {

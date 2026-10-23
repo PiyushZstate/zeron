@@ -212,6 +212,38 @@ fn variant_to_level(id: &str) -> Option<ReasoningLevel> {
     }
 }
 
+/// Startup retries for a server that exited on a transient fault (a locked
+/// database, a port claimed between our release and its bind), backing off
+/// linearly from [`SPAWN_RETRY_DELAY`].
+const SPAWN_RETRIES: u32 = 4;
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Oldest release the 1.x wire is verified against; older servers may never
+/// answer a health probe this driver knows.
+const TESTED_SINCE: &str = "1.14";
+
+enum SpawnFailure {
+    /// Launching again can succeed.
+    Retryable(HarnessError),
+    Fatal(HarnessError),
+}
+
+/// opencode's report of its shared SQLite database held by another process.
+fn is_database_locked(line: &str) -> bool {
+    let line = line.to_ascii_lowercase();
+    line.contains("database is locked") || line.contains("sqlite_busy")
+}
+
+/// The port we picked was claimed before the server bound it.
+fn is_address_in_use(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("eaddrinuse")
+        || text.contains("address already in use")
+        || text.contains("failed to start server. is port")
+        // WSAEADDRINUSE's message.
+        || text.contains("only one usage of each socket address")
+}
+
 /// A kernel-assigned free localhost port, released for the child to claim.
 fn free_localhost_port() -> Option<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -556,12 +588,27 @@ impl Protocol {
     /// Probe newest to oldest. A version-bearing JSON response distinguishes
     /// the API from web UI catch-alls; `None` means the server is still booting.
     async fn detect(server: &Server) -> Result<Option<Self>, HarnessError> {
-        for (path, protocol) in [
+        Self::detect_preferring(server, None).await
+    }
+
+    /// [`Self::detect`], probing `preferred`'s endpoints first. Every probe of
+    /// the other generation hits the web UI catch-all (which 1.x proxies
+    /// upstream), and while the port is still closed each costs a refused
+    /// loopback connect — about 2s on Windows, which retries the SYN.
+    async fn detect_preferring(
+        server: &Server,
+        preferred: Option<Protocol>,
+    ) -> Result<Option<Self>, HarnessError> {
+        let mut probes = [
             ("/api/info", Protocol::V2),
             ("/api/status", Protocol::V2),
             ("/api/health", Protocol::V2),
             ("/global/health", Protocol::V1),
-        ] {
+        ];
+        if preferred == Some(Protocol::V1) {
+            probes.rotate_right(1);
+        }
+        for (path, protocol) in probes {
             let Ok(resp) = server.get_raw(path).await else {
                 continue;
             };
@@ -633,6 +680,13 @@ impl Server {
     /// password, and wait for a generation-bearing health answer (which
     /// also resolves [`Protocol`]). `run_env` is the host-resolved run
     /// environment ([`RunRequest::env`]).
+    ///
+    /// Every opencode process shares one SQLite database; a server booting
+    /// while another migrates or checkpoints it can exit with "database is
+    /// locked" (more often on Windows, whose file locks are mandatory and
+    /// whose malware scan holds new WAL files). That exit alone is retried,
+    /// and on a fresh port, which also covers the port race inherent in
+    /// handing a released port to the child.
     async fn spawn_with_env(
         exe: &std::path::Path,
         cwd: Option<&str>,
@@ -640,38 +694,74 @@ impl Server {
         mcp: Option<&zeron_proto::McpServer>,
         run_env: &std::collections::BTreeMap<String, String>,
     ) -> Result<Self, HarnessError> {
+        // Known up front (cached per binary): it picks the MCP config shape
+        // and which health endpoints to probe first.
+        let version = opencode_version(exe).await;
+        let mut attempt = 0;
+        loop {
+            match Self::spawn_once(exe, cwd, startup, mcp, run_env, version.as_ref()).await {
+                Err(SpawnFailure::Retryable(error)) if attempt < SPAWN_RETRIES => {
+                    attempt += 1;
+                    tracing::warn!(
+                        target: "zeron_harness::opencode",
+                        attempt,
+                        %error,
+                        "opencode serve exited at startup on a transient fault; retrying"
+                    );
+                    tokio::time::sleep(SPAWN_RETRY_DELAY * attempt).await;
+                }
+                Err(SpawnFailure::Retryable(error) | SpawnFailure::Fatal(error)) => {
+                    return Err(error);
+                }
+                Ok(server) => return Ok(server),
+            }
+        }
+    }
+
+    async fn spawn_once(
+        exe: &std::path::Path,
+        cwd: Option<&str>,
+        startup: Duration,
+        mcp: Option<&zeron_proto::McpServer>,
+        run_env: &std::collections::BTreeMap<String, String>,
+        version: Option<&semver::Version>,
+    ) -> Result<Self, SpawnFailure> {
+        let fatal = SpawnFailure::Fatal;
         let port = free_localhost_port().ok_or_else(|| {
-            HarnessError::Protocol("no free localhost port for opencode serve".into())
+            fatal(HarnessError::Protocol(
+                "no free localhost port for opencode serve".into(),
+            ))
         })?;
         let password = uuid::Uuid::new_v4().to_string();
+        let preferred = version.map(|v| {
+            if v.major >= 2 {
+                Protocol::V2
+            } else {
+                Protocol::V1
+            }
+        });
         let mut cmd = Command::new(exe);
         cmd.arg("serve")
             .arg("--port")
             .arg(port.to_string())
             .arg("--hostname")
-            .arg("127.0.0.1")
-            // 2.x prefers OPENCODE_PASSWORD over the legacy name; a user's
-            // own value would otherwise lock us out of our server (401).
-            .env("OPENCODE_PASSWORD", &password)
-            .env("OPENCODE_SERVER_PASSWORD", &password)
-            .env("OPENCODE_CLIENT", "zeron");
+            .arg("127.0.0.1");
+        crate::compose_child_path(&mut cmd, exe);
+        crate::apply_run_env(&mut cmd, run_env);
         if let Some(mcp) = mcp {
             // The config shape differs by generation. If even the cold probe
             // can't tell, run without the Zeron MCP server rather than fail.
-            match opencode_version(exe).await {
-                Some(version) => {
-                    let protocol = if version.major >= 2 {
-                        Protocol::V2
-                    } else {
-                        Protocol::V1
-                    };
+            match preferred {
+                Some(protocol) => {
+                    // Set after the run env, merging into its inline config
+                    // (the user's layer for this run) rather than replacing it.
+                    let inherited = run_env
+                        .get("OPENCODE_CONFIG_CONTENT")
+                        .cloned()
+                        .or_else(|| std::env::var("OPENCODE_CONFIG_CONTENT").ok());
                     cmd.env(
                         "OPENCODE_CONFIG_CONTENT",
-                        mcp_config(
-                            std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
-                            mcp,
-                            protocol,
-                        )?,
+                        mcp_config(inherited.as_deref(), mcp, protocol).map_err(fatal)?,
                     );
                 }
                 None => tracing::warn!(
@@ -680,30 +770,66 @@ impl Server {
                 ),
             }
         }
-        crate::compose_child_path(&mut cmd, exe);
-        crate::apply_run_env(&mut cmd, run_env);
-        if let Some(cwd) = cwd {
-            cmd.current_dir(cwd);
+        // Ours win over anything inherited: 2.x prefers OPENCODE_PASSWORD
+        // over the legacy name, and a user's own value (or username) would
+        // otherwise lock us out of our own server (401).
+        cmd.env("OPENCODE_PASSWORD", &password)
+            .env("OPENCODE_SERVER_PASSWORD", &password)
+            .env("OPENCODE_SERVER_USERNAME", "opencode")
+            .env("OPENCODE_CLIENT", "zeron");
+        // Probes have no project: run them from home, where the global
+        // config lives, never the engine's own working directory (which for
+        // a GUI or service launch can be System32 or the install folder).
+        match cwd {
+            Some(cwd) => {
+                cmd.current_dir(cwd);
+            }
+            None => {
+                if let Some(home) = crate::executable::home_dir().filter(|h| h.is_dir()) {
+                    cmd.current_dir(home);
+                }
+            }
         }
         cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+            fatal(if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(crate::executable::binary_hint(exe))
             } else {
                 HarnessError::Io(e)
-            }
+            })
         })?;
         let stderr_tail = crate::StderrTail::default();
+        let db_locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Some(stderr) = child.stderr.take() {
             let tail = stderr_tail.clone();
+            let db_locked = db_locked.clone();
             tokio::spawn(async move {
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                let mut lines = crate::lossy_lines::lossy_lines(stderr);
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::debug!(target: "zeron_harness::opencode", "stderr: {line}");
+                    if is_database_locked(&line) {
+                        db_locked.store(true, std::sync::atomic::Ordering::Release);
+                    }
                     tail.push(&line);
+                }
+                tail.close();
+            });
+        }
+        // stdout announces the bound port; it is drained for the process's
+        // whole life, since a full pipe would block the server's next write.
+        let listening = Arc::new(tokio::sync::Notify::new());
+        if let Some(stdout) = child.stdout.take() {
+            let listening = listening.clone();
+            tokio::spawn(async move {
+                let mut lines = crate::lossy_lines::lossy_lines(stdout);
+                while let Ok(Some(line)) = lines.next_line().await {
+                    tracing::debug!(target: "zeron_harness::opencode", "stdout: {line}");
+                    if line.to_ascii_lowercase().contains("server listening on") {
+                        listening.notify_one();
+                    }
                 }
             });
         }
@@ -731,17 +857,30 @@ impl Server {
             if let Some(child) = server.child.as_mut()
                 && let Ok(Some(status)) = child.try_wait()
             {
-                return Err(HarnessError::Protocol(crate::crash_message(
+                server.stderr_tail.wait_closed().await;
+                let error = HarnessError::Protocol(crate::crash_message(
                     "opencode serve",
                     Some(status),
                     &server.stderr_tail,
-                )));
+                ));
+                return Err(
+                    if db_locked.load(std::sync::atomic::Ordering::Acquire)
+                        || server
+                            .stderr_tail
+                            .snapshot()
+                            .is_some_and(|tail| is_address_in_use(&tail))
+                    {
+                        SpawnFailure::Retryable(error)
+                    } else {
+                        fatal(error)
+                    },
+                );
             }
-            let detected = match Protocol::detect(&server).await {
+            let detected = match Protocol::detect_preferring(&server, preferred).await {
                 Ok(detected) => detected,
                 Err(error) => {
                     server.shutdown(Duration::from_secs(1)).await;
-                    return Err(error);
+                    return Err(fatal(error));
                 }
             };
             if let Some(protocol) = detected {
@@ -754,14 +893,21 @@ impl Server {
             }
             if tokio::time::Instant::now() >= deadline {
                 server.shutdown(Duration::from_secs(1)).await;
-                return Err(HarnessError::Protocol(format!(
-                    "opencode serve did not become healthy within {}s (raise {} if this \
-                     machine's plugin load is genuinely slow)",
+                let version = version.map_or_else(|| "unknown".to_owned(), |v| v.to_string());
+                return Err(fatal(HarnessError::Protocol(format!(
+                    "opencode serve (version {version}) did not become healthy within {}s. \
+                     If this opencode is older than {TESTED_SINCE}, update it; otherwise \
+                     raise {} if this machine's plugin load is genuinely slow",
                     startup.as_secs(),
                     STARTUP_TIMEOUT_ENV,
-                )));
+                ))));
             }
-            tokio::time::sleep(HEALTH_POLL).await;
+            // The listening line means the port is bound: probe right away
+            // rather than finishing the poll interval.
+            tokio::select! {
+                _ = tokio::time::sleep(HEALTH_POLL) => {}
+                _ = listening.notified() => {}
+            }
         }
         Ok(server)
     }

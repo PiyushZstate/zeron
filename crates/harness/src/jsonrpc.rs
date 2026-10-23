@@ -270,7 +270,7 @@ async fn read_loop(
     observer: Option<StdoutObserver>,
     voice_router: Arc<Mutex<Option<VoiceRouter>>>,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
+    let mut lines = crate::lossy_lines::lossy_lines(stdout);
     // A read error ends the loop like EOF: either way the child's stdout is
     // unusable, pending requests must fail, and the session loop must know.
     while let Ok(Some(line)) = lines.next_line().await {
