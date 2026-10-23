@@ -200,10 +200,17 @@ impl DeviceLogin {
                     Ok(Inbound::Notification { method, params })
                         if method == "account/loginCompleted" =>
                     {
+                        tracing::info!(target: "zeron_harness::muse", outcome = ?params.get("outcome"), message = ?params.get("message"), "Muse sign-in completed");
                         return Ok(params);
                     }
+                    Ok(Inbound::Notification { method, .. }) => {
+                        tracing::info!(target: "zeron_harness::muse", %method, "Muse sign-in host notification");
+                    }
                     Ok(_) => {}
-                    Err(error) => return Err(error.to_string()),
+                    Err(error) => {
+                        tracing::warn!(target: "zeron_harness::muse", %error, stderr = ?host.tail.snapshot(), "Muse sign-in host failed");
+                        return Err(error.to_string());
+                    }
                 }
             }
         })

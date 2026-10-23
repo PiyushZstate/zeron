@@ -215,6 +215,7 @@ impl AgentAccounts {
             }
         };
         let url = login.verification_url.clone();
+        tracing::info!(%pending, %url, "Muse sign-in started");
         let state = std::sync::Arc::new(std::sync::Mutex::new(TaskLoginState {
             url: Some(url.clone()),
             message: Some(format!("Enter the code {} on Meta.", login.user_code)),
@@ -227,6 +228,10 @@ impl AgentAccounts {
                 Ok(account) => this.adopt_muse_login(&pending, account).await,
                 Err(reason) => Err(EngineError::Other(reason)),
             };
+            match &outcome {
+                Ok(()) => tracing::info!(%pending, "Muse sign-in adopted"),
+                Err(error) => tracing::warn!(%pending, %error, "Muse sign-in failed"),
+            }
             if outcome.is_err()
                 && let Ok(home) = this.muse_home(&pending)
             {
@@ -703,6 +708,45 @@ for line in sys.stdin:
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
         accounts.cancel_login(&start.login_id);
+    }
+
+    /// Signs in for real through the engine (approve the printed code):
+    /// `MUSE_LIVE_BIN=~/.local/bin/muse cargo test -p zeron-engine --lib
+    /// live_muse_sign_in_is_adopted -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_muse_sign_in_is_adopted_once_approved() {
+        let Some(bin) = std::env::var_os("MUSE_LIVE_BIN") else {
+            return;
+        };
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let tmp = tempfile::tempdir().unwrap();
+        let config = super::super::AgentAccountsConfig::isolated(&tmp.path().join("root"));
+        let accounts = AgentAccounts::new(config);
+        accounts.override_cli(HarnessId::Muse, PathBuf::from(bin));
+        let start = accounts.start_login(HarnessId::Muse).await.unwrap();
+        println!("\n>>> Open {}\n", start.url);
+        for _ in 0..900 {
+            let poll = accounts.poll_login(&start.login_id).await.unwrap();
+            if poll.status != zeron_proto::AgentLoginStatus::Pending {
+                println!("finished: {:?} {:?}", poll.status, poll.message);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let rows: Vec<_> = accounts
+            .list(false)
+            .await
+            .unwrap()
+            .accounts
+            .into_iter()
+            .filter(|a| a.harness == HarnessId::Muse)
+            .collect();
+        println!("accounts: {rows:?}");
+        for row in &rows {
+            accounts.forget(HarnessId::Muse, &row.id).await.unwrap();
+        }
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]

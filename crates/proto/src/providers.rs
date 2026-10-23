@@ -63,10 +63,6 @@ pub fn provider_note(harness: HarnessId) -> Option<&'static str> {
             "Hermes manages its own credential pool and rotates through it. Accounts added \
              here go through `hermes auth add`; remove one with `hermes auth remove`.",
         ),
-        HarnessId::Muse => Some(
-            "Zeron keeps each Muse account added here as its own login, so you can switch \
-             between them. With none selected, Muse uses its own login (`muse login`).",
-        ),
         _ => None,
     }
 }
