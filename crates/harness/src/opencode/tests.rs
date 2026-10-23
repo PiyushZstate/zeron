@@ -2824,3 +2824,89 @@ fn windows_directories_encode_like_encode_uri_component() {
     );
     assert_eq!(encode_directory(r"\\srv\share"), "%5C%5Csrv%5Cshare");
 }
+
+/// A server that dies mid-turn is noticed within the process poll, with its
+/// own stderr, not after the bus burns its reconnect budget.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_server_crash_mid_turn_settles_promptly_with_its_stderr() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let exe = fixture.path().join("opencode");
+    let script = r#"#!/usr/bin/env node
+const http = require('node:http');
+if (process.argv.includes('--version')) { console.log('1.18.31'); process.exit(0); }
+const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
+http.createServer((req, res) => {
+  const json = (body, status = 200) => {
+    res.writeHead(status, {'content-type': 'application/json'}); res.end(JSON.stringify(body));
+  };
+  const path = req.url.split('?')[0];
+  if (path === '/global/health') return json({healthy: true, version: '1.18.31'});
+  if (path === '/global/event') {
+    res.writeHead(200, {'content-type': 'text/event-stream'});
+    res.write('data: {"payload":{"type":"server.connected","properties":{}}}\n\n');
+    return;
+  }
+  if (path === '/session' && req.method === 'POST') return json({id: 'ses_crash'});
+  if (path === '/provider') return json({all: [], connected: []});
+  if (path === '/command') return json([]);
+  if (path.endsWith('/prompt_async')) {
+    res.writeHead(204); res.end();
+    setTimeout(() => { console.error('fatal: provider bootstrap exploded'); process.exit(7); }, 100);
+    return;
+  }
+  json({});
+}).listen(port, '127.0.0.1', () => console.log(`opencode server listening on http://127.0.0.1:${port}`));
+"#;
+    std::fs::write(&exe, script).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (steer_tx, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
+        request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
+        steering,
+        interrupt: tokio_util::sync::CancellationToken::new(),
+        turn: Default::default(),
+    };
+    let request: RunRequest = serde_json::from_value(json!({
+        "prompt": "hi", "cwd": fixture.path().to_str().unwrap(),
+        "sandbox": "workspace-write", "autoApprove": true,
+    }))
+    .unwrap();
+    let harness = OpencodeHarness::new()
+        .with_executable(&exe)
+        .with_graces(Duration::from_millis(100), Duration::from_millis(100));
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let start = tokio::time::Instant::now();
+    let (error, done) = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut error = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::Error { message } => error = Some(message),
+                AgentEvent::Done {
+                    status,
+                    error: done,
+                    ..
+                } => return (error, (status, done)),
+                _ => {}
+            }
+        }
+        panic!("stream ended without Done");
+    })
+    .await
+    .unwrap();
+    // The bus alone would take 40 reconnects (10s+, far longer on Windows).
+    assert!(
+        start.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(done.0, DoneStatus::Errored);
+    let message = done.1.unwrap();
+    assert!(message.contains("exited unexpectedly"), "{message}");
+    assert!(message.contains("provider bootstrap exploded"), "{message}");
+    assert_eq!(error.as_deref(), Some(message.as_str()));
+    drop(steer_tx);
+}

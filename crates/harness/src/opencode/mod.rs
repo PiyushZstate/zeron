@@ -51,7 +51,8 @@
 //! [`RETRY_ABORT_ATTEMPT`] aborts the turn instead of retrying forever.
 //! A prompt that produces NO session-scoped event within
 //! [`default_stall_bound`] (`ZERON_OPENCODE_STALL_MS`, 0 disables) errors
-//! out instead of spinning "Working" forever.
+//! out instead of spinning "Working" forever. A server process that dies
+//! is noticed within [`SERVER_POLL`].
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -101,6 +102,11 @@ const BUS_RECONNECT_ATTEMPTS: u32 = 40;
 /// event every 10s (1.14.17 through 1.18.31), 2.x a `: heartbeat` comment
 /// every 15s (2.1.2); both verified live.
 const BUS_SILENCE: Duration = Duration::from_secs(45);
+
+/// How often the run checks that its own server process is still alive. A
+/// crash otherwise surfaces only once the bus exhausts its reconnects, and
+/// each refused loopback connect costs about 2s on Windows.
+const SERVER_POLL: Duration = Duration::from_millis(500);
 
 /// Budget for aborting a stopped turn's subagent sessions.
 const CHILD_ABORT_BUDGET: Duration = Duration::from_secs(15);
@@ -1160,6 +1166,11 @@ impl Server {
         }
     }
 
+    /// The process exit, once our own server has died.
+    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.as_mut()?.try_wait().ok().flatten()
+    }
+
     /// Abort `known` subagent sessions after their root was stopped. Only
     /// foreground subagents end with their parent; a background one keeps
     /// running (and spending) on a server a stopped turn leaves up. 1.x also
@@ -1972,6 +1983,8 @@ async fn run_session(session: Session) {
         return;
     }
     let mut turn = TurnState::begin(stall);
+    let mut server_poll = tokio::time::interval(SERVER_POLL);
+    server_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // ---- main loop --------------------------------------------------------
     let mut main_feed = SessionFeed::default();
@@ -2164,6 +2177,44 @@ async fn run_session(session: Session) {
         }};
     }
 
+    // The server is gone: it exited (`Some` status), or its bus could not be
+    // revived. Settle everything still open — the turn as errored unless it
+    // was being interrupted — and end the run, so the next message starts a
+    // fresh server rather than failing against a dead port. Between turns
+    // the Done still carries the crash message, never a later transport
+    // error.
+    macro_rules! settle_lost_server {
+        ($label:lifetime, $status:expr) => {{
+            let message = crate::crash_message("opencode serve", $status, &server.stderr_tail);
+            if turn.active {
+                let _ = send(
+                    &event_tx,
+                    AgentEvent::Error {
+                        message: message.clone(),
+                    },
+                )
+                .await;
+            }
+            settle_children(&mut children, &event_tx, DoneStatus::Interrupted).await;
+            let _ = send(
+                &event_tx,
+                AgentEvent::Done {
+                    status: if interrupt_requested {
+                        DoneStatus::Interrupted
+                    } else {
+                        DoneStatus::Errored
+                    },
+                    result: None,
+                    error: (!interrupt_requested).then_some(message),
+                    session_id: Some(session_id.clone()),
+                },
+            )
+            .await;
+            done_sent = true;
+            break $label;
+        }};
+    }
+
     // After the root is aborted (stop or interrupt), its subagent sessions
     // go too; detached, so the turn settles on the root's own idle.
     macro_rules! abort_children {
@@ -2332,6 +2383,12 @@ async fn run_session(session: Session) {
                             });
                             maybe_preempt!();
                         } else {
+                            // A server that died since the last turn reports
+                            // its crash, not this prompt's refused connect.
+                            if let Some(status) = server.exited() {
+                                server.stderr_tail.wait_closed().await;
+                                settle_lost_server!('main, Some(status));
+                            }
                             turn_generation = turn_generation.wrapping_add(1);
                             // Between turns: the engine routes the next message
                             // of a parked session here — images included.
@@ -2479,31 +2536,11 @@ async fn run_session(session: Session) {
                         }
                     }
                     BusMsg::Disconnected => {
-                        let crashed = match server.child.as_mut() {
-                            Some(child) => child.try_wait().ok().flatten(),
-                            None => None,
-                        };
-                        let message = crate::crash_message(
-                            "opencode serve",
-                            crashed,
-                            &server.stderr_tail,
-                        );
-                        if turn.active {
-                            let _ = send(&event_tx, AgentEvent::Error { message: message.clone() }).await;
+                        let crashed = server.exited();
+                        if crashed.is_some() {
+                            server.stderr_tail.wait_closed().await;
                         }
-                        settle_children(&mut children, &event_tx, DoneStatus::Interrupted).await;
-                        let _ = send(&event_tx, AgentEvent::Done {
-                            status: if interrupt_requested {
-                                DoneStatus::Interrupted
-                            } else {
-                                DoneStatus::Errored
-                            },
-                            result: None,
-                            error: (!interrupt_requested).then_some(message),
-                            session_id: Some(session_id.clone()),
-                        }).await;
-                        done_sent = true;
-                        break 'main;
+                        settle_lost_server!('main, crashed);
                     }
                     BusMsg::Event(event) => {
                         if interrupt_requested || stopping {
@@ -2552,6 +2589,15 @@ async fn run_session(session: Session) {
                             }
                         }
                     }
+                }
+            }
+
+            // Last, so frames the server wrote before dying are handled
+            // before its crash ends the run.
+            _ = server_poll.tick(), if server.child.is_some() => {
+                if let Some(status) = server.exited() {
+                    server.stderr_tail.wait_closed().await;
+                    settle_lost_server!('main, Some(status));
                 }
             }
         }
