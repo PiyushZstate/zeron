@@ -172,12 +172,14 @@ mod tests {
         let (_peer_writer, reader) = tokio::io::duplex(4096);
         let transport = super::super::rpc::Transport::new(writer, reader);
         let (bridge, mut requests) = tokio::sync::mpsc::unbounded_channel();
-        let mut dialogs = Dialogs::default();
-        dialogs.input = Some(Arc::new(move |_| {
-            let (tx, rx) = oneshot::channel();
-            bridge.send(tx).unwrap();
-            rx
-        }));
+        let mut dialogs = Dialogs {
+            input: Some(Arc::new(move |_| {
+                let (tx, rx) = oneshot::channel();
+                bridge.send(tx).unwrap();
+                rx
+            })),
+            ..Default::default()
+        };
         let mut lines = BufReader::new(peer).lines();
         dialogs.request(
             transport.client.clone(),
