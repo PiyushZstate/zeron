@@ -240,6 +240,10 @@ impl FakeOpencode {
                 Value::Object(self.statuses.lock().unwrap().clone()),
             ),
             ("GET", "/session/ses_resume") => ("200 OK", json!({ "id": "ses_resume" })),
+            ("GET", "/session/ses_test/children") => (
+                "200 OK",
+                json!([{ "id": "ses_listed", "parentID": "ses_test" }]),
+            ),
             ("GET", p) if p.starts_with("/session/") => ("404 Not Found", json!({})),
             ("POST", p) if p.ends_with("/prompt_async") => ("204 No Content", json!({})),
             ("POST", p) if p.ends_with("/abort") && *self.fail_aborts.lock().unwrap() => (
@@ -765,6 +769,49 @@ async fn an_acknowledged_stop_drops_late_output_and_keeps_the_session() {
             ..
         })
     ));
+}
+
+/// A stop keeps the server up for the next prompt, so subagents must not
+/// outlive it: a background one does not end with its parent. Every child
+/// the bus announced is aborted, and so is any the server lists.
+#[tokio::test]
+async fn a_stop_aborts_the_turns_subagent_sessions() {
+    let fake = FakeOpencode::start().await;
+    let (mut stream, _steer, turn) = stoppable_turn(&fake, harness(&fake)).await;
+    fake.emit(json!({
+        "type": "session.created",
+        "properties": { "info": {
+            "id": "ses_child", "parentID": "ses_test", "title": "scan (@explore subagent)",
+        }},
+    }));
+    // A text frame after it proves the child was seen before the stop.
+    fake.emit(json!({
+        "type": "message.part.updated",
+        "properties": { "part": {
+            "id": "prt_t", "messageID": "msg_1", "sessionID": "ses_test",
+            "type": "text", "text": "working on",
+        }},
+    }));
+    assert_eq!(
+        next_event(&mut stream).await,
+        AgentEvent::TextDelta { text: " on".into() }
+    );
+    turn.stop_turn();
+    wait_posts(&fake, "/session/ses_test/abort", 1).await;
+    wait_posts(&fake, "/session/ses_child/abort", 1).await;
+    wait_posts(&fake, "/session/ses_listed/abort", 1).await;
+    idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
 }
 
 #[tokio::test]

@@ -102,6 +102,9 @@ const BUS_RECONNECT_ATTEMPTS: u32 = 40;
 /// every 15s (2.1.2); both verified live.
 const BUS_SILENCE: Duration = Duration::from_secs(45);
 
+/// Budget for aborting a stopped turn's subagent sessions.
+const CHILD_ABORT_BUDGET: Duration = Duration::from_secs(15);
+
 /// Provider-retry surfacing: report at 3 (a chip; the turn keeps trying),
 /// abort at 8 (opencode itself would retry forever — #169's silent loop).
 const RETRY_REPORT_ATTEMPT: u64 = 3;
@@ -1143,6 +1146,57 @@ impl Server {
             .await
             .map(|_| ())
     }
+
+    /// The same server for a detached task (no process ownership).
+    fn handle(&self) -> Server {
+        Server {
+            child: None,
+            base: self.base.clone(),
+            auth: self.auth.clone(),
+            client: self.client.clone(),
+            stderr_tail: crate::StderrTail::default(),
+            protocol: self.protocol.clone(),
+            version: self.version.clone(),
+        }
+    }
+
+    /// Abort `known` subagent sessions after their root was stopped. Only
+    /// foreground subagents end with their parent; a background one keeps
+    /// running (and spending) on a server a stopped turn leaves up. 1.x also
+    /// lists the root's children, covering any whose creation the bus
+    /// missed. Bounded; failures (an already-idle or vanished child) are
+    /// ignored.
+    async fn abort_children(&self, root: &str, mut known: Vec<String>, dir: Option<&str>) {
+        let work = async {
+            if self.protocol().await == Protocol::V1
+                && let Ok(listed) = self
+                    .get_json(&format!("/session/{root}/children"), dir)
+                    .await
+            {
+                known.extend(
+                    listed
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|child| child.get("id").and_then(Value::as_str))
+                        .map(str::to_owned),
+                );
+            }
+            known.sort();
+            known.dedup();
+            futures::future::join_all(known.iter().map(|child| self.abort_session(child, dir)))
+                .await;
+        };
+        if tokio::time::timeout(CHILD_ABORT_BUDGET, work)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                target: "zeron_harness::opencode",
+                "aborting subagent sessions timed out"
+            );
+        }
+    }
 }
 
 fn http_client() -> reqwest::Client {
@@ -2110,6 +2164,24 @@ async fn run_session(session: Session) {
         }};
     }
 
+    // After the root is aborted (stop or interrupt), its subagent sessions
+    // go too; detached, so the turn settles on the root's own idle.
+    macro_rules! abort_children {
+        () => {{
+            let known: Vec<String> = children
+                .keys()
+                .chain(unbound_children.keys())
+                .cloned()
+                .collect();
+            let handle = server.handle();
+            let root = session_id.clone();
+            let dir = directory.clone();
+            tokio::spawn(async move {
+                handle.abort_children(&root, known, dir.as_deref()).await;
+            });
+        }};
+    }
+
     'main: loop {
         // The stall watchdog only arms while a turn awaits its first sign of
         // life; a running tool's silence never trips it (events already
@@ -2147,6 +2219,7 @@ async fn run_session(session: Session) {
                     .await;
                     if matches!(abort, Ok(Ok(_))) {
                         abort_deadline = Some(tokio::time::Instant::now() + interrupt_grace);
+                        abort_children!();
                     } else {
                         // The turn may still be running: this session must
                         // never take a prompt on top of it.
@@ -2196,6 +2269,7 @@ async fn run_session(session: Session) {
                     // live runner) — the settle path below finishes up. The
                     // grace guards a server that never delivers it.
                     abort_deadline = Some(tokio::time::Instant::now() + interrupt_grace);
+                    abort_children!();
                 } else {
                     let _ = send(&event_tx, AgentEvent::Done {
                         status: DoneStatus::Interrupted,
