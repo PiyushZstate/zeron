@@ -64,6 +64,27 @@ impl DocsStore {
         Ok(())
     }
 
+    /// Record rows as stored without queueing them (a host adopting rows an
+    /// earlier host already put in the room).
+    pub fn chat3_mark_published(&self, doc_id: &str, rows: &[(f64, i64, u64)]) -> Result<(), StoreError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        {
+            let mut mark = tx.prepare(
+                "INSERT INTO chat3_items (doc_id, ord, idx, hash) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(doc_id, ord, idx) DO UPDATE SET hash = excluded.hash",
+            )?;
+            for (ord, idx, hash) in rows {
+                mark.execute(params![doc_id, ord, idx, *hash as i64])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The oldest queued rows (key order: headers before their parts), up to
     /// `max_bytes` of payload but always at least one.
     pub fn chat3_pending(&self, doc_id: &str, max_bytes: usize) -> Result<Vec<OutboxItem>, StoreError> {
@@ -136,6 +157,18 @@ impl DocsStore {
                 "SELECT part, bytes FROM chat3_outputs WHERE doc_id = ?1 ORDER BY part LIMIT 1",
                 params![doc_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// A queued (not yet uploaded) output for one part.
+    pub fn chat3_next_output_for(&self, doc_id: &str, part: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT bytes FROM chat3_outputs WHERE doc_id = ?1 AND part = ?2",
+                params![doc_id, part],
+                |row| row.get(0),
             )
             .optional()?)
     }

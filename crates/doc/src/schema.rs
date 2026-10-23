@@ -995,11 +995,21 @@ impl SessionDoc {
 }
 
 /// The `ord` for an entry about to be inserted at list position `at`
-/// (docs/chat3-sync.md): `last + 1` at the end, the midpoint between its
-/// neighbours otherwise. Written once and never moved, so a transcript-plane
-/// row's key is stable for its whole life. Entries without an `ord` (written
-/// before the split) count as their list position.
+/// (docs/chat3-sync.md). Appends take `max(last + 1, now_ms)`: a wall-clock
+/// floor means a host whose local transcript is behind the room (a moved or
+/// restored host) still appends AFTER every existing row instead of reusing
+/// one's key, so it never has to block on catching up first. The
+/// provider-switch seam's insert takes the midpoint of its neighbours.
+/// Written once and never moved, so a row's key is stable for its whole life.
 fn ord_between(messages: &LoroList, at: usize) -> f64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0);
+    ord_between_at(messages, at, now)
+}
+
+fn ord_between_at(messages: &LoroList, at: usize, now: f64) -> f64 {
     let ord_at = |index: usize| match messages.get(index) {
         Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => entry_ord(&map),
         _ => None,
@@ -1007,7 +1017,7 @@ fn ord_between(messages: &LoroList, at: usize) -> f64 {
     .unwrap_or(index as f64 + 1.0);
     let before = if at == 0 { 0.0 } else { ord_at(at - 1) };
     if at >= messages.len() {
-        before + 1.0
+        (before + 1.0).max(now)
     } else {
         (before + ord_at(at)) / 2.0
     }

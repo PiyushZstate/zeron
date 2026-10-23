@@ -30,6 +30,7 @@ use crate::schema::{
 /// so a viewer who joins after the room restarted mid-part still sees it.
 pub const DURABLE_MS: i64 = 15_000;
 
+
 /// A row key. `idx = -1` is the entry header.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ItemKey {
@@ -95,6 +96,10 @@ pub struct Live {
     pub key: ItemKey,
     pub entry: String,
     pub op: LiveOp,
+    /// A `Part` frame carries its entry's header row JSON, so a reader that
+    /// hasn't received the stored header yet (it travels by HTTP, live frames
+    /// by socket) can still place the part.
+    pub header: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +186,35 @@ impl Publisher {
         }
     }
 
+    /// After a host pulls rows an earlier host wrote: re-examine the whole
+    /// doc and count the `pulled` keys as stored (the room has them).
+    /// Returns what still needs uploading — rows this host wrote but never
+    /// got out — and the adopted hashes to persist.
+    pub fn adopt(
+        &mut self,
+        doc: &SessionDoc,
+        pulled: &std::collections::HashSet<(u64, i64)>,
+        now_ms: i64,
+    ) -> (Vec<Publication>, Vec<((u64, i64), u64)>) {
+        self.mark_all();
+        let mut upload = Vec::new();
+        let mut adopted = Vec::new();
+        for publication in self.collect(doc, now_ms) {
+            match publication {
+                Publication::Store(item) if pulled.contains(&item.key.bits()) => {
+                    adopted.push((item.key.bits(), item.hash()));
+                }
+                other => upload.push(other),
+            }
+        }
+        (upload, adopted)
+    }
+
+    /// Whether this host has stored the row at `key`.
+    pub fn knows(&self, key: &ItemKey) -> bool {
+        self.known.contains_key(&key.bits())
+    }
+
     /// True when a collect would have something to look at.
     pub fn is_dirty(&self) -> bool {
         self.rescan || !self.dirty.is_empty()
@@ -246,6 +280,9 @@ impl Publisher {
             let idx = track.parts.len() as i64;
             track.parts.push(PartTrack {
                 stored: self.known.get(&ItemKey { ord, idx }.bits()).copied(),
+                // The durability clock starts when the part appears: its
+                // first copy is due DURABLE_MS later, not on its first tick.
+                stored_at: now_ms,
                 ..PartTrack::default()
             });
         }
@@ -279,8 +316,12 @@ impl Publisher {
             let from = if fresh { 0 } else { parts_len.saturating_sub(1) };
             let prior = track.parts.iter().position(|p| p.stored.is_none()).unwrap_or(parts_len);
             examine.extend(from.min(prior)..parts_len);
-            if let Some(last) = parts_len.checked_sub(2) {
-                examine.insert(last);
+            // Parts appended after a live part end its streaming: every part
+            // still held live is re-examined so it settles.
+            for (ix, part) in track.parts.iter().enumerate() {
+                if part.live_len.is_some() || part.live_hash.is_some() {
+                    examine.insert(ix);
+                }
             }
         }
         if settling {
@@ -291,6 +332,7 @@ impl Publisher {
             }
         }
         let Some(parts) = parts else { return };
+        let header_json = serde_json::to_vec(&header).unwrap_or_default();
         for ix in examine.into_iter().filter(|ix| *ix < parts_len) {
             let Some(value) = parts.get(ix) else { continue };
             let json_value = value.get_deep_value().to_json_value();
@@ -325,6 +367,7 @@ impl Publisher {
                         key,
                         entry: id.clone(),
                         op: LiveOp::Part(json),
+                        header: Some(header_json.clone()),
                     });
                 }
             } else if live_text {
@@ -339,6 +382,7 @@ impl Publisher {
                                 at: sent,
                                 text: body[sent..].to_owned(),
                             },
+                            header: None,
                         });
                         part.live_len = Some(body.len());
                     }
@@ -348,6 +392,7 @@ impl Publisher {
                             key,
                             entry: id.clone(),
                             op: LiveOp::Part(json.clone()),
+                            header: Some(header_json.clone()),
                         });
                         part.live_len = Some(body.len());
                     }
@@ -444,6 +489,19 @@ impl Reader {
         }
     }
 
+    /// Advance the feed cursor without applying anything (a host whose own
+    /// uploads were the only rows written).
+    pub fn note_head_rev(doc: &SessionDoc, rev: u64) -> Result<(), DocError> {
+        let mut cursor = Self::cursor(doc);
+        if rev <= cursor.head_rev {
+            return Ok(());
+        }
+        cursor.head_rev = rev;
+        Self::save_cursor(doc, &cursor)?;
+        doc.transcript_doc().commit();
+        Ok(())
+    }
+
     fn save_cursor(doc: &SessionDoc, cursor: &PlaneCursor) -> Result<(), DocError> {
         let plane = doc.transcript_doc().get_map("plane");
         plane.insert("headRev", cursor.head_rev as i64)?;
@@ -468,7 +526,7 @@ impl Reader {
         older: bool,
     ) -> Result<usize, DocError> {
         let mut cursor = Self::cursor(doc);
-        let first = items.iter().map(|i| i.key).min_by(|a, b| a.cmp_key(b));
+        let first = page_start(items);
         let extends = first.is_some_and(|f| cursor.oldest.is_none_or(|o| f.cmp_key(&o).is_lt()));
         if extends {
             cursor.oldest = first;
@@ -566,6 +624,19 @@ impl Reader {
     /// may not shorten a body or reopen a resolved tool.
     pub fn apply_live(&mut self, doc: &SessionDoc, live: &Live) -> Result<bool, DocError> {
         let messages = doc.transcript_doc().get_list("messages");
+        if find_entry(&messages, &live.entry).is_none()
+            && let Some(header) = &live.header
+        {
+            // The stored header hasn't arrived yet: place the entry from the
+            // copy the frame carries (the stored row refreshes it later).
+            let row = ReceivedItem {
+                key: ItemKey::header(live.key.ord),
+                entry: live.entry.clone(),
+                rev: 0,
+                json: header.clone(),
+            };
+            upsert_header(&messages, &row)?;
+        }
         let Some(map) = find_entry(&messages, &live.entry) else {
             return Ok(false);
         };
@@ -622,6 +693,19 @@ impl Reader {
             doc.transcript_doc().commit();
         }
         Ok(changed)
+    }
+}
+
+/// The first row a page covers. When the window starts inside an entry the
+/// room prepends that entry's header so its parts can render; the header is
+/// outside the window, and taking it as the oldest row would make the next
+/// page skip the rest of that entry.
+fn page_start(items: &[ReceivedItem]) -> Option<ItemKey> {
+    let mut keys: Vec<ItemKey> = items.iter().map(|i| i.key).collect();
+    keys.sort_by(|a, b| a.cmp_key(b));
+    match (keys.first(), keys.get(1)) {
+        (Some(header), Some(next)) if header.idx == -1 && next.ord == header.ord && next.idx > 0 => Some(*next),
+        (first, _) => first.copied(),
     }
 }
 
@@ -1128,6 +1212,84 @@ mod tests {
         old.json = br#"{"id":"t0","kind":"text","text":"He"}"#.to_vec();
         reader.apply_feed(&viewer, &[old], None, false).unwrap();
         assert_eq!(viewer.read_entries().unwrap(), host.doc.read_entries().unwrap());
+    }
+
+    #[test]
+    fn a_host_that_moved_appends_after_rows_it_never_saw() {
+        // Host A writes a turn; the chat moves to host B, whose local
+        // transcript is empty (it hasn't paged history in yet).
+        let a = Host::new(HashMap::new());
+        for i in 0..3 {
+            a.doc.push_message(&user(&format!("a{i}"), "on host A")).unwrap();
+        }
+        let mut room = Room::default();
+        room.take(&a.collect(0));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = Host::new(HashMap::new());
+        b.doc.push_message(&user("b0", "on host B")).unwrap();
+        let (stored, _) = room.take(&b.collect(0));
+        let a_max = room
+            .rows
+            .iter()
+            .filter(|r| r.entry.starts_with('a'))
+            .map(|r| r.key.ord)
+            .fold(f64::MIN, f64::max);
+        assert!(stored.iter().all(|r| r.key.ord > a_max), "no key reused, order kept");
+        // A reader sees A's history then B's message.
+        let viewer = SessionDoc::init_split("chat").unwrap();
+        let mut reader = Reader::default();
+        reader.apply_page(&viewer, &room.sorted(), false, room.rev, false).unwrap();
+        let ids: Vec<String> = viewer.read_entries().unwrap().into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["a0", "a1", "a2", "b0"]);
+    }
+
+    #[test]
+    fn a_live_part_settles_even_when_two_parts_land_after_it_at_once() {
+        let host = Host::new(HashMap::new());
+        let mut room = Room::default();
+        let mut writer = SegmentWriter::begin(&host.doc, "a1", "host", 1).unwrap();
+        let mut body = String::from("streaming");
+        writer.sync(&[text("t0", &body)]).unwrap();
+        room.take(&host.collect(0));
+        // Long enough for a durability copy of the live part.
+        body.push_str(" more");
+        writer.sync(&[text("t0", &body)]).unwrap();
+        let (stored, _) = room.take(&host.collect(DURABLE_MS + 1));
+        assert!(stored.iter().any(|r| r.key.idx == 0), "durability copy");
+        // One commit appends a tool AND a text part after it.
+        body.push_str(" final");
+        writer
+            .sync(&[text("t0", &body), tool("c1", true, Some("ok")), text("t1", "next")])
+            .unwrap();
+        room.take(&host.collect(DURABLE_MS + 200));
+        let t0 = room.rows.iter().find(|r| r.key.idx == 0).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&t0.json).unwrap();
+        assert_eq!(value["text"], body.as_str(), "the old live part settled with its final text");
+    }
+
+    #[test]
+    fn live_frames_alone_carry_a_stream_before_its_header_row_arrives() {
+        let host = Host::new(HashMap::new());
+        let viewer = SessionDoc::init_split("chat").unwrap();
+        let mut reader = Reader::default();
+        let mut writer = SegmentWriter::begin(&host.doc, "a1", "host", 1).unwrap();
+        let mut body = String::new();
+        for i in 0..20 {
+            body.push_str(&format!("t{i} "));
+            writer.sync(&[text("t0", &body)]).unwrap();
+            // Stored rows (the header) are withheld: live frames travel by
+            // socket and can beat them.
+            for publication in host.collect(i * 120) {
+                if let Publication::Live(live) = publication {
+                    reader.apply_live(&viewer, &live).unwrap();
+                }
+            }
+        }
+        assert_eq!(
+            viewer.read_entries().unwrap()[0].parts,
+            vec![text("t0", &body)],
+            "the part frame's header placed the entry"
+        );
     }
 
     #[test]

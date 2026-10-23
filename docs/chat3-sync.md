@@ -1,6 +1,6 @@
 # chat3: a transcript plane beside the chat2 log
 
-Status: IN PROGRESS · Flag: `preferences/labs.chat3` (per user, synced) · Room gen: 3
+Status: BEHIND A FLAG · Flag: `preferences/labs.chat3` (per user, synced; `zeron labs chat3 on`) · Room gen: 3
 Prior art: `docs/chat2-sync.md` (the relay this keeps), `docs/registry-sync.md`.
 
 ## Why
@@ -62,10 +62,13 @@ Each item is one row keyed by `(ord, idx)`:
 - `idx ≥ 0` is **part `idx`** of that entry, as its doc JSON (the same shape
   `read_entries` decodes).
 
-`ord` is the entry's position, a float the host assigns once when the entry is created
-(`last + 1` for appends, the midpoint for the provider-switch seam's
-`insert_message_before_last`). It is stored on the local entry map and never changes,
-so a row's key is stable for its whole life.
+`ord` is the entry's position, a float the host assigns once when the entry is created:
+`max(last + 1, now_ms)` for appends, the midpoint of its neighbours for the
+provider-switch seam's `insert_message_before_last`. The wall-clock floor means a host
+whose local transcript is behind the room (a moved or restored host that hasn't paged
+history in yet) still appends after every existing row instead of reusing a key, so it
+never has to block on catching up. The `ord` is stored on the local entry map and never
+changes, so a row's key is stable for its whole life.
 
 Rows are upserts. Each write takes the next `rev` (a room-wide counter, indexed), which
 is the change feed readers resume from.
@@ -92,9 +95,12 @@ outbox; a dropped live frame only delays text until the part settles.
 `live{entry, ord, idx, op}`: `op: "part"` carries the full part JSON; `op: "append"`
 carries `at` (the UTF-8 length the sender had before) and the appended text. The room
 relays them to other sockets and keeps the current open parts in memory (bounded) so a
-viewer who joins mid-stream gets them after its backfill. Nothing is written. A stored
-row for the same key drops the live copy. A reader applies an `append` only when `at`
-matches its local length; otherwise it waits for the next `part` frame or stored row.
+viewer who joins mid-stream gets them with its next read. Nothing is written. A stored
+row for the same key drops the live copy. A `part` frame also carries its entry's
+header row, because live frames ride the socket and can beat the stored header (which
+the host uploads by HTTP). A reader applies an `append` only when `at` matches its
+local length; one that doesn't line up asks for a feed catch-up, whose response
+replays the room's copy of the open part.
 
 ### Pagination
 
@@ -106,9 +112,9 @@ on desktop, `load_earlier` on mobile). A reader keeps `partBase` on an entry it 
 holds the tail of, so partially loaded entries render their loaded parts. Updates to
 rows older than the loaded window are ignored; paging returns their current version.
 
-A host that does not hold the whole transcript (a moved or restored host) pages
-everything in before it runs anything that needs history (resume, fork, provider
-switch replay).
+A host pulls the change feed in the background when it joins and adopts rows an
+earlier host wrote (recorded as stored, never re-sent); it uploads only what it wrote
+itself. Because of the `ord` floor this never gates running a command.
 
 ### Tool outputs
 
@@ -119,11 +125,15 @@ switch replay).
 - gen 2 is unchanged: the fold still keeps outputs out of the doc, and output deltas
   are not journaled.
 - gen 3: while a tool runs, its part carries the last lines of output (local doc only,
-  streamed as `part` live frames). On `ToolResult` the host PUTs the full text to
-  `/chat3/{id}/outputs/{partId}` and the part settles with the one-line summary,
-  `outputBytes` and `outputRef = chat3:{chatId}/{partId}`. The desktop's existing
-  "Show full output (N KB)" affordance fetches it through `FetchToolBlob`, which routes
-  `chat3:` refs to the room.
+  streamed as `part` live frames — viewers watch a build scroll). On `ToolResult` the
+  host queues the full text (durable local outbox) for `/chat3/{id}/outputs/{partId}`
+  and the part settles with the one-line summary, `outputBytes` and
+  `outputRef = chat3:{chatId}/{partId}`. The desktop's existing "Show full output
+  (N KB)" affordance fetches it through `FetchToolBlob`, which routes `chat3:` refs to
+  the room (or to the host's own queue if it hasn't uploaded yet). iOS gets the live
+  tail and `SessionHandle.toolOutput`; its full-output viewer is a follow-up.
+- Outputs are not in the nightly R2 backup (they are large and re-derivable on the
+  host); transcript rows are.
 
 Outputs live in the user's owner-only room, the same trust boundary as the transcript.
 Tool *inputs* keep their existing `sanitize_tool_call` strip.
@@ -133,10 +143,16 @@ Tool *inputs* keep their existing `sanitize_tool_call` strip.
 - `preferences/labs` registry row, field `chat3: bool`. It syncs to every device of the
   user. Only chat minting reads it: a new chat is born gen 3 when it is on. Turning it
   off affects new chats only; gen-3 chats stay gen 3.
-- **Old apps read `roomGen >= 2` as chat2.** This release teaches every client the exact
-  generations it knows and shows "update to view" for newer ones. Enable the flag for a
-  user only once all their apps run this release, or an old app will dial an empty chat2
-  room for a gen-3 chat.
+- Switch it with `zeron labs chat3 on|off` (or the `SetLabsFlag` RPC). Mint sites in the
+  engine (`CreateChat`, forks) and the app client read it. A device that opens a chat
+  before its registry row has synced assumes the flag's generation (a subagent doc, its
+  parent chat's); if the row later disagrees, the handle is replaced on the row's
+  generation and an empty assumed-generation doc is set aside with a rollback copy.
+- **Old apps read `roomGen >= 2` as chat2.** This release makes every client exact about
+  the generations it knows (`MAX_KNOWN_ROOM_GEN = 3`) and opens newer ones read-only from
+  local state instead of dialing the wrong room. Enable the flag for a user only once all
+  their apps run this release, or an old app will dial an empty chat2 room for a gen-3
+  chat.
 - No migration of existing chats in this change. gen-2 chats keep working untouched.
 
 ## Edge
@@ -161,15 +177,60 @@ PRIMARY KEY(part, chunk))`.
 Both generations meter their own SQL (`rowsWritten`/`rowsRead` from each cursor, the
 numbers Cloudflare bills) and report them in `/stats`.
 
+## Clients
+
+- Desktop: the engine serves a gen-3 transcript through the same `WatchDocMessages`
+  stream, plus `historyMore`; the transcript shows a "Load earlier messages" pill while
+  scrolled to its first row (`FetchEarlierMessages`).
+- iOS: the client crate reads gen-3 chats (split local doc, pages, feed, live frames);
+  the Rust layout puts a "Load earlier messages" row first while older history exists
+  and Swift answers its `load-earlier` action.
+
 ## Proving the cost
 
-`edge/test/workerd/chat3-cost.workerd.test.ts` replays the same recorded turn traces
-into a gen-2 and a gen-3 room on real DO SQLite and compares the metered rows written,
-stored bytes, and cold-open bytes. The traces come from
-`crates/engine/examples/chat3_trace.rs`, which runs a real run journal through the real
-fold, `SegmentWriter` and gen-3 publisher on a virtual clock. Results are recorded in
-"Measured" below.
+`crates/doc/examples/chat3_trace.rs` replays agent events through the real fold,
+`SegmentWriter`, both doc layouts and the gen-3 publisher on a virtual clock (deltas
+30 ms apart, tools 2.5 s, a 2 KB output stored per tool — chat2 stores none), and writes
+what each generation sends its room. `edge/test/workerd/chat3-cost.workerd.test.ts`
+replays those traces into a real gen-2 and a real gen-3 `ChatRoom` on DO SQLite and
+reads what each was billed — the rooms meter their own SQL with the runtime's
+`rowsWritten`/`rowsRead` — and what a cold open downloads. The recorded workload is
+this feature's own build session with every text replaced by same-length filler
+(`edge/test/workerd/fixtures/chat3-cost-traces.json` holds only ids, sizes and hashes).
+
+Regenerate with
+`cargo run -p zeron-doc --example chat3_trace -- <journal.jsonl> > edge/test/workerd/fixtures/chat3-cost-traces.json`.
 
 ## Measured
 
-_Filled in from the benchmark when it runs._
+Rows written are what Cloudflare bills ($1.00 per million past the plan's 50 M).
+
+| Workload | Length | chat2 rows written | chat3 rows written | chat3 / chat2 |
+|---|---|---|---|---|
+| Recorded session (50 entries, 787 parts, 378 tools) | 28 min | 40,341 | 3,318 | 8.2% |
+| One long answer (reasoning + text, no tools) | 3 min | 9,034 | 71 | 0.8% |
+| Tool-heavy turn (80 shell commands) | 4 min | 2,874 | 607 | 21% |
+
+| Workload | chat2 cold open | chat3 cold open | chat2 stored | chat3 stored |
+|---|---|---|---|---|
+| Recorded session | 297.6 KB | 117.5 KB | 295.7 KB | 1,212.0 KB |
+| One long answer | 63.7 KB | 62.6 KB | 58.0 KB | 62.0 KB |
+| Tool-heavy turn | 39.7 KB | 37.3 KB | 35.1 KB | 187.1 KB |
+
+- Writes: chat2 pays ~6 rows per streamed commit (row + `batch_id` index + `headSeq`,
+  `backupDirty`, `pushOutcomes`, plus checkpoint deletes); chat3 pays ~2 per stored row
+  (row + `rev` index), and stores rows per part. The tool-heavy turn is chat3's worst
+  case: every tool part is stored twice (when it starts, when it resolves) and its output
+  once — work chat2 never did.
+- Cold open: chat3 downloads the newest page and the small state doc; chat2 the whole
+  checkpoint. The gap grows with the chat: at 28 minutes it is already 61% less, and a
+  page stays ~120 KB however long the chat runs. (A cold open can read more rows on
+  chat3 — a page is 200 rows — at a thousandth of a write's price.)
+- Stored bytes grow on chat3 because it now keeps full tool outputs (378 × 2 KB here),
+  which chat2 dropped. Storage is $0.20/GB-month; rows written dominate.
+- In dollars at $1 per million rows: the recorded session bills ~86k rows (~$0.086) per
+  hour of agent work on chat2 and ~7k (~$0.007) on chat3.
+- chat2's busiest minute held 472–504 pushes from one device in the streaming
+  workloads — past its 300-a-minute per-device quota, so today a long stream gets
+  throttled into head-only retries and viewers lag. chat3 streams on live frames, which
+  the quota never sees.

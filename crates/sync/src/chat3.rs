@@ -7,12 +7,20 @@
 //! change feed come back the same way from `GET /items`, the `/rows` body
 //! encoding. Live frames ride the chat's existing socket.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, Weak};
+
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use zeron_doc::transcript_plane::{Item, ItemKey, Live, LiveOp, ReceivedItem};
+use tokio::sync::Notify;
+use zeron_doc::SessionDoc;
+use zeron_doc::transcript_plane::{Item, ItemKey, Live, LiveOp, Reader, ReceivedItem};
 
 use crate::SyncError;
 use crate::chat_frames::{self as wire, frame_type};
+
+/// Rows per page: about a screen and a half of a busy turn.
+pub const PAGE_LIMIT: usize = 200;
 
 /// `GET/POST /chat3/{id}/items` and `GET/PUT /chat3/{id}/outputs/{part}`.
 /// Engine and app clients implement it over their own HTTP stacks.
@@ -49,6 +57,10 @@ struct LiveHeader {
     op: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     at: Option<usize>,
+    /// A `part` frame's entry header row (JSON object), for readers that
+    /// haven't received the stored one yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    head: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -85,6 +97,9 @@ pub struct PostResult {
     pub idx: Option<i64>,
     #[serde(default)]
     pub rev: Option<u64>,
+    /// False for an identical rewrite the room skipped.
+    #[serde(default)]
+    pub changed: Option<bool>,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -145,6 +160,7 @@ pub fn encode_live(live: &Live) -> Vec<u8> {
             idx: live.key.idx,
             op: op.into(),
             at,
+            head: live.header.as_ref().and_then(|h| serde_json::from_slice(h).ok()),
         },
         &payload,
     )
@@ -167,6 +183,7 @@ pub fn decode_live(header: &serde_json::Value, payload: &[u8]) -> Option<Live> {
         },
         entry: header.entry,
         op,
+        header: header.head.and_then(|h| serde_json::to_vec(&h).ok()),
     })
 }
 
@@ -238,6 +255,171 @@ pub fn valid_part_id(part: &str) -> bool {
         && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:#~-".contains(&b))
 }
 
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn doc_error(err: zeron_doc::DocError) -> SyncError {
+    SyncError::Protocol(format!("transcript apply: {err}"))
+}
+
+/// The reader half of a gen-3 chat, shared by the engine and the app client:
+/// pages the newest history in, follows the change feed, applies relayed
+/// rows and live frames, pages older history on request.
+///
+/// Callers hold the doc WEAKLY across awaits (a strong ref reads as a live
+/// writer to the engine's LRU) and pass the lock their transcript publisher
+/// reads under, so a publish never sees a half-applied page.
+pub struct ReaderPlane {
+    reader: Mutex<Reader>,
+    /// A relayed row skipped revs: run the change feed.
+    pub catch_up: Notify,
+    reading: tokio::sync::Mutex<()>,
+    import_lock: Arc<Mutex<()>>,
+}
+
+impl ReaderPlane {
+    pub fn new(import_lock: Arc<Mutex<()>>) -> Self {
+        Self {
+            reader: Mutex::new(Reader::default()),
+            catch_up: Notify::new(),
+            reading: tokio::sync::Mutex::new(()),
+            import_lock,
+        }
+    }
+
+    /// A transcript frame relayed on the chat's socket. Returns true when
+    /// the doc changed.
+    pub fn apply_frame(&self, doc: &SessionDoc, kind: u8, header: &serde_json::Value, payload: &[u8]) -> bool {
+        match kind {
+            frame_type::ITEM => {
+                let Some(item) = decode_item(header, payload) else {
+                    return false;
+                };
+                let _import = lock(&self.import_lock);
+                let head = Reader::cursor(doc).head_rev;
+                if item.rev > head + 1 {
+                    // Rows between were missed (a relay outran the feed): the
+                    // feed fetches them all, this one included.
+                    self.catch_up.notify_one();
+                    return false;
+                }
+                lock(&self.reader)
+                    .apply_feed(doc, &[item], None, false)
+                    .map(|n| n > 0)
+                    .unwrap_or(false)
+            }
+            frame_type::LIVE => {
+                let Some(live) = decode_live(header, payload) else {
+                    return false;
+                };
+                let _import = lock(&self.import_lock);
+                let applied = lock(&self.reader).apply_live(doc, &live).unwrap_or(false);
+                if !applied && matches!(live.op, LiveOp::Append { .. }) {
+                    // An append that doesn't line up: a frame was missed (or
+                    // this viewer joined mid-part). The room replays the
+                    // open part's frames on every read, so a feed catch-up
+                    // rebuilds it.
+                    self.catch_up.notify_one();
+                }
+                applied
+            }
+            _ => false,
+        }
+    }
+
+    /// The newest page for a transcript that never held one, else the change
+    /// feed from its last rev. Safe to call repeatedly.
+    pub async fn catch_up(&self, doc: &Weak<SessionDoc>, transport: &dyn TranscriptTransport) -> Result<(), SyncError> {
+        let _reading = self.reading.lock().await;
+        let cursor = {
+            let Some(doc) = doc.upgrade() else { return Ok(()) };
+            Reader::cursor(&doc)
+        };
+        if cursor.head_rev == 0 && cursor.oldest.is_none() {
+            let body = transport.fetch_items(page_query(None, PAGE_LIMIT)).await?;
+            let response = decode_items_body(&body);
+            let Some(doc) = doc.upgrade() else { return Ok(()) };
+            let max_rev = response.items.iter().map(|i| i.rev).max().unwrap_or(0);
+            let (more, head) = response.done.map_or((true, max_rev), |d| (d.more, d.head_rev));
+            let _import = lock(&self.import_lock);
+            let mut reader = lock(&self.reader);
+            reader.apply_page(&doc, &response.items, more, head, false).map_err(doc_error)?;
+            for live in &response.live {
+                let _ = reader.apply_live(&doc, live);
+            }
+            if response.done.is_some() {
+                return Ok(());
+            }
+        }
+        self.feed_locked(doc, transport, |_| true).await.map(|_| ())
+    }
+
+    /// Follow the change feed to the head, applying only rows `keep` accepts
+    /// (a host keeps rows it did not write). Returns the keys applied.
+    pub async fn feed(
+        &self,
+        doc: &Weak<SessionDoc>,
+        transport: &dyn TranscriptTransport,
+        keep: impl Fn(&ItemKey) -> bool,
+    ) -> Result<HashSet<(u64, i64)>, SyncError> {
+        let _reading = self.reading.lock().await;
+        self.feed_locked(doc, transport, keep).await
+    }
+
+    async fn feed_locked(
+        &self,
+        doc: &Weak<SessionDoc>,
+        transport: &dyn TranscriptTransport,
+        keep: impl Fn(&ItemKey) -> bool,
+    ) -> Result<HashSet<(u64, i64)>, SyncError> {
+        let mut applied = HashSet::new();
+        loop {
+            let since = {
+                let Some(doc) = doc.upgrade() else { return Ok(applied) };
+                Reader::cursor(&doc).head_rev
+            };
+            let body = transport.fetch_items(feed_query(since)).await?;
+            let response = decode_items_body(&body);
+            let Some(doc) = doc.upgrade() else { return Ok(applied) };
+            let max_rev = response.items.iter().map(|i| i.rev).max().unwrap_or(since);
+            let rows: Vec<_> = response.items.iter().filter(|i| keep(&i.key)).cloned().collect();
+            applied.extend(rows.iter().map(|i| i.key.bits()));
+            let head = response.done.map(|d| d.head_rev).unwrap_or(max_rev);
+            let _import = lock(&self.import_lock);
+            let mut reader = lock(&self.reader);
+            reader.apply_feed(&doc, &rows, Some(head), true).map_err(doc_error)?;
+            for live in &response.live {
+                let _ = reader.apply_live(&doc, live);
+            }
+            if response.done.is_some() || max_rev <= since {
+                return Ok(applied);
+            }
+        }
+    }
+
+    /// The page before the oldest row held. Returns whether older rows remain.
+    pub async fn load_earlier(&self, doc: &Weak<SessionDoc>, transport: &dyn TranscriptTransport) -> Result<bool, SyncError> {
+        let _reading = self.reading.lock().await;
+        let cursor = {
+            let Some(doc) = doc.upgrade() else { return Ok(false) };
+            Reader::cursor(&doc)
+        };
+        if !cursor.more_before {
+            return Ok(false);
+        }
+        let body = transport.fetch_items(page_query(cursor.oldest, PAGE_LIMIT)).await?;
+        let response = decode_items_body(&body);
+        let Some(doc) = doc.upgrade() else { return Ok(false) };
+        let more = response.done.map_or(true, |d| d.more);
+        let _import = lock(&self.import_lock);
+        lock(&self.reader)
+            .apply_page(&doc, &response.items, more, 0, true)
+            .map_err(doc_error)?;
+        Ok(Reader::cursor(&doc).more_before)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +453,7 @@ mod tests {
                 key: ItemKey { ord: 2.0, idx: 0 },
                 entry: "e".into(),
                 op,
+                header: Some(br#"{"id":"e","role":"assistant"}"#.to_vec()),
             };
             let frame = wire::decode(&encode_live(&live)).unwrap();
             assert_eq!(frame.kind, frame_type::LIVE);
@@ -292,6 +475,7 @@ mod tests {
                 at: 0,
                 text: "x".into(),
             },
+            header: None,
         });
         let done = wire::encode(frame_type::ITEMS_DONE, &serde_json::json!({"headRev": 9, "more": true}), &[]);
         let body = length_prefixed(&[item, live, done]);
@@ -303,6 +487,26 @@ mod tests {
         // Truncated at the cap: no done frame.
         let truncated = decode_items_body(&body[..body.len() - 10]);
         assert_eq!(truncated.done, None);
+    }
+
+    #[test]
+    fn an_append_that_does_not_line_up_asks_for_a_catch_up() {
+        let doc = SessionDoc::init_split("chat").unwrap();
+        let plane = ReaderPlane::new(Arc::new(Mutex::new(())));
+        let frame = wire::decode(&encode_live(&Live {
+            key: ItemKey { ord: 1.0, idx: 0 },
+            entry: "e1".into(),
+            op: LiveOp::Append { at: 10, text: "late".into() },
+            header: None,
+        }))
+        .unwrap();
+        assert!(!plane.apply_frame(&doc, frame.kind, &frame.header, &frame.payload));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(100), plane.catch_up.notified())
+                .await
+                .expect("a missed append requests the feed");
+        });
     }
 
     #[test]
