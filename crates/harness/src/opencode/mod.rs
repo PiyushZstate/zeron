@@ -62,7 +62,6 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
-use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -802,16 +801,18 @@ impl Server {
             })
         })?;
         let stderr_tail = crate::StderrTail::default();
-        let db_locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Matched per line: the tail keeps only the last few, and Node prints
+        // the EADDRINUSE message above a stack trace that scrolls it out.
+        let transient = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Some(stderr) = child.stderr.take() {
             let tail = stderr_tail.clone();
-            let db_locked = db_locked.clone();
+            let transient = transient.clone();
             tokio::spawn(async move {
                 let mut lines = crate::lossy_lines::lossy_lines(stderr);
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::debug!(target: "zeron_harness::opencode", "stderr: {line}");
-                    if is_database_locked(&line) {
-                        db_locked.store(true, std::sync::atomic::Ordering::Release);
+                    if is_database_locked(&line) || is_address_in_use(&line) {
+                        transient.store(true, std::sync::atomic::Ordering::Release);
                     }
                     tail.push(&line);
                 }
@@ -863,18 +864,11 @@ impl Server {
                     Some(status),
                     &server.stderr_tail,
                 ));
-                return Err(
-                    if db_locked.load(std::sync::atomic::Ordering::Acquire)
-                        || server
-                            .stderr_tail
-                            .snapshot()
-                            .is_some_and(|tail| is_address_in_use(&tail))
-                    {
-                        SpawnFailure::Retryable(error)
-                    } else {
-                        fatal(error)
-                    },
-                );
+                return Err(if transient.load(std::sync::atomic::Ordering::Acquire) {
+                    SpawnFailure::Retryable(error)
+                } else {
+                    fatal(error)
+                });
             }
             let detected = match Protocol::detect_preferring(&server, preferred).await {
                 Ok(detected) => detected,
@@ -4871,6 +4865,40 @@ http.createServer((req, res) => {{
                 json!(["/path with spaces/zeron", "mcp"])
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_retries_a_port_taken_before_bind() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let exe = fixture.path().join("opencode");
+        // The first launch loses the port race the way Node reports it: the
+        // EADDRINUSE line, then more stack than the stderr tail keeps.
+        let script = r#"#!/usr/bin/env node
+const fs = require('node:fs');
+const http = require('node:http');
+if (process.argv.includes('--version')) { console.log('1.14.0'); process.exit(0); }
+const raced = require('node:path').join(__dirname, 'raced');
+if (!fs.existsSync(raced)) {
+  fs.writeFileSync(raced, '');
+  console.error('Error: listen EADDRINUSE: address already in use 127.0.0.1:1');
+  for (let i = 0; i < 12; i++) console.error(`    at frame${i} (node:net:${i})`);
+  process.exit(1);
+}
+const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
+http.createServer((req, res) => {
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({version: '1.14.0'}));
+}).listen(port, '127.0.0.1', () => console.log(`opencode server listening on http://127.0.0.1:${port}`));
+"#;
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut server = Server::spawn(&exe, fixture.path().to_str(), Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        server.shutdown(Duration::from_millis(100)).await;
+        assert!(fixture.path().join("raced").exists());
     }
 
     #[cfg(unix)]

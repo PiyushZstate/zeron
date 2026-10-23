@@ -19,10 +19,7 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    sync::mpsc,
-};
+use tokio::sync::mpsc;
 use zeron_proto::{AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode};
 
 pub struct PiHarness {

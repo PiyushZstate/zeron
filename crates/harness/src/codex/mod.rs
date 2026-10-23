@@ -59,7 +59,6 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Value, json};
-use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
