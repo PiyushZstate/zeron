@@ -36,6 +36,7 @@ use std::sync::OnceLock;
 /// the SSH agent for git over SSH, the locale, and mise's record of the PATH
 /// entries it added (it must travel with the shell's PATH, or `mise x` can
 /// rebuild PATH behind a same-named wrapper that then re-runs itself).
+#[cfg_attr(not(unix), allow(dead_code))]
 const CAPTURED_VARS: [&str; 9] = [
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
@@ -567,18 +568,19 @@ exit 1
                 ),
             );
             let start = Instant::now();
-            // Generous enough for the fallback attempt's first exec of a freshly
-            // written script, which macOS may hold for a malware scan under load.
-            let path = snapshot_path(&shell, Duration::from_secs(1)).unwrap();
+            // Generous enough for the fallback attempt's exec of a freshly
+            // written script: under a full parallel test run that alone has
+            // taken ~2s on macOS.
+            let path = snapshot_path(&shell, Duration::from_secs(3)).unwrap();
             assert!(
                 path.to_string_lossy()
                     .starts_with("/zeron-test/fallback/bin"),
                 "got: {}",
                 path.to_string_lossy()
             );
-            // First attempt burned ~1s then was killed; the whole resolve must
+            // First attempt burned ~3s then was killed; the whole resolve must
             // not have waited out the sleep.
-            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(start.elapsed() < Duration::from_secs(15));
         }
 
         #[test]
