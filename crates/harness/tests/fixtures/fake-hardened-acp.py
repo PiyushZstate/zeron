@@ -107,7 +107,7 @@ for line in sys.stdin:
             say(f"resumed {SID}")
         elif MODE.startswith("auth"):
             say("signed in")
-        elif MODE == "image":
+        elif MODE in ("image", "image-unsupported"):
             kinds = [b.get("mimeType") or b["type"] for b in blocks]
             say(" ".join(kinds))
         elif MODE in ("stop-wedge", "grok-meta"):

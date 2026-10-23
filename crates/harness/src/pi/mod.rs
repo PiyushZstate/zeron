@@ -994,7 +994,8 @@ impl Runner {
 /// Inline attachments as native image blocks, best-effort like the Claude
 /// driver: the path refs already ride the prompt text, so an unreadable,
 /// oversized or non-inlinable file (SVG, HEIC, TIFF, ...) must not fail the turn.
-async fn load_images(paths: &[String]) -> Value {
+/// The blocks are ACP's image content shape, so the ACP driver shares them.
+pub(crate) async fn load_images(paths: &[String]) -> Value {
     use base64::Engine;
     let mut images = vec![];
     for path in paths {

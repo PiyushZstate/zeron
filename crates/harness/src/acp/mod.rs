@@ -3049,12 +3049,12 @@ fn stop_outcome(
 fn prompt_turn(
     client: RpcClient,
     session_id: String,
-    text: String,
+    prompt: &PromptInput,
     prompt_id: Option<String>,
 ) -> BoxFuture<'static, Result<Value, HarnessError>> {
     let mut params = json!({
         "sessionId": session_id,
-        "prompt": [{ "type": "text", "text": text }],
+        "prompt": prompt.blocks(),
     });
     if let Some(id) = prompt_id {
         params["_meta"] = json!({ "promptId": id, "requestId": id });
@@ -3062,6 +3062,49 @@ fn prompt_turn(
     // Written now, not on first poll: a steer's `session/cancel` issued in
     // the same loop iteration must reach the agent after this prompt.
     client.request_now("session/prompt", params)
+}
+
+/// A message bound for the agent: its text plus the image blocks inlined
+/// with it — empty unless the agent advertises `promptCapabilities.image`;
+/// the image paths also ride the text as refs either way.
+#[derive(Clone, Default)]
+struct PromptInput {
+    text: String,
+    images: Vec<Value>,
+}
+
+impl PromptInput {
+    async fn new(text: String, attachments: &[String], inline_images: bool) -> Self {
+        let images = if inline_images && !attachments.is_empty() {
+            match crate::pi::load_images(attachments).await {
+                Value::Array(images) => images,
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        Self { text, images }
+    }
+
+    fn blocks(&self) -> Vec<Value> {
+        std::iter::once(json!({ "type": "text", "text": self.text }))
+            .chain(self.images.iter().cloned())
+            .collect()
+    }
+
+    /// Several queued messages delivered as one prompt.
+    fn join(prompts: impl IntoIterator<Item = PromptInput>) -> Self {
+        let mut texts = Vec::new();
+        let mut images = Vec::new();
+        for prompt in prompts {
+            texts.push(prompt.text);
+            images.extend(prompt.images);
+        }
+        Self {
+            text: texts.join("\n\n"),
+            images,
+        }
+    }
 }
 
 /// Answer a server→client request. Permission requests are auto-accepted with
@@ -3774,11 +3817,11 @@ fn track_open_tools(ev: &AgentEvent, open_tools: &mut std::collections::HashSet<
 fn steering_call_future(
     client: &RpcClient,
     session_id: &str,
-    text: &str,
+    prompt: &PromptInput,
 ) -> BoxFuture<'static, Result<Value, HarnessError>> {
     let params = json!({
         "sessionId": session_id,
-        "prompt": [{ "type": "text", "text": text }],
+        "prompt": prompt.blocks(),
         "_meta": { "steering": { "idleBehavior": "promptRequired" } },
     });
     prompt_like_request(client.clone(), "_session/steering", params)
@@ -4005,6 +4048,8 @@ async fn run_session(session: Session) {
             .await?;
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
+        let inline_images =
+            init["agentCapabilities"]["promptCapabilities"]["image"].as_bool() == Some(true);
 
         // auth_required gets one sign-in and retry; agents that sign in
         // from Settings never start a sign-in mid-chat and point there.
@@ -4055,9 +4100,10 @@ async fn run_session(session: Session) {
             devin_selection.clone(),
         )
         .await?;
-        Ok::<(String, bool, Vec<SlashCommand>, Value), HarnessError>((
+        Ok::<(String, bool, bool, Vec<SlashCommand>, Value), HarnessError>((
             session_id,
             steer_ext,
+            inline_images,
             init_commands,
             session_options,
         ))
@@ -4120,7 +4166,7 @@ async fn run_session(session: Session) {
             }
         }
     };
-    let (session_id, steer_ext, init_commands, mut session_options) = match res {
+    let (session_id, steer_ext, inline_images, init_commands, mut session_options) = match res {
         Ok(v) => v,
         Err(e) => {
             // A child that dies before the handshake used to surface only
@@ -4230,28 +4276,34 @@ async fn run_session(session: Session) {
     };
     let mut prompt_stall_deadline: Option<tokio::time::Instant> =
         prompt_stall.map(|d| tokio::time::Instant::now() + d);
-    // The text of the prompt in flight (re-sent by a preempt when the agent
-    // drops an unstarted cancelled prompt).
-    let mut current_prompt_text = prompt_transform(request.reasoning, &request.prompt);
+    // The prompt in flight (re-sent by a preempt when the agent drops an
+    // unstarted cancelled prompt).
+    let mut current_prompt = PromptInput::new(
+        prompt_transform(request.reasoning, &request.prompt),
+        &request.attachments,
+        inline_images,
+    )
+    .await;
     let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some({
         prompt_turn(
             client.clone(),
             session_id.clone(),
-            current_prompt_text.clone(),
+            &current_prompt,
             current_prompt_id.clone(),
         )
     });
     // Steers waiting for the turn boundary (agents without the extension, or
     // extension steers that lost the turn-end race).
-    let mut queued_steers: VecDeque<String> = VecDeque::new();
+    let mut queued_steers: VecDeque<PromptInput> = VecDeque::new();
     // The in-flight `_session/steering` call (text + response future), plus
     // followers awaiting their turn. Polled from the main select so the loop
     // keeps draining `incoming` while the agent responds — awaiting inline
     // deadlocks against a full incoming channel when the agent floods
     // updates (the reader blocks on the channel and never parses the
     // steering response).
-    let mut steering_call: Option<(String, BoxFuture<'static, Result<Value, HarnessError>>)> = None;
-    let mut steer_backlog: VecDeque<String> = VecDeque::new();
+    let mut steering_call: Option<(PromptInput, BoxFuture<'static, Result<Value, HarnessError>>)> =
+        None;
+    let mut steer_backlog: VecDeque<PromptInput> = VecDeque::new();
     let mut steering_open = true;
     // Immediate steering for agents without a mid-turn steering extension:
     // a steer cancels the current generation (never a running tool — it
@@ -4529,11 +4581,11 @@ async fn run_session(session: Session) {
                 // boundary; otherwise stay alive for the mailbox — the caller
                 // owns teardown (mirrors the codex harness).
                 if !queued_steers.is_empty() {
-                    let mut texts = Vec::with_capacity(queued_steers.len() + 1);
+                    let mut prompts = Vec::with_capacity(queued_steers.len() + 1);
                     if preempted && resend_unstarted && progress_seq != prompt_seq {
-                        texts.push(std::mem::take(&mut current_prompt_text));
+                        prompts.push(std::mem::take(&mut current_prompt));
                     }
-                    while let Some(text) = queued_steers.pop_front() {
+                    while let Some(steer) = queued_steers.pop_front() {
                         let (prev, next) = rotate(&mut assistant_message_id);
                         if !send(
                             &event_tx,
@@ -4546,7 +4598,7 @@ async fn run_session(session: Session) {
                         {
                             break 'main;
                         }
-                        texts.push(text);
+                        prompts.push(steer);
                     }
                     done_current = false;
                     open_tools.clear();
@@ -4556,11 +4608,11 @@ async fn run_session(session: Session) {
                         prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
-                    current_prompt_text = texts.join("\n\n");
+                    current_prompt = PromptInput::join(prompts);
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        current_prompt_text.clone(),
+                        &current_prompt,
                         current_prompt_id.clone(),
                     ));
                 } else if !steering_open {
@@ -4867,11 +4919,11 @@ async fn run_session(session: Session) {
                         prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
-                    current_prompt_text = text.clone();
+                    current_prompt = text;
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        text,
+                        &current_prompt,
                         current_prompt_id.clone(),
                     ));
                 }
@@ -4917,11 +4969,11 @@ async fn run_session(session: Session) {
                         prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
-                    current_prompt_text = text.clone();
+                    current_prompt = text;
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        text,
+                        &current_prompt,
                         current_prompt_id.clone(),
                     ));
                 } else if turn.is_none() && !steering_open {
@@ -4995,11 +5047,11 @@ async fn run_session(session: Session) {
                         prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
-                    current_prompt_text = text.clone();
+                    current_prompt = text;
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        text,
+                        &current_prompt,
                         current_prompt_id.clone(),
                     ));
                 } else if !steering_open {
@@ -5105,11 +5157,16 @@ async fn run_session(session: Session) {
                     }
                     // Same transform as the initial prompt: Claude's
                     // Ultrathink prefix rides every steer too.
-                    let text = prompt_transform(request.reasoning, &msg.prompt);
+                    let prompt = PromptInput::new(
+                        prompt_transform(request.reasoning, &msg.prompt),
+                        &msg.attachments,
+                        inline_images,
+                    )
+                    .await;
                     if turn.is_none() && cancel_flush_deadline.is_some() {
                         // A busy-session cancel is already in flight: this
                         // steer lines up behind it and dispatches at flush.
-                        queued_steers.push_back(text);
+                        queued_steers.push_back(prompt);
                     } else if turn.is_none()
                         && (!open_tools.is_empty()
                             || (last_update_at.elapsed() < BUSY_RECENT
@@ -5125,7 +5182,7 @@ async fn run_session(session: Session) {
                              the unowned turn before prompting"
                         );
                         client.notify("session/cancel", Some(cancel_params(harness, &session_id)));
-                        queued_steers.push_back(text);
+                        queued_steers.push_back(prompt);
                         cancel_flush_deadline =
                             Some(tokio::time::Instant::now() + CANCEL_FLUSH);
                     } else if turn.is_none() {
@@ -5150,11 +5207,11 @@ async fn run_session(session: Session) {
                         prompt_complete_extension.then(|| format!("zeron-p{prompt_seq}"));
                     prompt_stall_deadline =
                         prompt_stall.map(|d| tokio::time::Instant::now() + d);
-                    current_prompt_text = text.clone();
+                    current_prompt = prompt;
                     turn = Some(prompt_turn(
                         client.clone(),
                         session_id.clone(),
-                        text,
+                        &current_prompt,
                         current_prompt_id.clone(),
                     ));
                     } else if steer_ext {
@@ -5163,15 +5220,15 @@ async fn run_session(session: Session) {
                         // select branch. One call in flight at a time;
                         // followers wait in the backlog.
                         if steering_call.is_some() {
-                            steer_backlog.push_back(text);
+                            steer_backlog.push_back(prompt);
                         } else {
-                            let fut = steering_call_future(&client, &session_id, &text);
-                            steering_call = Some((text, fut));
+                            let fut = steering_call_future(&client, &session_id, &prompt);
+                            steering_call = Some((prompt, fut));
                         }
                     } else {
                         // No extension: preempt the generation and continue
                         // the turn with this steer (see `preempt_pending`).
-                        queued_steers.push_back(text);
+                        queued_steers.push_back(prompt);
                         preempt_pending = preempt_steers;
                         if preempt_pending
                             && !preempt_sent

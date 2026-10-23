@@ -273,3 +273,40 @@ async fn resume_uses_the_advertised_restore_method() {
     )));
     assert_eq!(texts(&events), ["resumed old-session"]);
 }
+
+/// An agent advertising image prompts gets attachments as image blocks, on
+/// the first prompt and on later messages alike.
+#[tokio::test]
+async fn attachments_inline_as_image_blocks_when_advertised() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("shot.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\nfake").unwrap();
+    let image = image.display().to_string();
+    let mut req = request("image");
+    req.attachments = vec![image.clone()];
+    let mut run = start(&harness(), req).await;
+    let events = run.until_done().await;
+    assert_eq!(texts(&events), ["text image/png"]);
+    run.steer
+        .send(SteerMessage {
+            attachments: vec![image.clone(), image],
+            ..SteerMessage::text("again")
+        })
+        .await
+        .unwrap();
+    let events = run.until_done().await;
+    assert_eq!(texts(&events), ["text image/png image/png"]);
+}
+
+/// Without the capability the prompt stays a single text block.
+#[tokio::test]
+async fn attachments_stay_path_refs_without_the_image_capability() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("shot.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\nfake").unwrap();
+    let mut req = request("image-unsupported");
+    req.attachments = vec![image.display().to_string()];
+    let mut run = start(&harness(), req).await;
+    let events = run.until_done().await;
+    assert_eq!(texts(&events), ["text"]);
+}
