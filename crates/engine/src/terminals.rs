@@ -2,8 +2,9 @@
 //! zeron's `terminals.ts` over `portable-pty`).
 //!
 //! - `open` spawns the user's login shell in the chat's cwd; `subscribe` replays a
-//!   bounded 1MB window (resumable via `afterSeq`) then tails live output, batched
-//!   at [`TERMINAL_OUTPUT_BATCH_MS`]; data rides base64 (PTY bytes ≠ UTF-8).
+//!   bounded 1MB window (resumable via `afterSeq`) then tails live output — sent
+//!   as soon as it is read, paced at [`TERMINAL_OUTPUT_BATCH_MS`] only while it
+//!   streams; data rides base64 (PTY bytes ≠ UTF-8).
 //! - Live shells survive subscriber detach — a detached session is the user's
 //!   running process, kept until its tab is explicitly closed or the engine exits.
 //!   Only EXITED sessions expire (30min TTL on their inert replay buffers), and
@@ -29,6 +30,7 @@ use tokio::sync::{mpsc, watch};
 use zeron_doc::TERMINAL_OUTPUT_BATCH_MS;
 use zeron_proto::{TerminalActivity, TerminalEvent, TerminalSession};
 
+pub mod link;
 mod program_status;
 use program_status::{ProgramTracker, SUPPORT_REPLY};
 
@@ -65,7 +67,13 @@ struct LiveTerminal {
     /// `pump_output`).
     support_replies: u32,
     support_window: std::time::Instant,
+    /// Highest input seq applied per remote viewer, so input replayed after
+    /// a path change (direct link ↔ relay) is applied exactly once.
+    applied_inputs: HashMap<String, u64>,
 }
+
+/// Remote viewers whose input seqs one terminal remembers.
+const MAX_INPUT_CLIENTS: usize = 16;
 
 /// Program-detection replies one terminal writes per [`SUPPORT_WINDOW`].
 /// Detection needs one per program launch; output that keeps asking faster
@@ -419,10 +427,11 @@ impl Terminals {
             exited: false,
             support_replies: 0,
             support_window: std::time::Instant::now(),
+            applied_inputs: HashMap::new(),
         }));
         lock(&self.inner.sessions).insert(id.clone(), session.clone());
 
-        // Raw PTY bytes: blocking reader thread → batcher task (12ms windows).
+        // Raw PTY bytes: blocking reader thread → batcher task.
         let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let reader_thread = std::thread::Builder::new()
             .name(format!("pty-read-{id}"))
@@ -545,6 +554,36 @@ impl Terminals {
             .map_err(|e| EngineError::Other(format!("Terminal write failed: {e}")))
     }
 
+    /// Write input a remote viewer numbered: applied only if `seq` is newer
+    /// than the last one applied from `client`. Returns whether it was
+    /// applied (a replay of already-applied input is acknowledged, not
+    /// written twice).
+    pub fn write_sequenced(
+        &self,
+        terminal_id: &str,
+        client: &str,
+        seq: u64,
+        bytes: &[u8],
+    ) -> Result<bool, EngineError> {
+        {
+            let session = self.session(terminal_id)?;
+            let mut session = lock(&session);
+            let applied = session.applied_inputs.get(client).copied().unwrap_or(0);
+            if seq <= applied {
+                return Ok(false);
+            }
+            if !session.applied_inputs.contains_key(client)
+                && session.applied_inputs.len() >= MAX_INPUT_CLIENTS
+                && let Some(oldest) = session.applied_inputs.keys().next().cloned()
+            {
+                session.applied_inputs.remove(&oldest);
+            }
+            session.applied_inputs.insert(client.to_owned(), seq);
+        }
+        self.write_bytes(terminal_id, bytes)?;
+        Ok(true)
+    }
+
     pub fn resize(&self, terminal_id: &str, cols: u16, rows: u16) -> Result<(), EngineError> {
         let session = self.session(terminal_id)?;
         let mut session = lock(&session);
@@ -616,7 +655,7 @@ fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) -> bool {
 /// Blocking PTY reader: forwards raw chunks until EOF. A closed PTY reads as an
 /// error on some platforms (EIO on Linux once the shell exits) — both end the loop.
 fn read_pty(mut reader: Box<dyn Read + Send>, tx: mpsc::UnboundedSender<Vec<u8>>) {
-    let mut buf = [0u8; 8192];
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
@@ -632,7 +671,8 @@ fn read_pty(mut reader: Box<dyn Read + Send>, tx: mpsc::UnboundedSender<Vec<u8>>
     }
 }
 
-/// Batches raw chunks into `Data` events every [`TERMINAL_OUTPUT_BATCH_MS`].
+/// Turns raw chunks into `Data` events: immediately after a quiet spell, at
+/// most once per [`TERMINAL_OUTPUT_BATCH_MS`] while output keeps coming.
 /// ConPTY keeps its output pipe open while the pseudoconsole handle is alive, even after
 /// the child exits, so child wait and output reads must be driven concurrently. Once the
 /// child is gone we close the PTY handles, drain its final buffered output, then emit `Exit`.
@@ -681,21 +721,35 @@ async fn pump_output(
         true
     };
 
-    // Start a batch only when output arrives; idle terminals need no timer.
+    // Output that follows a quiet spell (a keystroke's echo) goes out the
+    // moment it is read; only a continuous stream waits out the pacing
+    // interval. Idle terminals need no timer.
     let flush = tokio::time::sleep(batch);
     tokio::pin!(flush);
     let mut buffer = Vec::new();
     let mut raw_open = true;
     let mut exit_code = None;
+    let mut last_emit = tokio::time::Instant::now() - batch;
 
     while raw_open || exit_code.is_none() {
         tokio::select! {
             chunk = raw_rx.recv(), if raw_open => match chunk {
                 Some(chunk) => {
-                    if buffer.is_empty() {
-                        flush.as_mut().reset(tokio::time::Instant::now() + batch);
-                    }
+                    let was_empty = buffer.is_empty();
                     buffer.extend_from_slice(&chunk);
+                    // Whatever the reader already has queued rides along.
+                    while let Ok(more) = raw_rx.try_recv() {
+                        buffer.extend_from_slice(&more);
+                    }
+                    let now = tokio::time::Instant::now();
+                    if now >= last_emit + batch {
+                        last_emit = now;
+                        if !emit(std::mem::take(&mut buffer)) {
+                            return;
+                        }
+                    } else if was_empty {
+                        flush.as_mut().reset(last_emit + batch);
+                    }
                 },
                 None => raw_open = false,
             },
@@ -735,6 +789,7 @@ async fn pump_output(
                 }
             }
             _ = &mut flush, if !buffer.is_empty() => {
+                last_emit = tokio::time::Instant::now();
                 if !emit(std::mem::take(&mut buffer)) {
                     return;
                 }
