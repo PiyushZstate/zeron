@@ -49,6 +49,13 @@ def read_frame():
         return None
     frame = json.loads(line)
     record("inbound.ndjson", frame)
+    params = frame.get("params") or {}
+    # The real host refuses a sticky workspace-root change on a steer (it may
+    # launch no turn to bind it to): fail loudly, as a real run would.
+    if frame.get("method") == "turn/start" and params.get("ifBusy") == "steer" \
+            and "workspaceRoots" in params:
+        sys.stderr.write("Invalid params: workspaceRoots cannot ride ifBusy \"steer\"\n")
+        sys.exit(97)
     return frame
 
 

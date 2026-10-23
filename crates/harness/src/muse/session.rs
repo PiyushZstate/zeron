@@ -358,11 +358,16 @@ impl Runner {
             "commandId": turn,
             "input": input,
             "displayText": if prompt.is_empty() { "Image attachment" } else { prompt },
-            // A resumed session keeps the root it was created with; pin it to
-            // this run's checkout so edits land where Zeron tracks them.
-            "workspaceRoots": [self.root],
             "ifBusy": if_busy,
         });
+        // A resumed session keeps the root it was created with; pin it to
+        // this run's checkout so edits land where Zeron tracks them. The root
+        // is sticky (it binds at this turn and persists), and Muse refuses it
+        // on a steer, which may launch no turn to bind it to: the run's first
+        // prompt carries it, later ones inherit it.
+        if if_busy != "steer" {
+            params["workspaceRoots"] = json!([self.root]);
+        }
         if let Some(effort) = catalog::effort(self.request.reasoning) {
             params["reasoningEffort"] = json!(effort);
         }

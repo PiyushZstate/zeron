@@ -187,7 +187,9 @@ impl Transport {
                     continue;
                 }
                 if !bytes.iter().all(u8::is_ascii_whitespace) {
-                    let frame = serde_json::from_slice::<Value>(&bytes)
+                    // A stray non-UTF-8 byte (raw tool output echoed into a
+                    // frame) costs that character, never the session.
+                    let frame = serde_json::from_str::<Value>(&String::from_utf8_lossy(&bytes))
                         .map_err(|e| HarnessError::Protocol(format!("Invalid Muse JSON: {e}")))
                         .and_then(decode);
                     let failed = frame.is_err();
