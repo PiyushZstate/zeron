@@ -317,7 +317,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         if isMovingFromParent || navigationController == nil {
-            if tabBarController != nil { (splitViewController as? SplitRootController)?.sessionDidClose(chatId) }
+            if mainShell != nil { (splitViewController as? SplitRootController)?.sessionDidClose(chatId) }
             source.detach()
             engine.close()
             app.markSeen(chatId)
@@ -636,7 +636,7 @@ extension UIViewController {
     /// Beside the sidebar the composer rests on the safe area, level with
     /// the sidebar's bottom toolbar; on its own (tab shell, sheet) 8pt up.
     var composerRestGap: CGFloat {
-        guard tabBarController == nil, let split = splitViewController, !split.isCollapsed else { return 8 }
+        guard mainShell == nil, let split = splitViewController, !split.isCollapsed else { return 8 }
         return 0
     }
 }
