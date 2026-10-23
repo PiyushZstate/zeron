@@ -1656,8 +1656,7 @@ mod gate_tests {
         );
     }
 
-    /// Every agent spawn carries the commit-credit hooks while that's on —
-    /// alongside a Cloud environment's own variables.
+    /// Every agent spawn carries the commit-credit hooks while that's on.
     #[tokio::test]
     async fn runs_carry_the_commit_credit_hooks() {
         let data = tempfile::tempdir().unwrap();
@@ -1667,6 +1666,7 @@ mod gate_tests {
         .unwrap();
         let registry = HarnessRegistry::new();
         let credit = Arc::new(crate::commit_credit::CommitCredit::open(data.path(), false));
+        credit.set(true).unwrap();
         registry.set_commit_credit(credit.clone());
         registry
             .prepare_run(HarnessId::ClaudeCode, &mut request)

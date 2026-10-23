@@ -11,7 +11,7 @@
 //! the trailer once that hook passed. Commits made by hand never see it.
 //!
 //! Always on for a Cloud machine (Zeron's own); on a user's device while its
-//! setting is on (the default).
+//! setting is on (off by default: the user's own repositories).
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -64,9 +64,10 @@ struct Stored {
     enabled: bool,
 }
 
+/// Off by default on a user's device: their own repositories.
 impl Default for Stored {
     fn default() -> Self {
-        Self { enabled: true }
+        Self { enabled: false }
     }
 }
 
@@ -266,6 +267,7 @@ mod tests {
         std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let credit = CommitCredit::open(data.path(), false);
+        credit.set(true).unwrap();
         let mut env = BTreeMap::new();
         credit.apply(&mut env);
         assert_eq!(
@@ -326,10 +328,18 @@ mod tests {
     }
 
     #[test]
-    fn the_device_setting_turns_it_off_but_never_on_cloud() {
+    fn the_device_setting_is_off_by_default_and_always_on_for_cloud() {
         let data = tempfile::tempdir().unwrap();
         let credit = CommitCredit::open(data.path(), false);
-        assert!(credit.status().enabled, "on by default");
+        assert!(
+            !credit.status().enabled,
+            "off by default on a user's device"
+        );
+        credit.set(true).unwrap();
+        assert!(
+            CommitCredit::open(data.path(), false).status().enabled,
+            "persisted"
+        );
         credit.set(false).unwrap();
         let mut env = BTreeMap::new();
         credit.apply(&mut env);
