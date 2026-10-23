@@ -45,13 +45,13 @@ pub(crate) const OWN_LOGIN: &str = "muse-own-login";
 /// of a link) are left alone.
 #[cfg(unix)]
 fn mirror_config(real: &Path, root: &Path) -> std::io::Result<()> {
-    fn link_entries(from: &Path, into: &Path, skip: &str) -> std::io::Result<()> {
+    fn link_entries(from: &Path, into: &Path, skip: impl Fn(&str) -> bool) -> std::io::Result<()> {
         std::fs::create_dir_all(into)?;
         let wanted: std::collections::HashSet<std::ffi::OsString> = match std::fs::read_dir(from) {
             Ok(entries) => entries
                 .flatten()
                 .map(|entry| entry.file_name())
-                .filter(|name| name != skip)
+                .filter(|name| !skip(&name.to_string_lossy()))
                 .collect(),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Default::default(),
             Err(err) => return Err(err),
@@ -81,12 +81,17 @@ fn mirror_config(real: &Path, root: &Path) -> std::io::Result<()> {
         }
         Ok(())
     }
-    link_entries(real, root, "muse")?;
+    link_entries(real, root, |name| name == "muse")?;
     let muse = root.join("muse");
     if std::fs::symlink_metadata(&muse).is_ok_and(|meta| meta.file_type().is_symlink()) {
         std::fs::remove_file(&muse)?;
     }
-    link_entries(&real.join("muse"), &muse, "auth.json")
+    // The credential store is the account's own: its file, Muse's lock on
+    // it (shared, it would serialize every account and the user's own
+    // login) and any temp file of an atomic write.
+    link_entries(&real.join("muse"), &muse, |name| {
+        name.starts_with("auth.json") || name.starts_with(".auth.json")
+    })
 }
 
 #[cfg(not(unix))]
@@ -190,10 +195,18 @@ impl AgentAccounts {
     /// a fresh config root, adopted as a slot once approved. Re-signing an
     /// account already kept replaces its login in place.
     pub(super) async fn start_muse_login(&self) -> Result<AgentLoginStart, EngineError> {
+        // A sign-in already waiting for approval is the answer: replacing it
+        // would kill the Muse holding its device code, and the page already
+        // open for that code would then say it is invalid.
+        if let Some(start) = self.pending_muse_login() {
+            return Ok(start);
+        }
         self.reap_spawned_flows(HarnessId::Muse);
+        self.sweep_muse_pending();
         let cli = self.muse_cli()?;
         let pending = format!("pending-{}", new_id());
         let env = self.muse_env(&pending)?;
+        let pending_home = self.muse_home(&pending)?;
         let login = match msp::start_device_login(&cli, &env).await {
             Ok(login) => login,
             Err(err) => {
@@ -229,7 +242,8 @@ impl AgentAccounts {
                 started_at: std::time::Instant::now(),
                 state,
                 handle,
-                home: None,
+                // Cancelled (dialog closed, superseded): the root goes too.
+                home: Some(pending_home),
                 port: None,
             },
         );
@@ -239,6 +253,51 @@ impl AgentAccounts {
             mode: AgentLoginMode::Browser,
             callback_port: None,
         })
+    }
+
+    /// The Muse sign-in still waiting for approval, if any.
+    fn pending_muse_login(&self) -> Option<AgentLoginStart> {
+        let flows = lock(&self.inner.flows);
+        flows.iter().find_map(|(login_id, flow)| match flow {
+            LoginFlow::Task {
+                harness: HarnessId::Muse,
+                state,
+                handle,
+                ..
+            } if !handle.is_finished() && lock(state).outcome.is_none() => Some(AgentLoginStart {
+                login_id: login_id.clone(),
+                url: lock(state).url.clone().unwrap_or_default(),
+                mode: AgentLoginMode::Browser,
+                callback_port: None,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Roots of sign-ins that never finished (an engine stopped mid-flow),
+    /// once older than any flow can live.
+    fn sweep_muse_pending(&self) {
+        let Ok(homes) = self
+            .inner
+            .config
+            .private_root()
+            .map(|root| root.join(HOMES_DIR))
+        else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(homes) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let stale = entry.file_name().to_string_lossy().starts_with("pending-")
+                && entry
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .is_ok_and(|at| at.elapsed().unwrap_or_default() > super::FLOW_TTL);
+            if stale {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
     }
 
     /// An approved sign-in in `pending`'s root becomes a kept account.
@@ -376,6 +435,8 @@ mod tests {
         std::fs::create_dir_all(real.join("muse/skills")).unwrap();
         std::fs::write(real.join("muse/settings.json"), "{}").unwrap();
         std::fs::write(real.join("muse/auth.json"), "the user's own login").unwrap();
+        std::fs::write(real.join("muse/.auth.json.lock"), "").unwrap();
+        std::fs::write(real.join("muse/auth.json.tmp-1"), "").unwrap();
         let root = tmp.path().join("account/config");
 
         mirror_config(&real, &root).unwrap();
@@ -392,6 +453,11 @@ mod tests {
             !root.join("muse/auth.json").exists(),
             "never the user's login"
         );
+        assert!(
+            std::fs::symlink_metadata(root.join("muse/.auth.json.lock")).is_err(),
+            "never the user's credential lock"
+        );
+        assert!(std::fs::symlink_metadata(root.join("muse/auth.json.tmp-1")).is_err());
 
         // The account's own login, an entry added and one removed later.
         std::fs::write(root.join("muse/auth.json"), "the account's login").unwrap();
@@ -427,6 +493,7 @@ for line in sys.stdin:
     elif method == "account/read": send({"jsonrpc": "2.0", "id": rid, "result": state()})
     elif method == "account/loginStart":
         send({"jsonrpc": "2.0", "id": rid, "result": {"verificationUrl": "https://auth.example/device", "userCode": "ABCD-EFGH"}})
+        if os.environ.get("FAKE_HOLD"): continue  # never approved
         n = int(open(os.path.join(fake, "n")).read()) if os.path.exists(os.path.join(fake, "n")) else 0
         open(os.path.join(fake, "n"), "w").write(str(n + 1))
         email = os.environ["FAKE_EMAILS"].split(",")[n]
@@ -463,6 +530,49 @@ for line in sys.stdin:
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("sign-in never finished");
+    }
+
+    #[tokio::test]
+    async fn a_second_start_reuses_the_waiting_sign_in_and_closing_it_cleans_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("fake");
+        std::fs::create_dir_all(&fake).unwrap();
+        let cli = fake.join("muse");
+        std::fs::write(&cli, FAKE_MUSE).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = super::super::AgentAccountsConfig::isolated(&tmp.path().join("root"));
+        let accounts = AgentAccounts::new(config.clone());
+        // A wrapper holding every sign-in open (never approved).
+        let hold = fake.join("muse-hold");
+        std::fs::write(
+            &hold,
+            format!(
+                "#!/bin/sh\nFAKE_HOLD=1 FAKE_DIR='{}' FAKE_EMAILS=x exec '{}' \"$@\"\n",
+                fake.display(),
+                cli.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hold, std::fs::Permissions::from_mode(0o755)).unwrap();
+        accounts.override_cli(HarnessId::Muse, &hold);
+
+        let first = accounts.start_login(HarnessId::Muse).await.unwrap();
+        let second = accounts.start_login(HarnessId::Muse).await.unwrap();
+        assert_eq!(
+            second.login_id, first.login_id,
+            "the open page's code stays valid"
+        );
+        assert_eq!(second.url, first.url);
+        let homes = config.private_root().unwrap().join(HOMES_DIR);
+        let pending = || {
+            std::fs::read_dir(&homes)
+                .map(|entries| entries.flatten().count())
+                .unwrap_or(0)
+        };
+        assert_eq!(pending(), 1);
+        accounts.cancel_login(&first.login_id);
+        assert_eq!(pending(), 0, "a closed sign-in leaves no root behind");
     }
 
     #[tokio::test]
@@ -567,6 +677,32 @@ for line in sys.stdin:
             env.credential(HarnessId::Muse).await.as_deref(),
             Some(OWN_LOGIN)
         );
+    }
+
+    /// Against a real `muse` (opt-in, never approves anything):
+    /// `MUSE_LIVE_BIN=~/.local/bin/muse cargo test -p zeron-engine --lib
+    /// live_muse_sign_in_stays_pending -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_muse_sign_in_stays_pending_until_approved() {
+        let Some(bin) = std::env::var_os("MUSE_LIVE_BIN") else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let config = super::super::AgentAccountsConfig::isolated(&tmp.path().join("root"));
+        std::fs::create_dir_all(config.muse_config_root.join("muse")).unwrap();
+        std::fs::write(config.muse_config_root.join("muse/.auth.json.lock"), "").unwrap();
+        let accounts = AgentAccounts::new(config);
+        accounts.override_cli(HarnessId::Muse, PathBuf::from(bin));
+        let start = accounts.start_login(HarnessId::Muse).await.unwrap();
+        println!("url {}", start.url);
+        for second in 0..20 {
+            let poll = accounts.poll_login(&start.login_id).await.unwrap();
+            println!("{second}s: {:?} {:?}", poll.status, poll.message);
+            assert_eq!(poll.status, zeron_proto::AgentLoginStatus::Pending);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        accounts.cancel_login(&start.login_id);
     }
 
     #[test]
