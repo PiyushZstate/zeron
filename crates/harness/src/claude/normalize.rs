@@ -260,6 +260,18 @@ fn is_synthetic_user_text(text: &str) -> bool {
     text.starts_with("<system-reminder>") || text.starts_with("[Request interrupted")
 }
 
+/// What `--resume <id>` would find in Claude's native history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Transcript {
+    /// A transcript with conversation in it.
+    Conversation,
+    /// No transcript, or one without a single user or assistant line. The
+    /// CLI refuses to resume either ("No conversation found") and exits.
+    Empty,
+    /// The history could not be looked at: leave it to the CLI.
+    Unknown,
+}
+
 /// Per-run normalization state.
 ///
 /// `saw_init` dedupes `system:init` — the CLI re-emits it every time the model
@@ -327,15 +339,16 @@ impl Normalizer {
     /// duplicating the CLI's cwd encoding (including long-path hashing).
     /// Long sessions' histories run to hundreds of MB: the scan runs off the
     /// runtime and only parses lines that can name a spawn or its agent.
-    pub async fn for_resume(config_root: &std::path::Path, session_id: &str) -> Self {
+    /// The same scan says whether there is a conversation to resume at all.
+    pub async fn for_resume(config_root: &std::path::Path, session_id: &str) -> (Self, Transcript) {
         let config_root = config_root.to_owned();
         let session_id = session_id.to_owned();
         tokio::task::spawn_blocking(move || Self::restore_spawns(&config_root, &session_id))
             .await
-            .unwrap_or_else(|_| Self::new())
+            .unwrap_or_else(|_| (Self::new(), Transcript::Unknown))
     }
 
-    fn restore_spawns(config_root: &std::path::Path, session_id: &str) -> Self {
+    fn restore_spawns(config_root: &std::path::Path, session_id: &str) -> (Self, Transcript) {
         use std::io::BufRead as _;
         let mut norm = Self::new();
         if session_id.is_empty()
@@ -343,16 +356,17 @@ impl Normalizer {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-')
         {
-            return norm;
+            return (norm, Transcript::Unknown);
         }
         let Ok(projects) = std::fs::read_dir(config_root.join("projects")) else {
-            return norm;
+            return (norm, Transcript::Unknown);
         };
         let Some(file) = projects.flatten().find_map(|project| {
             std::fs::File::open(project.path().join(format!("{session_id}.jsonl"))).ok()
         }) else {
-            return norm;
+            return (norm, Transcript::Empty);
         };
+        let mut transcript = Transcript::Empty;
         let mut reader = std::io::BufReader::with_capacity(1 << 16, file);
         let mut line = Vec::new();
         loop {
@@ -365,6 +379,19 @@ impl Normalizer {
             let Ok(text) = std::str::from_utf8(&line) else {
                 continue;
             };
+            // Most of a transcript is bookkeeping (queue operations, request
+            // records, attachments); one user or assistant record is enough.
+            if transcript == Transcript::Empty
+                && (text.contains("\"type\":\"user\"") || text.contains("\"type\":\"assistant\""))
+                && serde_json::from_str::<Value>(text).is_ok_and(|record| {
+                    matches!(
+                        record.get("type").and_then(Value::as_str),
+                        Some("user" | "assistant")
+                    )
+                })
+            {
+                transcript = Transcript::Conversation;
+            }
             if !(text.contains("\"Agent\"")
                 || text.contains("\"Task\"")
                 || text.contains("agentId"))
@@ -421,7 +448,7 @@ impl Normalizer {
                 _ => {}
             }
         }
-        norm
+        (norm, transcript)
     }
 
     /// Rotate the assistant message id for a steer boundary; returns
@@ -1473,7 +1500,8 @@ mod tests {
             r#"{"type":"user","isSidechain":true,"toolUseResult":{"agentId":"a2"},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_nested"}]}}"#,
             "\n{torn tail"
         )).unwrap();
-        let mut norm = Normalizer::for_resume(root.path(), "session-1").await;
+        let (mut norm, transcript) = Normalizer::for_resume(root.path(), "session-1").await;
+        assert_eq!(transcript, Transcript::Conversation);
         assert!(!norm.agent_spawn_tools.contains("toolu_nested"));
         assert!(!norm.agent_tasks.contains_key("a2"));
         // The revived process has no original spawn frame on its wire.
@@ -1496,11 +1524,36 @@ mod tests {
             )]
         );
         assert!(!norm.saw_init, "history must not consume the live init");
-        assert!(
-            Normalizer::for_resume(root.path(), "missing")
-                .await
-                .agent_tasks
-                .is_empty()
+        let (missing, transcript) = Normalizer::for_resume(root.path(), "missing").await;
+        assert!(missing.agent_tasks.is_empty());
+        assert_eq!(transcript, Transcript::Empty);
+    }
+
+    #[tokio::test]
+    async fn a_transcript_without_conversation_cannot_be_resumed() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("projects/encoded-project");
+        std::fs::create_dir_all(&project).unwrap();
+        // What a run that died before its first reply leaves behind.
+        std::fs::write(
+            project.join("bare.jsonl"),
+            concat!(
+                r#"{"type":"queue-operation","operation":"enqueue","content":"{\"type\":\"user\"}"}"#,
+                "\n",
+                r#"{"type":"last-prompt","lastPrompt":"hi"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            Normalizer::for_resume(root.path(), "bare").await.1,
+            Transcript::Empty
+        );
+        // No history at all: nothing can be said either way.
+        let nowhere = tempfile::tempdir().unwrap();
+        assert_eq!(
+            Normalizer::for_resume(nowhere.path(), "bare").await.1,
+            Transcript::Unknown
         );
     }
 
