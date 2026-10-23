@@ -4,10 +4,33 @@
 pub use std::process::Stdio;
 #[cfg(not(windows))]
 pub use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+#[cfg(any(windows, test))]
+pub(crate) mod cmd_shim;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use windows::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+/// Backoff for a Windows process creation that failed transiently.
+#[cfg(any(windows, test))]
+const SPAWN_RETRY_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(300),
+    std::time::Duration::from_millis(1000),
+];
+
+/// Whether a failed Windows process creation is worth retrying: a sharing
+/// or lock violation on the image, or access denied on one modified in the
+/// last minute (the malware scanner holding a CLI that just updated).
+/// `image_age` is how long ago the launched image was last written.
+#[cfg(any(windows, test))]
+fn spawn_retryable(error: &std::io::Error, image_age: Option<std::time::Duration>) -> bool {
+    match error.raw_os_error() {
+        Some(32 | 33) => true,
+        Some(5) => image_age.is_some_and(|age| age < std::time::Duration::from_secs(60)),
+        _ => false,
+    }
+}
 
 #[cfg(unix)]
 pub(crate) fn signal_target(child: &Child) -> Option<i32> {
@@ -313,6 +336,24 @@ pub(crate) async fn terminate_tree(pids: &[i32], grace: std::time::Duration) {
         }
     }
     identities::forget(pids);
+}
+
+#[cfg(test)]
+#[test]
+fn windows_spawn_retries_only_sharing_failures_and_fresh_images() {
+    use std::io::Error;
+    use std::time::Duration;
+    let fresh = Some(Duration::from_secs(5));
+    let old = Some(Duration::from_secs(3600));
+    assert!(spawn_retryable(&Error::from_raw_os_error(32), old));
+    assert!(spawn_retryable(&Error::from_raw_os_error(33), None));
+    assert!(spawn_retryable(&Error::from_raw_os_error(5), fresh));
+    assert!(!spawn_retryable(&Error::from_raw_os_error(5), old));
+    assert!(!spawn_retryable(&Error::from_raw_os_error(5), None));
+    // ERROR_FILE_NOT_FOUND, ERROR_BAD_EXE_FORMAT: retrying cannot help.
+    assert!(!spawn_retryable(&Error::from_raw_os_error(2), fresh));
+    assert!(!spawn_retryable(&Error::from_raw_os_error(193), fresh));
+    assert_eq!(SPAWN_RETRY_DELAYS.len(), 3);
 }
 
 #[cfg(all(test, unix))]
