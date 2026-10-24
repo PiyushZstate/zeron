@@ -405,10 +405,18 @@ pub struct ResearchView {
     ui: ResearchUi,
     places: Vec<Place>,
     focus: FocusHandle,
+    /// Take the keyboard on the next frame: the screen works by keys, and the
+    /// focus it opened from (a composer) is no longer drawn.
+    wants_focus: bool,
     _poll: Task<()>,
 }
 
 impl ResearchView {
+    /// The shell calls this when the Research route comes back into view.
+    pub fn on_visible(&mut self) {
+        self.wants_focus = true;
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let poll = cx.spawn(async move |this, cx| {
             loop {
@@ -429,6 +437,7 @@ impl ResearchView {
             ui,
             places: Vec::new(),
             focus: cx.focus_handle(),
+            wants_focus: true,
             _poll: poll,
         }
     }
@@ -604,7 +613,10 @@ impl Focusable for ResearchView {
 }
 
 impl Render for ResearchView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.wants_focus) {
+            window.focus(&self.focus, cx);
+        }
         div()
             .id("research")
             .key_context("Research")

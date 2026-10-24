@@ -746,15 +746,19 @@ impl ResearchView {
                 }
             };
             let mut line = format!(
-                "{} over {}, mean reward {}",
+                "{} over {}",
                 many(s.rollouts, "rollout"),
-                many(s.tasks, "task"),
-                reward(s.mean_reward)
+                many(s.tasks, "task")
             );
-            match s.errored {
-                0 => line.push('.'),
-                1 => line.push_str("; 1 errored, left out of the mean."),
-                n => line.push_str(&format!("; {n} errored, left out of the mean.")),
+            match (s.mean_reward, s.errored) {
+                (Some(mean), 0) => line.push_str(&format!(", mean reward {}.", reward(Some(mean)))),
+                (Some(mean), n) => line.push_str(&format!(
+                    ", mean reward {}; {n} errored, left out of the mean.",
+                    reward(Some(mean))
+                )),
+                (None, 0) => line.push_str(", no reward yet."),
+                (None, n) if n == s.rollouts => line.push_str(", all errored, so no mean."),
+                (None, n) => line.push_str(&format!("; {n} errored, and no mean yet.")),
             }
             if let (Some(b), Some(d)) = (baseline, head_delta) {
                 line.push_str(&format!(" {} against {}.", delta(d).0, run_name(b)));

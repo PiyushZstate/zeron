@@ -5135,7 +5135,14 @@ impl Shell {
                 page.update(cx, |page, _| page.on_hidden());
             }
         }
+        let was_research = matches!(self.route, Route::Research);
         self.route = route;
+        if !was_research
+            && matches!(self.route, Route::Research)
+            && let Some(page) = self.research_page.as_ref().cloned()
+        {
+            page.update(cx, |page, _| page.on_visible());
+        }
         if !was_pull_requests && will_show_pull_requests {
             if let Some(page) = self.pull_requests_page.as_ref().cloned() {
                 page.update(cx, |page, cx| page.on_visible(cx));
