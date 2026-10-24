@@ -448,7 +448,7 @@ final class CompanionCell: UICollectionViewListCell {
         icon.isHidden = false
         glyph.isHidden = true
         title.text = tab.name
-        detail.attributedText = TerminalViewController.subtitle(folder: tab.folder, host: host, direct: tab.direct && tab.isLive, size: TypeScale.size(13.5))
+        detail.text = "\(tab.folder) · \(host)"
         switch tab.phase {
         case .live, .connecting:
             trailing.text = "Live"

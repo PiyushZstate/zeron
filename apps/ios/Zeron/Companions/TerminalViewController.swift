@@ -193,25 +193,7 @@ final class TerminalViewController: UIViewController {
         guard let tab = current else { return }
         navigationItem.title = tab.name
         let host = app.deviceName(tab.ref.deviceId)
-        let subtitle = Self.subtitle(folder: tab.folder, host: host, direct: tab.direct && tab.isLive)
-        navigationItem.attributedSubtitle = (try? AttributedString(subtitle, including: \.uiKit)) ?? AttributedString(subtitle.string)
-    }
-
-    /// "~/zeron · MacBook Pro", led by a bolt once the terminal rides a
-    /// direct link to its computer (no round trip through the cloud) — first,
-    /// so a long folder truncates instead of the badge.
-    static func subtitle(folder: String, host: String, direct: Bool, size: CGFloat = 12) -> NSAttributedString {
-        let font = Fonts.ui(.sans, size)
-        let place = NSAttributedString(string: "\(folder) · \(host)", attributes: [.font: font, .foregroundColor: Palette.secondary])
-        guard direct else { return place }
-        let bolt = NSTextAttachment(image: UIImage(systemName: "bolt.fill", withConfiguration: UIImage.SymbolConfiguration(pointSize: size * 0.75, weight: .bold))!.withTintColor(Palette.accent, renderingMode: .alwaysOriginal))
-        let side = (size * 0.8).rounded()
-        bolt.bounds = CGRect(x: 0, y: (font.capHeight - side) / 2, width: side * 0.7, height: side)
-        let text = NSMutableAttributedString(attachment: bolt)
-        text.append(NSAttributedString(string: " Direct", attributes: [.font: Fonts.ui(.sansMedium, size), .foregroundColor: Palette.accent]))
-        text.append(NSAttributedString(string: " · ", attributes: [.font: font, .foregroundColor: Palette.secondary]))
-        text.append(place)
-        return text
+        navigationItem.subtitle = "\(tab.folder) · \(host)"
     }
 
     private var shownPhase: TerminalPhase?

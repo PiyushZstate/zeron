@@ -14,7 +14,8 @@ final class TerminalTab: TerminalListener, @unchecked Sendable {
     /// The phase as last seen on main (drives the session's chips).
     private(set) var phase: TerminalPhase = .connecting
     private(set) var title: String?
-    /// Riding a direct link to its host (else the relay).
+    /// Riding a direct link to its host (else the relay). Not shown — the
+    /// route is plumbing — but the DEBUG terminal probe measures by it.
     private(set) var direct = false
     var onPhaseChange: (() -> Void)?
 
@@ -72,11 +73,10 @@ final class TerminalTab: TerminalListener, @unchecked Sendable {
             lock.unlock()
             let phase = session.phase()
             let title = session.title()
-            let direct = session.isDirect()
-            if phase != self.phase || title != self.title || direct != self.direct {
+            direct = session.isDirect()
+            if phase != self.phase || title != self.title {
                 self.phase = phase
                 self.title = title
-                self.direct = direct
                 onPhaseChange?()
             }
             observers.values.forEach { $0() }
