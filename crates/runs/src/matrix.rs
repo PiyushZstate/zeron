@@ -55,6 +55,11 @@ pub struct Cell {
     pub errored: u32,
     /// Indices into the input slice, so a cell can open its rollouts.
     pub members: Vec<usize>,
+    /// Two or more rollouts count and all scored the same. A group-relative
+    /// trainer (GRPO and its kin) gets no gradient from such a group, so the task
+    /// teaches nothing at this harness and model until the rewards differ.
+    #[serde(default)]
+    pub flat: bool,
 }
 
 impl Matrix {
@@ -64,6 +69,9 @@ impl Matrix {
             .find(|c| c.row == row && c.column == column)
     }
 }
+
+/// Rewards closer than this are the same score: well below any grader's step.
+const FLAT_TOLERANCE: f64 = 1e-9;
 
 /// Group `rollouts` by `spec`. Order of rows, columns and cells is first seen.
 pub fn matrix(rollouts: &[Rollout], spec: &MatrixSpec) -> Matrix {
@@ -99,6 +107,7 @@ pub fn matrix(rollouts: &[Rollout], spec: &MatrixSpec) -> Matrix {
                     rollouts: 0,
                     errored: 0,
                     members: Vec::new(),
+                    flat: false,
                 });
                 cells.len() - 1
             }
@@ -120,6 +129,10 @@ pub fn matrix(rollouts: &[Rollout], spec: &MatrixSpec) -> Matrix {
             })
             .collect();
         cell.counted = counted.len() as u32;
+        cell.flat = counted.len() >= 2
+            && counted
+                .iter()
+                .all(|r| (r - counted[0]).abs() < FLAT_TOLERANCE);
         cell.mean = mean(counted.into_iter());
     }
     Matrix {
@@ -225,6 +238,30 @@ mod tests {
         assert_eq!(m.cells.len(), 2);
         assert_eq!(m.cell(0, 0).unwrap().mean, Some(1.0));
         assert_eq!(m.cell(0, 1).unwrap().mean, Some(0.0));
+    }
+
+    #[test]
+    fn a_cell_is_flat_only_when_two_or_more_counted_rewards_agree() {
+        let at = |id: &str, task: &str, outcome: Outcome, reward: Option<f64>| {
+            r(id, task, Some("h"), Some("m"), None, outcome, reward)
+        };
+        let rollouts = [
+            // Same score twice, and an error that does not count: flat.
+            at("a", "same", Outcome::Completed, Some(1.0)),
+            at("b", "same", Outcome::Completed, Some(1.0)),
+            at("c", "same", Outcome::Errored, Some(0.0)),
+            // Scores that differ: a signal.
+            at("d", "mixed", Outcome::Completed, Some(1.0)),
+            at("e", "mixed", Outcome::Completed, Some(0.0)),
+            // One rollout says nothing about spread.
+            at("f", "alone", Outcome::Completed, Some(0.0)),
+        ];
+        let m = matrix(&rollouts, &MatrixSpec::default());
+        let flat = |row: usize| m.cell(row, 0).unwrap().flat;
+        assert_eq!(m.rows, ["same", "mixed", "alone"]);
+        assert!(flat(0));
+        assert!(!flat(1));
+        assert!(!flat(2));
     }
 
     #[test]

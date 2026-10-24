@@ -245,7 +245,10 @@ impl ResearchView {
                         Some("harness × model".to_owned()),
                     ))
                     .child(self.matrix_table(&snap, choice, cx))
-                    .child(legend(snap.grid.rows.len())),
+                    .child(legend(
+                        snap.grid.rows.len(),
+                        snap.grid.cells.iter().filter(|c| c.flat).count(),
+                    )),
             );
         let opened = opened_key.map(|key| self.opened_cell(&snap, key, cx));
         (section, opened)
@@ -314,7 +317,7 @@ impl ResearchView {
             .children(snap.column_totals().into_iter().map(|c| {
                 cell_box(Some(COL_W), false)
                     .flex()
-                    .child(figures(&c).font_weight(gpui::FontWeight::MEDIUM))
+                    .child(figures(&c, false).font_weight(gpui::FontWeight::MEDIUM))
             }));
         let rows = snap.grid.rows.iter().enumerate().map(|(ri, row_key)| {
             let row_chosen = choice.cell.as_ref().is_some_and(|k| &k.row == row_key);
@@ -411,12 +414,18 @@ impl ResearchView {
             .collect();
         let t = tally(members.iter().filter_map(|&i| snap.rollouts.get(i)));
         let (n, errored, counted) = cell.map_or((0, 0, 0), |c| (c.rollouts, c.errored, c.counted));
-        let summary = match (n, errored) {
+        let flat = cell.is_some_and(|c| c.flat);
+        let mut summary = match (n, errored) {
             (0, _) => "No rollouts ran here.".to_owned(),
             (n, 0) => format!(
                 "{n} rollout{}, mean reward {} over the {counted} that count.",
                 if n == 1 { "" } else { "s" },
                 reward(cell.and_then(|c| c.mean))
+            ),
+            (n, e) if e == n => format!(
+                "{n} rollout{}, all errored, so no mean: errors are left out rather than \
+                 counted as zero.",
+                if n == 1 { "" } else { "s" }
             ),
             (n, e) => format!(
                 "{n} rollouts, mean reward {} over the {counted} that count; {e} errored, \
@@ -424,6 +433,12 @@ impl ResearchView {
                 reward(cell.and_then(|c| c.mean))
             ),
         };
+        if flat {
+            summary.push_str(
+                " Every one scored the same, so a group-relative trainer such as GRPO \
+                 learns nothing from this task here.",
+            );
+        }
         let close = button("research-cell-close", "Close", false).on_click(cx.listener(
             |this, _, _, cx| {
                 this.ui.matrix.opened = false;
@@ -479,8 +494,8 @@ impl ResearchView {
 
 /// What a cell's figures are and which keys the page answers, as the board's quiet
 /// line under its table.
-fn legend(tasks: usize) -> Div {
-    div()
+fn legend(tasks: usize, flat: usize) -> Div {
+    let line = div()
         .flex()
         .items_center()
         .gap(px(4.))
@@ -491,17 +506,31 @@ fn legend(tasks: usize) -> Div {
         .child(quiet("errors").text_color(rgb(EMBER)))
         .child(quiet("never count as zero"))
         .child(div().flex_1())
-        .child(quiet("←↑↓→ move · ↩ open · [ ] env · , . folder"))
+        .child(quiet("←↑↓→ move · ↩ open · [ ] env · , . folder"));
+    // Its own line: what a grey mean means is the one thing here a trainer acts on.
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.))
+        .child(line)
+        .when(flat > 0, |d| {
+            d.child(quiet(format!(
+                "{flat} grey mean{}: every rollout scored alike, so there is no learning \
+                 signal there",
+                if flat == 1 { "" } else { "s" }
+            )))
+        })
 }
 
 /// A mean, its rollouts and its errors, as a cell and the "All tasks" row print them.
-fn figures(t: &Totals) -> Div {
+/// A flat cell's mean is quiet: every rollout scored the same, so it carries no signal.
+fn figures(t: &Totals, flat: bool) -> Div {
     div()
         .flex()
         .items_baseline()
         .gap(px(8.))
         .whitespace_nowrap()
-        .child(body(reward(t.mean), INK).font_family(MONO))
+        .child(body(reward(t.mean), if flat { DIM } else { INK }).font_family(MONO))
         .child(body(t.rollouts.to_string(), DIM).font_family(MONO))
         .when(t.errored > 0, |d| {
             d.child(body(t.errored.to_string(), EMBER).font_family(MONO))
@@ -523,11 +552,14 @@ fn matrix_cell(
     let id = (row as u64) << 32 | col as u64;
     let figures = match cell {
         None => div().child(body("–", DIM).font_family(MONO)),
-        Some(c) => figures(&Totals {
-            mean: c.mean,
-            rollouts: c.rollouts,
-            errored: c.errored,
-        }),
+        Some(c) => figures(
+            &Totals {
+                mean: c.mean,
+                rollouts: c.rollouts,
+                errored: c.errored,
+            },
+            c.flat,
+        ),
     };
     cell_box(Some(COL_W), false)
         .flex()
