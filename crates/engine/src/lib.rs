@@ -42,6 +42,7 @@ pub mod project_actions;
 pub mod registry;
 pub mod remote_terminals;
 pub mod repos;
+pub mod research;
 pub mod rpc;
 pub mod run_journal;
 pub mod runner;
@@ -650,6 +651,8 @@ pub struct EngineRuntime {
     host_relay: std::sync::Mutex<Option<zeron_rpc::HostRelay>>,
     /// Desktop banners for this engine's sessions (desktop engines only).
     notifier: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Docent and its watcher, while the device has Research on.
+    research: Option<research::Research>,
 }
 
 /// IPC-only lifecycle control owned by `zeron headless`. The regular
@@ -708,6 +711,9 @@ impl EngineRuntime {
 
     pub async fn shutdown(&self) {
         self.stop_notifier();
+        if let Some(research) = &self.research {
+            research.shutdown().await;
+        }
         self.disconnect_edge();
         self.core.shutdown().await;
     }
@@ -1068,10 +1074,17 @@ impl Engine {
 
         let notifier = desktop_notify::enabled()
             .then(|| desktop_notify::spawn(&core, config.data_dir.clone()));
+        let research = research::Research::start(
+            &config.data_dir,
+            core.repos.clone(),
+            core.workspace.clone(),
+            core.device_id.clone(),
+        );
         Ok(EngineRuntime {
             core,
             host_relay: std::sync::Mutex::new(host_relay),
             notifier: std::sync::Mutex::new(notifier),
+            research,
         })
     }
 
