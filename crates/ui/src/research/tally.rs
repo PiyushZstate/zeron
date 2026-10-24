@@ -151,6 +151,7 @@ mod tests {
             started_at: None,
             traces: 1,
             axes: Axes::default(),
+            metrics: Vec::new(),
         }
     }
 

@@ -14,11 +14,12 @@ use gpui::{
 use zeron_engine::research::ResearchRun;
 
 use super::PlaceId;
+use seamlessh_runs::speedup::{Speedup, speedup};
 use seamlessh_runs::{Comparison, Framework, Outcome, TaskRow, compare};
 
 use super::ResearchView;
 use super::style::{
-    self as theme, DIM, EMBER, INK, INK_2, MIST, MONO, SOFT, WAITING, WORKING, meta, white,
+    self as theme, ADDED, DIM, EMBER, INK, INK_2, MIST, MONO, SOFT, WAITING, WORKING, meta, white,
 };
 use super::style::{self as kit, Kind};
 use crate::icons::{self, icon};
@@ -831,6 +832,10 @@ impl ResearchView {
                     .children(notes.into_iter().map(|n| dot_note(WAITING, n)))
             }))
             .children(tally_parts(&tally(&run.rollouts)))
+            .children(baseline.and_then(|b| {
+                let s = speedup(&b.rollouts, &run.rollouts)?;
+                Some(speedup_section(&s, &run_name(b)))
+            }))
             .child(
                 aside_section(match baseline {
                     Some(b) => format!("Tasks against {}", run_name(b)),
@@ -843,6 +848,65 @@ impl ResearchView {
             )
             .child(aside_actions(vec![pin]))
     }
+}
+
+/// How much faster the run is than its baseline: the geometric mean first, then each
+/// task's ratio, a gain in the improvement green and a loss in ember.
+fn speedup_section(s: &Speedup, base: &str) -> Div {
+    let times = |n: f64| format!("{n:.2}×");
+    let lead = if s.geomean >= 1.0 {
+        format!("{} faster than the baseline", times(s.geomean))
+    } else {
+        format!("{} the baseline's speed", times(s.geomean))
+    };
+    let line = format!(
+        "{lead}: the geometric mean over {} task{}, timed by {}. Faster in {}, slower in {}.",
+        s.tasks.len(),
+        if s.tasks.len() == 1 { "" } else { "s" },
+        s.metric,
+        s.faster,
+        s.slower
+    );
+    aside_section(format!("Speedup against {base}"))
+        .child(body(line, INK_2))
+        .when(s.lost > 0, |d| {
+            d.child(dot_note(
+                EMBER,
+                format!(
+                    "{} task{} the baseline solved and this run did not: not timed",
+                    s.lost,
+                    if s.lost == 1 { "" } else { "s" }
+                ),
+            ))
+        })
+        .child(div().flex().flex_col().children(s.tasks.iter().map(|t| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .py(px(6.))
+                .border_t_1()
+                .border_color(white(0.06))
+                .child(
+                    body(t.task.label.clone(), INK_2)
+                        .flex_1()
+                        .min_w_0()
+                        .truncate(),
+                )
+                .child(
+                    body(
+                        times(t.ratio),
+                        if t.ratio > 1.0 {
+                            ADDED
+                        } else if t.ratio < 1.0 {
+                            EMBER
+                        } else {
+                            INK_2
+                        },
+                    )
+                    .font_family(MONO),
+                )
+        })))
 }
 
 fn compare_rows(c: &Comparison) -> Vec<AnyElement> {

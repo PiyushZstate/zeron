@@ -201,6 +201,7 @@ mod tests {
                 model: model.map(str::to_owned),
                 runtime: runtime.map(str::to_owned),
             },
+            metrics: Vec::new(),
         }
     }
 

@@ -139,6 +139,7 @@ mod tests {
                 harness: agent.map(str::to_owned),
                 ..Axes::default()
             },
+            metrics: Vec::new(),
         }
     }
 

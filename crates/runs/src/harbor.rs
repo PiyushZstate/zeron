@@ -210,6 +210,7 @@ fn parse_trial(json: &str) -> Result<(Rollout, TrialFacts), String> {
             model: keep(facts.model.clone()),
             runtime: None,
         },
+        metrics: Vec::new(),
     };
     Ok((rollout, facts))
 }
@@ -287,6 +288,7 @@ pub fn unfinished_trial(trial_name: &str, config: Option<&str>) -> Rollout {
             harness,
             ..Axes::default()
         },
+        metrics: Vec::new(),
     }
 }
 

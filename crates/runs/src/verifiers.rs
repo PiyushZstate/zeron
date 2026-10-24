@@ -168,6 +168,7 @@ struct TraceLine {
     #[serde(default)]
     errors: Vec<ErrorLine>,
     timing: Option<TimingLine>,
+    metrics: Option<Ordered<f64>>,
 }
 
 #[derive(Deserialize)]
@@ -393,8 +394,17 @@ fn parse_line(line: &str) -> Result<(Rollout, LineFacts), LineError> {
             model: facts.model.clone(),
             runtime: facts.runtime.clone(),
         },
+        metrics: main.map(trace_metrics).unwrap_or_default(),
     };
     Ok((rollout, facts))
+}
+
+fn trace_metrics(trace: &TraceLine) -> Vec<(String, f64)> {
+    trace
+        .metrics
+        .as_ref()
+        .map(|m| m.0.clone())
+        .unwrap_or_default()
 }
 
 /// `sum(score * weight)`. `Trace.reward` is a property, so the file never stores it. A reward

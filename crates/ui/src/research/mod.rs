@@ -723,6 +723,7 @@ mod tests {
                 model: Some("qwen".to_owned()),
                 runtime: None,
             },
+            metrics: Vec::new(),
         }
     }
 

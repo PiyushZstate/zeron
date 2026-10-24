@@ -134,6 +134,10 @@ pub struct Rollout {
     pub traces: u32,
     /// Env, harness, model, runtime. Task lives on [`Self::task`].
     pub axes: Axes,
+    /// verifiers `metrics` of the main trace, in file order: what a run measures beside
+    /// its reward, such as a kernel's runtime. Appended last for the wire's order.
+    #[serde(default)]
+    pub metrics: Vec<(String, f64)>,
 }
 
 impl Rollout {
@@ -435,6 +439,7 @@ mod tests {
             started_at: None,
             traces: 1,
             axes: Axes::default(),
+            metrics: Vec::new(),
         }
     }
 
