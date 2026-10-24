@@ -506,7 +506,9 @@ fn legend(tasks: usize, flat: usize) -> Div {
         .child(quiet("errors").text_color(rgb(EMBER)))
         .child(quiet("never count as zero"))
         .child(div().flex_1())
-        .child(quiet("←↑↓→ move · ↩ open · [ ] env · , . folder"));
+        .child(quiet(
+            "←↑↓→ move · ↩ open · [ ] env · , . folder · 1 2 3 page",
+        ));
     // Its own line: what a grey mean means is the one thing here a trainer acts on.
     div()
         .flex()

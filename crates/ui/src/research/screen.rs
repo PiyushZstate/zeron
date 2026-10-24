@@ -464,7 +464,13 @@ impl ResearchView {
                         "Matrix",
                         Page::Matrix,
                     ))
-                    .child(page("research-runs-page", icons::LIST, "Runs", Page::Runs)),
+                    .child(page("research-runs-page", icons::LIST, "Runs", Page::Runs))
+                    .child(page(
+                        "research-checks-page",
+                        icons::CHECKLIST,
+                        "Checks",
+                        Page::Checks,
+                    )),
             )
             .child(
                 div()
@@ -519,6 +525,7 @@ impl ResearchView {
                 let (section, detail) = match self.ui.page {
                     Page::Matrix => self.matrix_page(cx),
                     Page::Runs => self.runs_page(cx),
+                    Page::Checks => self.checks_page(cx),
                 };
                 (div().id("research-page").child(section), detail)
             }
@@ -677,7 +684,7 @@ impl ResearchView {
                         ),
                 )
                 .child(quiet(format!(
-                    "{} runs · ↑↓ choose · b baseline · , . folder",
+                    "{} runs · ↑↓ choose · b baseline · , . folder · 1 2 3 page",
                     runs.len()
                 ))),
         );

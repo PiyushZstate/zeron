@@ -118,7 +118,14 @@ fn a_trial_without_result_json_is_unfinished_and_keeps_its_task() {
         .unwrap();
     // The same task, whether the name came from config.json or result.json.
     assert_eq!(unfinished.task.key, finished.task.key);
-    assert_eq!(unfinished.axes, Axes::default());
+    // Nothing but the agent is known of an unfinished trial, and the job's lock names that.
+    assert_eq!(
+        unfinished.axes,
+        Axes {
+            harness: Some("oracle".into()),
+            ..Axes::default()
+        }
+    );
 }
 
 #[test]
@@ -183,4 +190,67 @@ fn an_atif_trajectory_reads_as_turns_with_tool_results() {
     assert_eq!(doc.turns[2].tool_call_id.as_deref(), Some("c1"));
     let other = document(r#"{"schema_version":"ATIF-v2.0","steps":[]}"#).unwrap();
     assert!(other.notice.is_some());
+}
+
+#[test]
+fn a_result_without_agent_info_names_its_agent_from_the_echoed_config() {
+    let r = parse_trial_result(
+        r#"{"trial_name":"t__abcdefg","task_name":"t","agent_info":null,"config":{"agent":{"name":"nop"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(r.axes.harness.as_deref(), Some("nop"));
+    // agent_info is the better source: it carries the version.
+    let both = parse_trial_result(
+        r#"{"trial_name":"t__abcdefg","task_name":"t","agent_info":{"name":"oracle","version":"1.0.0"},"config":{"agent":{"name":"other"}}}"#,
+    )
+    .unwrap();
+    assert_eq!(both.axes.harness.as_deref(), Some("oracle 1.0.0"));
+}
+
+#[test]
+fn an_unfinished_trial_reads_its_agent_from_its_config() {
+    let r = unfinished_trial(
+        "t__abcdefg",
+        Some(r#"{"task":{"path":"tasks/t"},"agent":{"name":"nop"}}"#),
+    );
+    assert_eq!(r.axes.harness.as_deref(), Some("nop"));
+    let none = unfinished_trial("t__abcdefg", Some(r#"{"task":{"path":"tasks/t"}}"#));
+    assert_eq!(none.axes.harness, None);
+}
+
+#[test]
+fn the_lock_names_the_agent_of_trials_that_do_not() {
+    let lock = r#"{"harbor":{"version":"0.24.0"},"trials":[{"agent":{"name":"oracle"}},{"agent":{"name":"oracle"}}]}"#;
+    let scan = |lock: &str| {
+        let mut scan = JobScan::new("j");
+        scan.lock(lock);
+        scan.trial("t__abcdefg", None, Some(r#"{"task":{"path":"tasks/t"}}"#));
+        scan.trial(
+            "t__hijklmn",
+            Some(r#"{"trial_name":"t__hijklmn","task_name":"t"}"#),
+            None,
+        );
+        scan.finish()
+    };
+    let run = scan(lock);
+    assert!(
+        run.rollouts
+            .iter()
+            .all(|r| r.axes.harness.as_deref() == Some("oracle"))
+    );
+    assert_eq!(run.facts.framework_version.as_deref(), Some("0.24.0"));
+    // Two agents in one job: a trial cannot be matched to either, so it stays unnamed.
+    let mixed = scan(r#"{"trials":[{"agent":{"name":"oracle"}},{"agent":{"name":"nop"}}]}"#);
+    assert!(mixed.rollouts.iter().all(|r| r.axes.harness.is_none()));
+}
+
+#[test]
+fn the_real_oracle_job_names_its_agent_on_every_trial() {
+    let run = job(&["write-file__6fBnNtH", "broken-env__3eaHFQz"]);
+    assert!(run.rollouts.iter().all(|r| {
+        r.axes
+            .harness
+            .as_deref()
+            .is_some_and(|h| h.starts_with("oracle"))
+    }));
 }

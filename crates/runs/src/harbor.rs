@@ -28,12 +28,24 @@ struct TrialResultFile {
     source: Option<String>,
     task_checksum: Option<String>,
     agent_info: Option<AgentInfo>,
+    config: Option<TrialConfig>,
     agent_result: Option<AgentContext>,
     verifier_result: Option<VerifierResult>,
     exception_info: Option<ExceptionInfo>,
     started_at: Option<String>,
     finished_at: Option<String>,
     step_results: Option<Vec<StepResult>>,
+}
+
+/// The trial config Harbor echoes into `result.json`. Only the agent's name is read.
+#[derive(Deserialize)]
+struct TrialConfig {
+    agent: Option<AgentConfig>,
+}
+
+#[derive(Deserialize)]
+struct AgentConfig {
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -150,13 +162,22 @@ fn parse_trial(json: &str) -> Result<(Rollout, TrialFacts), String> {
                 None => name,
             })
         }),
-        harness: agent.and_then(|a| {
-            let name = a.name.clone()?;
-            Some(match &a.version {
-                Some(v) if !v.is_empty() => format!("{name} {v}"),
-                _ => name,
+        harness: agent
+            .and_then(|a| {
+                let name = a.name.clone()?;
+                Some(match &a.version {
+                    Some(v) if !v.is_empty() => format!("{name} {v}"),
+                    _ => name,
+                })
             })
-        }),
+            // why: `agent_info` is written once the agent has been set up; a trial that
+            // failed before that still names its agent in the config it ran with.
+            .or_else(|| {
+                file.config
+                    .as_ref()
+                    .and_then(|c| c.agent.as_ref())
+                    .and_then(|a| a.name.clone())
+            }),
     };
     let keep = |s: Option<String>| s.filter(|s| !s.is_empty());
     let rollout = Rollout {
@@ -216,14 +237,22 @@ pub fn unfinished_trial(trial_name: &str, config: Option<&str>) -> Rollout {
     #[derive(Deserialize)]
     struct Config {
         task: Option<Task>,
+        agent: Option<AgentConfig>,
     }
     #[derive(Deserialize)]
     struct Task {
         name: Option<String>,
         path: Option<String>,
     }
+    let config = config.and_then(|c| serde_json::from_str::<Config>(c).ok());
+    // why: Harbor omits `agent` from a trial config when the job ran the default agent,
+    // which is how `oracle` jobs are written; the job's lock fills that in later.
+    let harness = config
+        .as_ref()
+        .and_then(|c| c.agent.as_ref())
+        .and_then(|a| a.name.clone())
+        .filter(|n| !n.is_empty());
     let task = config
-        .and_then(|c| serde_json::from_str::<Config>(c).ok())
         .and_then(|c| c.task)
         .and_then(|t| {
             t.name.or_else(|| {
@@ -254,7 +283,10 @@ pub fn unfinished_trial(trial_name: &str, config: Option<&str>) -> Rollout {
         duration_secs: None,
         started_at: None,
         traces: 1,
-        axes: Axes::default(),
+        axes: Axes {
+            harness,
+            ..Axes::default()
+        },
     }
 }
 
@@ -262,6 +294,8 @@ pub fn unfinished_trial(trial_name: &str, config: Option<&str>) -> Rollout {
 pub struct JobScan {
     facts: RunFacts,
     rollouts: Vec<Rollout>,
+    /// The one agent every trial in `lock.json` names, when there is exactly one.
+    lock_agent: Option<String>,
 }
 
 impl JobScan {
@@ -274,6 +308,7 @@ impl JobScan {
         Self {
             facts,
             rollouts: Vec::new(),
+            lock_agent: None,
         }
     }
 
@@ -305,19 +340,39 @@ impl JobScan {
         });
     }
 
-    /// The job-level `lock.json`, for the Harbor version that ran it.
+    /// The job-level `lock.json`, for the Harbor version that ran it and, where a trial does
+    /// not name its agent, the agent the job ran.
     pub fn lock(&mut self, json: &str) {
         #[derive(Deserialize)]
         struct Lock {
             harbor: Option<Info>,
+            #[serde(default)]
+            trials: Vec<LockTrial>,
         }
         #[derive(Deserialize)]
         struct Info {
             version: Option<String>,
         }
-        self.facts.framework_version = serde_json::from_str::<Lock>(json)
-            .ok()
-            .and_then(|l| l.harbor?.version)
+        #[derive(Deserialize)]
+        struct LockTrial {
+            agent: Option<AgentConfig>,
+        }
+        let Ok(lock) = serde_json::from_str::<Lock>(json) else {
+            return;
+        };
+        let mut names = lock
+            .trials
+            .iter()
+            .map(|t| t.agent.as_ref().and_then(|a| a.name.as_deref()));
+        self.lock_agent = match names.next().flatten() {
+            Some(first) if !first.is_empty() && names.all(|n| n == Some(first)) => {
+                Some(first.to_owned())
+            }
+            _ => None,
+        };
+        self.facts.framework_version = lock
+            .harbor
+            .and_then(|h| h.version)
             .or(self.facts.framework_version.take());
     }
 
@@ -349,6 +404,15 @@ impl JobScan {
     }
 
     pub fn finish(mut self) -> ParsedRun {
+        if let Some(agent) = &self.lock_agent {
+            for r in self
+                .rollouts
+                .iter_mut()
+                .filter(|r| r.axes.harness.is_none())
+            {
+                r.axes.harness = Some(agent.clone());
+            }
+        }
         // Trial directory listing order is arbitrary; show trials as they started.
         self.rollouts.sort_by(|a, b| {
             a.started_at

@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use gpui::{AnyElement, Context, Div, FontWeight, ScrollHandle, Stateful, div, prelude::*, px};
+use seamlessh_runs::tamper::{Suspicion, suspicions};
 use seamlessh_runs::{Document, Role, Rollout, Turn};
 
 use super::ResearchView;
@@ -323,9 +324,11 @@ impl ResearchView {
             }
             Loaded::Ready(doc) => {
                 let names = call_names(&doc.turns);
+                let flagged = suspicions(doc);
                 for (i, turn) in doc.turns.iter().enumerate() {
+                    let why = flagged.iter().find(|s| s.turn == i).map(|s| s.why.clone());
                     rows.push(
-                        self.turn_row(i, turn, reading, &names, cx)
+                        self.turn_row(i, turn, reading, &names, why, cx)
                             .into_any_element(),
                     );
                 }
@@ -358,6 +361,7 @@ impl ResearchView {
         turn: &Turn,
         reading: &Reading,
         names: &BTreeMap<&str, &str>,
+        tamper: Option<String>,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let chosen = reading.at == i;
@@ -400,6 +404,7 @@ impl ResearchView {
                     )
                     .child(quiet(format!("{}", i + 1)).font_family(MONO)),
             )
+            .children(tamper.map(|why| dot_note(EMBER, format!("May change its grader: {why}"))))
             .child(turn_body(turn, open, chosen))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(reading) = &mut this.ui.reading {
@@ -500,6 +505,7 @@ impl ResearchView {
                 notes
             })
             .unwrap_or_default();
+        let tampering: Vec<Suspicion> = doc.map(suspicions).unwrap_or_default();
         let back = button("research-doc-back-foot", "Back to the cell", false).on_click(
             cx.listener(|this, _, _, cx| {
                 this.ui.reading = None;
@@ -539,6 +545,17 @@ impl ResearchView {
                     ),
                 ],
             ))
+            // Before the rewards: if the grader was changed, they mean nothing.
+            .when(!tampering.is_empty(), |a| {
+                a.child(aside_section("Possible grader tampering").children(
+                    tampering.into_iter().map(|s| {
+                        dot_note(
+                            EMBER,
+                            format!("Turn {}: {} ({})", s.turn + 1, s.why, s.tool),
+                        )
+                    }),
+                ))
+            })
             .children(section("Rewards", parts))
             .children(section("Metrics", metrics))
             .children(section("Timing", timing))

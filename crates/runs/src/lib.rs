@@ -12,6 +12,8 @@
 pub mod harbor;
 pub mod matrix;
 pub mod model;
+pub mod qualify;
+pub mod tamper;
 mod time;
 pub mod verifiers;
 

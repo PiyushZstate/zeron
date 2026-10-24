@@ -14,6 +14,7 @@
 //! opens as a document, which the engine reads on asking. Nothing runs in Docker and
 //! nothing is copied: the run files are the record.
 
+mod checks;
 mod document;
 mod matrix;
 mod screen;
@@ -71,6 +72,7 @@ pub(crate) enum Page {
     #[default]
     Matrix,
     Runs,
+    Checks,
 }
 
 /// What the engine said about each folder, and the choices on the screen. Choices are kept by key rather than by index, so a refresh that
@@ -321,6 +323,9 @@ impl ResearchUi {
         }
         let opened = self.matrix.opened;
         match (self.page, key) {
+            (_, "1") => self.page = Page::Matrix,
+            (_, "2") => self.page = Page::Runs,
+            (_, "3") => self.page = Page::Checks,
             (_, ",") => self.cycle_scope(-1),
             (_, ".") => self.cycle_scope(1),
             (Page::Matrix, "up") if opened => self.matrix.pick = self.matrix.pick.saturating_sub(1),
@@ -426,11 +431,13 @@ impl ResearchView {
                 cx.background_executor().timer(POLL).await;
             }
         });
-        // Dev/testing knob, beside the shell's: `ZERON_OPEN_ROUTE=research/runs`
-        // opens on the Runs page, which synthetic input can't otherwise reach.
+        // Dev/testing knob, beside the shell's: `ZERON_OPEN_ROUTE=research/runs` or
+        // `research/checks` opens on that page, which synthetic input can't otherwise reach.
         let mut ui = ResearchUi::default();
-        if std::env::var("ZERON_OPEN_ROUTE").is_ok_and(|route| route == "research/runs") {
-            ui.page = Page::Runs;
+        match std::env::var("ZERON_OPEN_ROUTE").as_deref() {
+            Ok("research/runs") => ui.page = Page::Runs,
+            Ok("research/checks") => ui.page = Page::Checks,
+            _ => {}
         }
         Self {
             state,

@@ -2534,7 +2534,7 @@ impl Shell {
         let open_route = std::env::var("ZERON_OPEN_ROUTE").ok();
         let route = match open_route.as_deref() {
             Some("pull-requests") => Route::PullRequests,
-            Some("research" | "research/runs") => Route::Research,
+            Some("research" | "research/runs" | "research/checks") => Route::Research,
             Some(route) if route == "settings" || route.starts_with("settings/") => {
                 match settings_open_route(route, settings.settings_section) {
                     Some(section) => {
