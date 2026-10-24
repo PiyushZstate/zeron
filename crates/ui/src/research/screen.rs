@@ -333,8 +333,11 @@ fn run_state(run: &ResearchRun) -> (u32, &'static str) {
         (WORKING, "Writing")
     } else if run.summary.facts.ended == Some(true) {
         (MIST, "Finished")
+    } else if run.summary.errored > 0 {
+        // Nothing is writing it and it never recorded an end: it stopped early.
+        (EMBER, "Stopped")
     } else {
-        (MIST, "Idle")
+        (MIST, "Stopped")
     }
 }
 
@@ -434,6 +437,12 @@ impl ResearchView {
             }
         }
         let total: usize = groups.iter().flat_map(|(_, l)| l.iter().map(|t| t.2)).sum();
+        // A project whose one folder carries its name needs no heading repeating it:
+        // that folder joins the list under All folders.
+        let (lone, groups): (Vec<_>, Vec<_>) = groups.into_iter().partition(
+            |(project, places)| matches!(places.as_slice(), [(_, name, _)] if name == project),
+        );
+        let lone: Vec<PlaceRow> = lone.into_iter().flat_map(|(_, places)| places).collect();
         div()
             .w(px(232.))
             .flex_none()
@@ -472,7 +481,10 @@ impl ResearchView {
                             .flex_col()
                             .gap(px(1.))
                             .child(div().px(px(10.)).pb(px(4.)).child(quiet("Folders")))
-                            .child(place_row(0, "All folders".to_owned(), total, None)),
+                            .child(place_row(0, "All folders".to_owned(), total, None))
+                            .children(lone.into_iter().map(|(place, name, n)| {
+                                place_row(place.0.saturating_add(1), name, n, Some(place))
+                            })),
                     )
                     .children(groups.into_iter().map(|(project, places)| {
                         div()
