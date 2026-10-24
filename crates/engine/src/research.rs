@@ -1,371 +1,426 @@
-//! Research: a self-hosted Docent, fed by the verifiers watcher, kept by the
-//! engine so evaluation runs reach it with nothing to start by hand.
+//! Eval runs in a folder, read for the Research view (Seamlessh's
+//! docs/research-view.md). Ported from Seamlessh's host, where it read one
+//! thread's worktree; here it reads whichever folder a chat runs in.
 //!
-//! Off by default. `{data_dir}/research.json` turns it on for the device:
-//!
-//! ```json
-//! { "enabled": true, "docentDir": "/path/to/docent", "apiKey": "dk_…" }
-//! ```
-//!
-//! It holds Docent's API key, so it is written owner-only, as `session.json`
-//! is; the key reaches the watcher through its environment, never its
-//! arguments. Optional fields: `composeFiles` (compose files in `docentDir`,
-//! default `docker-compose.yml`), `watcher` (the command, default `python3 -m
-//! docent.loaders.watch_verifiers`, run in `docentDir`), `serverUrl` and
-//! `webUrl` (Docent's API and UI, default `http://localhost:8889` and `:3001`).
-//!
-//! When on, the engine:
-//!
-//! - brings Docent up once with `docker compose up -d`. Docent outlives the
-//!   engine: its database is the record, and a restart should not wait on it;
-//! - runs the watcher as its child (`kill_on_drop`), so it stops with the
-//!   engine, restarting it if it exits; its output goes to
-//!   `{data_dir}/research/watcher.log`;
-//! - writes the watcher's roots to `{data_dir}/research/roots`, which the
-//!   watcher rereads on every pass: every space folder on this device, every
-//!   linked worktree of those that are repositories, and every folder a chat
-//!   on this device runs in. A new worktree needs no restart.
+//! Read-only: nothing here writes in a run's directory. verifiers runs are found as
+//! `outputs/*/traces.jsonl` and Harbor jobs as `jobs/*/` holding `result.json` or
+//! `config.json`. `seamlessh-runs` does the parsing; this module only finds and reads files.
+//! A `traces.jsonl` is read line by line, so memory follows the episode count, not the
+//! file's size, and every call reads afresh: `vf-eval --resume` rewrites the whole file.
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+use std::path::{Component, Path};
+use std::time::{Duration, SystemTime};
 
-use serde::Deserialize;
-use tokio::process::{Child, Command};
-use tokio_util::sync::CancellationToken;
+use seamlessh_runs::{
+    Document, Framework, Rollout, RunSummary, TaskRow, harbor, summarize, task_table, verifiers,
+};
+use serde::{Deserialize, Serialize};
 
-use crate::repos::Repos;
-use crate::workspace_host::WorkspaceHost;
-
-const SETTINGS_FILE: &str = "research.json";
-/// How often the roots file is brought up to date and the watcher checked on.
-const TICK: Duration = Duration::from_secs(5);
-/// The longest wait before starting a watcher that keeps exiting.
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct Settings {
-    enabled: bool,
-    docent_dir: Option<PathBuf>,
-    compose_files: Vec<String>,
-    watcher: Vec<String>,
-    server_url: String,
-    web_url: String,
-    api_key: Option<String>,
+/// One run as the engine read it: where it is, whether it is still being written, its
+/// totals, its tasks and every rollout. Documents are not sent here; a run's file can
+/// be gigabytes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResearchRun {
+    /// The run's directory, relative to the folder it was read from.
+    pub path: String,
+    /// Its files changed in the last 30 seconds. No format marks a run's end.
+    pub live: bool,
+    pub summary: RunSummary,
+    pub tasks: Vec<TaskRow>,
+    pub rollouts: Vec<Rollout>,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            docent_dir: None,
-            compose_files: vec!["docker-compose.yml".into()],
-            watcher: ["python3", "-m", "docent.loaders.watch_verifiers"]
-                .map(String::from)
-                .to_vec(),
-            server_url: "http://localhost:8889".into(),
-            web_url: "http://localhost:3001".into(),
-            api_key: None,
-        }
+/// `ListResearchRuns`'s reply.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResearchRuns {
+    pub runs: Vec<ResearchRun>,
+}
+
+/// A run whose files changed this recently is shown as live.
+const LIVE_FOR: Duration = Duration::from_secs(30);
+
+/// The document of one rollout of `run` (a [`ResearchRun::path`]) in `worktree`.
+pub fn document(worktree: &Path, run: &str, rollout: &str) -> Result<Document, String> {
+    let path = Path::new(run);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+        || !(run.starts_with("outputs/") || run.starts_with("jobs/"))
+    {
+        return Err("run path is not a run directory".to_owned());
+    }
+    if rollout.is_empty()
+        || rollout.contains('/')
+        || rollout.contains('\\')
+        || rollout.contains("..")
+    {
+        return Err("rollout is not a rollout id".to_owned());
+    }
+    if run.starts_with("outputs/") {
+        verifiers_document(worktree, run, rollout)
+    } else {
+        harbor_document(worktree, run, rollout)
     }
 }
 
-impl Settings {
-    /// The device's settings, or `None` when Research is off or cannot run. A
-    /// missing file is off; an unreadable one is off with a warning.
-    fn load(data_dir: &Path) -> Option<(Self, PathBuf)> {
-        let path = data_dir.join(SETTINGS_FILE);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "research: settings unreadable");
-                return None;
-            }
-        };
-        let settings: Self = match serde_json::from_str(&text) {
-            Ok(settings) => settings,
-            Err(err) => {
-                tracing::warn!(path = %path.display(), error = %err, "research: settings invalid");
-                return None;
-            }
-        };
-        if !settings.enabled {
-            return None;
+/// Every run under `worktree`, newest first.
+pub fn runs(worktree: &Path, now: SystemTime) -> Vec<ResearchRun> {
+    let mut found: Vec<(SystemTime, ResearchRun)> = Vec::new();
+    for dir in children(&worktree.join("outputs")) {
+        if let Some(run) = verifiers_run(worktree, &dir, now) {
+            found.push(run);
         }
-        let Some(docent_dir) = settings.docent_dir.clone() else {
-            tracing::warn!("research: on, but no docentDir; not starting");
-            return None;
-        };
-        if settings.watcher.is_empty() {
-            tracing::warn!("research: on, but the watcher command is empty; not starting");
-            return None;
-        }
-        Some((settings, docent_dir))
     }
+    for dir in children(&worktree.join("jobs")) {
+        if let Some(run) = harbor_job(worktree, &dir, now) {
+            found.push(run);
+        }
+    }
+    found.sort_by_key(|(changed, _)| std::cmp::Reverse(*changed));
+    found.into_iter().map(|(_, run)| run).collect()
 }
 
-/// Research's processes for one engine runtime. Dropping it stops the watcher.
-pub struct Research {
-    cancel: CancellationToken,
-    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+/// Subdirectories, in name order; none when `dir` is missing or unreadable.
+fn children(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<_> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    out
 }
 
-impl Research {
-    /// Start Research if the device has it on. Requires a tokio runtime.
-    pub fn start(
-        data_dir: &Path,
-        repos: Repos,
-        workspace: WorkspaceHost,
-        device_id: String,
-    ) -> Option<Self> {
-        let (settings, docent_dir) = Settings::load(data_dir)?;
-        let roots_file = data_dir.join("research").join("roots");
-        let cancel = CancellationToken::new();
-        let keeper = Keeper {
-            settings,
-            docent_dir,
-            roots_file,
-            repos,
-            workspace,
-            device_id,
-        };
-        let task = tokio::spawn(keeper.run(cancel.clone()));
-        tracing::info!("research: started");
-        Some(Self {
-            cancel,
-            task: Mutex::new(Some(task)),
+fn modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn is_live(changed: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(changed).is_ok_and(|age| age <= LIVE_FOR) || changed > now
+}
+
+fn relative(worktree: &Path, dir: &Path) -> String {
+    dir.strip_prefix(worktree)
+        .unwrap_or(dir)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn verifiers_run(
+    worktree: &Path,
+    dir: &Path,
+    now: SystemTime,
+) -> Option<(SystemTime, ResearchRun)> {
+    let traces = dir.join(verifiers::TRACES_FILE);
+    let file = File::open(&traces).ok()?;
+    let changed = modified(&traces).unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut scan = verifiers::TraceScan::new();
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let terminated = line.last() == Some(&b'\n');
+                let body = if terminated {
+                    &line[..line.len() - 1]
+                } else {
+                    &line[..]
+                };
+                scan.push(body, terminated);
+            }
+            // A file swapped mid-read by `--resume`: show what was read; the next ask
+            // reads the new file.
+            Err(_) => break,
+        }
+    }
+    let config = fs::read_to_string(dir.join("configs/resolved/eval.json"))
+        .ok()
+        .map(|text| verifiers::parse_resolved_config(&text));
+    let parsed = scan.finish(config.as_ref());
+    let tasks = task_table(&parsed.rollouts);
+    let summary = summarize(Framework::Verifiers, parsed.facts, &parsed.rollouts);
+    Some((
+        changed,
+        ResearchRun {
+            path: relative(worktree, dir),
+            live: is_live(changed, now),
+            summary,
+            tasks,
+            rollouts: parsed.rollouts,
+        },
+    ))
+}
+
+fn verifiers_document(worktree: &Path, run: &str, rollout: &str) -> Result<Document, String> {
+    let file =
+        File::open(worktree.join(run).join(verifiers::TRACES_FILE)).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                let body = match line.as_slice() {
+                    [rest @ .., b'\n'] => rest,
+                    bytes => bytes,
+                };
+                let Ok(text) = std::str::from_utf8(body) else {
+                    continue;
+                };
+                // A traces.jsonl can be gigabytes; only parse lines that could name this episode.
+                if !text.contains(rollout) {
+                    continue;
+                }
+                if episode_id(text).as_deref() != Some(rollout) {
+                    continue;
+                }
+                return verifiers::document(text, None).map_err(|e| e.to_string());
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err(format!("no rollout {rollout} in this run"))
+}
+
+#[derive(Deserialize)]
+struct EpisodeId {
+    id: Option<String>,
+}
+
+fn episode_id(line: &str) -> Option<String> {
+    serde_json::from_str::<EpisodeId>(line)
+        .ok()?
+        .id
+        .filter(|id| !id.is_empty())
+}
+
+fn harbor_document(worktree: &Path, run: &str, rollout: &str) -> Result<Document, String> {
+    let trial = worktree.join(run).join(rollout);
+    if !trial.is_dir() {
+        return Err(format!("no rollout {rollout} in this run"));
+    }
+    let trajectory = trial.join(harbor::TRAJECTORY_FILE);
+    let mut doc = if trajectory.is_file() {
+        harbor::document(&fs::read_to_string(&trajectory).map_err(|e| e.to_string())?)?
+    } else {
+        harbor::log_document(&harbor_logs(&trial))
+    };
+    if let Ok(json) = fs::read_to_string(trial.join(harbor::RESULT_FILE))
+        && let Ok(summary) = harbor::parse_trial_result(&json)
+    {
+        doc.attach(&summary);
+    }
+    Ok(doc)
+}
+
+fn harbor_logs(trial: &Path) -> Vec<(String, String)> {
+    let mut logs: Vec<_> = fs::read_dir(trial.join("agent"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            Some((name, e.path()))
         })
-    }
-
-    /// Stop the watcher and wait for it to go. Docent is left running.
-    pub async fn shutdown(&self) {
-        self.cancel.cancel();
-        let task = self
-            .task
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(task) = task {
-            let _ = task.await;
-        }
-    }
+        .collect();
+    logs.sort_by(|a, b| a.0.cmp(&b.0));
+    logs.into_iter()
+        .filter(|(name, _)| name != "trajectory.json")
+        .filter_map(|(name, path)| Some((name, fs::read_to_string(path).ok()?)))
+        .collect()
 }
 
-impl Drop for Research {
-    fn drop(&mut self) {
-        // The task owns the child; aborting drops it, and `kill_on_drop` ends it.
-        if let Some(task) = self
-            .task
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            task.abort();
-        }
+fn harbor_job(worktree: &Path, dir: &Path, now: SystemTime) -> Option<(SystemTime, ResearchRun)> {
+    let result_path = dir.join(harbor::RESULT_FILE);
+    let job_result = fs::read_to_string(&result_path).ok();
+    if job_result.is_none() && !dir.join(harbor::CONFIG_FILE).is_file() {
+        return None;
     }
-}
-
-struct Keeper {
-    settings: Settings,
-    docent_dir: PathBuf,
-    roots_file: PathBuf,
-    repos: Repos,
-    workspace: WorkspaceHost,
-    device_id: String,
-}
-
-impl Keeper {
-    async fn run(self, cancel: CancellationToken) {
-        tokio::select! {
-            () = cancel.cancelled() => return,
-            () = self.compose_up() => {}
-        }
-        let mut watcher: Option<Child> = None;
-        let mut backoff = TICK;
-        let mut next_start = tokio::time::Instant::now();
-        let mut written: Option<Vec<PathBuf>> = None;
-        loop {
-            let roots = self.roots().await;
-            if written.as_ref() != Some(&roots) {
-                match write_roots(&self.roots_file, &roots) {
-                    Ok(()) => written = Some(roots),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "research: couldn't write the roots file")
-                    }
-                }
-            }
-            if let Some(child) = watcher.as_mut()
-                && let Ok(Some(status)) = child.try_wait()
-            {
-                tracing::warn!(%status, "research: the watcher exited");
-                watcher = None;
-                next_start = tokio::time::Instant::now() + backoff;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
-            }
-            if watcher.is_none() && tokio::time::Instant::now() >= next_start {
-                match self.spawn_watcher() {
-                    Ok(child) => watcher = Some(child),
-                    Err(err) => {
-                        tracing::warn!(error = %err, "research: couldn't start the watcher");
-                        next_start = tokio::time::Instant::now() + backoff;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                    }
-                }
-            }
-            tokio::select! {
-                () = cancel.cancelled() => break,
-                () = tokio::time::sleep(TICK) => {}
-            }
-        }
-        if let Some(mut child) = watcher {
-            let _ = child.kill().await;
-        }
+    let name = dir.file_name()?.to_string_lossy().into_owned();
+    let mut scan = harbor::JobScan::new(&name);
+    if let Some(json) = &job_result {
+        scan.job_result(json);
     }
-
-    /// `docker compose up -d`, once. A failure is logged and the watcher still
-    /// starts: Docent may be up already, or come up later, and the watcher
-    /// keeps every line until Docent takes it.
-    async fn compose_up(&self) {
-        let mut command = Command::new("docker");
-        command.arg("compose");
-        for file in &self.settings.compose_files {
-            command.arg("-f").arg(file);
-        }
-        command
-            .args(["up", "-d"])
-            .current_dir(&self.docent_dir)
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        match command.output().await {
-            Ok(out) if out.status.success() => tracing::info!("research: Docent is up"),
-            Ok(out) => tracing::warn!(
-                status = %out.status,
-                stderr = %String::from_utf8_lossy(&out.stderr).trim(),
-                "research: docker compose up failed"
-            ),
-            Err(err) => tracing::warn!(error = %err, "research: couldn't run docker compose"),
-        }
+    if let Ok(lock) = fs::read_to_string(dir.join(harbor::LOCK_FILE)) {
+        scan.lock(&lock);
     }
-
-    fn spawn_watcher(&self) -> std::io::Result<Child> {
-        let (program, args) = self
-            .settings
-            .watcher
-            .split_first()
-            .ok_or_else(|| std::io::Error::other("empty watcher command"))?;
-        // Its own log beside the roots file: the engine's stderr may go nowhere.
-        let log_path = self.roots_file.with_file_name("watcher.log");
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .arg("--roots-file")
-            .arg(&self.roots_file)
-            .args(["--server-url", &self.settings.server_url])
-            .args(["--web-url", &self.settings.web_url])
-            .current_dir(&self.docent_dir)
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        if let Some(key) = &self.settings.api_key {
-            command.env("DOCENT_API_KEY", key);
+    let mut changed = modified(&result_path).unwrap_or(SystemTime::UNIX_EPOCH);
+    for trial in children(dir) {
+        let result = trial.join(harbor::RESULT_FILE);
+        let config = trial.join(harbor::CONFIG_FILE);
+        if !result.is_file() && !config.is_file() {
+            continue;
         }
-        let child = command.spawn()?;
-        tracing::info!(pid = child.id(), "research: watcher started");
-        Ok(child)
-    }
-
-    /// Every folder a run on this device could be written under, sorted.
-    async fn roots(&self) -> Vec<PathBuf> {
-        let mut roots = BTreeSet::new();
-        let spaces = self.workspace.read_spaces().unwrap_or_default();
-        for space in spaces.into_iter().filter(|s| s.device_id == self.device_id) {
-            let path = PathBuf::from(&space.path);
-            if space.git_detected
-                && let Ok(worktrees) = self.repos.worktree_paths(&path).await
-            {
-                roots.extend(worktrees);
-            }
-            roots.insert(path);
-        }
-        let chats = self.workspace.read_chats().unwrap_or_default();
-        roots.extend(
-            chats
-                .into_iter()
-                .filter(|chat| chat.device_id == self.device_id)
-                .filter_map(|chat| chat.cwd.map(PathBuf::from)),
+        let trial_name = trial.file_name().map(|n| n.to_string_lossy().into_owned());
+        let Some(trial_name) = trial_name else {
+            continue;
+        };
+        changed = changed.max(modified(&trial).unwrap_or(SystemTime::UNIX_EPOCH));
+        scan.trial(
+            &trial_name,
+            fs::read_to_string(&result).ok().as_deref(),
+            fs::read_to_string(&config).ok().as_deref(),
         );
-        roots.into_iter().collect()
     }
-}
-
-/// Replace the roots file whole, so the watcher never reads half of it.
-fn write_roots(path: &Path, roots: &[PathBuf]) -> std::io::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("roots file has no folder"))?;
-    std::fs::create_dir_all(dir)?;
-    let mut text = String::from("# Written by the Zeron engine; reread by the watcher.\n");
-    for root in roots {
-        let line = root.to_string_lossy();
-        // A path the file format can't carry (a newline in it) is left out.
-        if !line.contains('\n') {
-            text.push_str(&line);
-            text.push('\n');
-        }
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
+    let parsed = scan.finish();
+    let tasks = task_table(&parsed.rollouts);
+    let summary = summarize(Framework::Harbor, parsed.facts, &parsed.rollouts);
+    let live = summary.facts.ended != Some(true) && is_live(changed, now);
+    Some((
+        changed,
+        ResearchRun {
+            path: relative(worktree, dir),
+            live,
+            summary,
+            tasks,
+            rollouts: parsed.rollouts,
+        },
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn write(path: &Path, text: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, text).unwrap();
+    }
+
+    const EPISODE_OK: &str = r#"{"id":"e1","task":{"key":"t1","data":{"prompt":"Add 2 and 2"}},"ok":true,"is_timeout":false,"errors":[],"traces":[{"version":1,"agent":{"name":"agent","config":{"model":"m"}},"rewards":{"correct":{"score":1.0,"weight":0.5},"format":{"score":0.5,"weight":1.0}},"ok":true}]}"#;
+    const EPISODE_FAILED: &str = r#"{"id":"e2","task":{"key":"t1"},"ok":false,"errors":[{"type":"Boom","message":"sandbox died"}],"traces":[{"version":1,"rewards":{"correct":{"score":1.0,"weight":1.0}},"ok":false}]}"#;
+
     #[test]
-    fn research_is_off_without_a_settings_file_or_when_disabled() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(Settings::load(tmp.path()).is_none());
-        std::fs::write(tmp.path().join(SETTINGS_FILE), r#"{"docentDir": "/d"}"#).unwrap();
-        assert!(Settings::load(tmp.path()).is_none());
-        std::fs::write(tmp.path().join(SETTINGS_FILE), r#"{"enabled": true}"#).unwrap();
-        assert!(Settings::load(tmp.path()).is_none(), "on but no docentDir");
+    fn finds_both_formats_and_reads_a_torn_tail_as_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // An errored rollout with reward 1.0 stays out of the mean; the torn last line is
+        // a write in progress, not a third rollout.
+        write(
+            &root.join("outputs/run-a/traces.jsonl"),
+            &format!("{EPISODE_OK}\n{EPISODE_FAILED}\n{{\"id\":\"e3\",\"ta"),
+        );
+        write(&root.join("outputs/not-a-run/notes.txt"), "x");
+        write(
+            &root.join("jobs/2026-10-22__10-00-00/result.json"),
+            r#"{"id":"0","started_at":"2026-10-22T10:00:00","finished_at":"2026-10-22T10:01:00","n_total_trials":2,"stats":{"n_errored_trials":1}}"#,
+        );
+        write(
+            &root.join("jobs/2026-10-22__10-00-00/write-file__abc1234/result.json"),
+            r#"{"task_name":"write-file","trial_name":"write-file__abc1234","agent_info":{"name":"oracle","version":"1"},"agent_result":{"n_input_tokens":100,"n_cache_tokens":40,"n_output_tokens":5},"verifier_result":{"rewards":{"reward":1,"style":0.5}},"started_at":"2026-10-22T10:00:01","finished_at":"2026-10-22T10:00:11"}"#,
+        );
+        write(
+            &root.join("jobs/2026-10-22__10-00-00/write-file__def5678/config.json"),
+            r#"{"task":{"path":"tasks/write-file"}}"#,
+        );
+
+        let runs = runs(root, SystemTime::now());
+        assert_eq!(runs.len(), 2);
+        let v = runs.iter().find(|r| r.path == "outputs/run-a").unwrap();
+        assert_eq!(v.summary.rollouts, 2);
+        assert_eq!(v.summary.errored, 1);
+        assert!(v.summary.facts.torn_tail);
+        // 1.0 × 0.5 + 0.5 × 1.0, from the first rollout alone.
+        assert_eq!(v.summary.mean_reward, Some(1.0));
+        assert!(v.live);
+        assert_eq!(v.rollouts.len(), 2);
+        assert_eq!(v.rollouts[0].id, "e1");
+
+        let h = runs.iter().find(|r| r.path.starts_with("jobs/")).unwrap();
+        assert_eq!((h.summary.rollouts, h.summary.unfinished), (2, 1));
+        assert_eq!(h.summary.mean_reward, Some(1.0));
+        assert_eq!(h.rollouts.len(), 2);
+        // Harbor's input count already includes the cache.
+        assert_eq!(h.summary.tokens.input, Some(100));
+        assert_eq!(h.tasks.len(), 1);
+        // The job says it finished, so it is not live however fresh its files are.
+        assert!(!h.live);
     }
 
     #[test]
-    fn settings_fill_in_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(
-            tmp.path().join(SETTINGS_FILE),
-            r#"{"enabled": true, "docentDir": "/d", "composeFiles": ["a.yml", "b.yml"]}"#,
-        )
-        .unwrap();
-        let (settings, dir) = Settings::load(tmp.path()).unwrap();
-        assert_eq!(dir, PathBuf::from("/d"));
-        assert_eq!(settings.compose_files, ["a.yml", "b.yml"]);
-        assert_eq!(settings.watcher[0], "python3");
-        assert_eq!(settings.server_url, "http://localhost:8889");
-        assert_eq!(settings.api_key, None);
+    fn a_worktree_without_runs_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(runs(dir.path(), SystemTime::now()).is_empty());
     }
 
     #[test]
-    fn the_roots_file_lists_one_root_per_line_and_is_replaced_whole() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("research").join("roots");
-        write_roots(&path, &[PathBuf::from("/a"), PathBuf::from("/b\nc")]).unwrap();
-        write_roots(&path, &[PathBuf::from("/a"), PathBuf::from("/d")]).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        let roots: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
-        assert_eq!(roots, ["/a", "/d"]);
-        assert!(!path.with_extension("tmp").exists());
+    fn loads_a_verifiers_episode_as_a_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("outputs/run-a/traces.jsonl"),
+            &format!("{EPISODE_OK}\n{EPISODE_FAILED}\n"),
+        );
+        let doc = document(root, "outputs/run-a", "e1").unwrap();
+        assert_eq!(
+            doc.rewards
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["correct", "format"]
+        );
+    }
+
+    #[test]
+    fn a_missing_verifiers_rollout_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("outputs/run-a/traces.jsonl"),
+            &format!("{EPISODE_OK}\n"),
+        );
+        assert_eq!(
+            document(root, "outputs/run-a", "e3").unwrap_err(),
+            "no rollout e3 in this run"
+        );
+    }
+
+    #[test]
+    fn loads_a_harbor_trial_with_a_trajectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let trial = root.join("jobs/2026-10-22__10-00-00/write-file__abc1234");
+        write(
+            &trial.join("agent/trajectory.json"),
+            r#"{"schema_version":"ATIF-v1.8","steps":[{"step_id":1,"source":"user","message":"Fix the test"}]}"#,
+        );
+        write(
+            &trial.join("result.json"),
+            r#"{"task_name":"write-file","trial_name":"write-file__abc1234","verifier_result":{"rewards":{"reward":1,"style":0.5}}}"#,
+        );
+        let doc = document(root, "jobs/2026-10-22__10-00-00", "write-file__abc1234").unwrap();
+        assert_eq!(doc.turns[0].text, "Fix the test");
+        assert_eq!(
+            doc.rewards
+                .iter()
+                .map(|r| (r.name.as_str(), r.score))
+                .collect::<Vec<_>>(),
+            [("reward", 1.0), ("style", 0.5)]
+        );
+    }
+
+    #[test]
+    fn refuses_a_run_or_rollout_that_leaves_the_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for run in ["../x", "/etc", "outputs/../../x"] {
+            assert!(document(root, run, "e1").is_err(), "{run}");
+        }
+        assert!(document(root, "outputs/run-a", "e1/x").is_err());
+        assert!(
+            document(root, "jobs/j", "").is_err(),
+            "an empty id is the job itself"
+        );
     }
 }

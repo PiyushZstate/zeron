@@ -1296,10 +1296,7 @@ impl Repos {
 
     /// Every checkout of the repository at `repo_path`, main one first.
     /// NUL-terminated so a `\n` in a worktree's path can't forge another entry.
-    pub(crate) async fn worktree_paths(
-        &self,
-        repo_path: &Path,
-    ) -> Result<Vec<PathBuf>, EngineError> {
+    async fn worktree_paths(&self, repo_path: &Path) -> Result<Vec<PathBuf>, EngineError> {
         let out = match self
             .git(&["worktree", "list", "--porcelain", "-z"], Some(repo_path))
             .await

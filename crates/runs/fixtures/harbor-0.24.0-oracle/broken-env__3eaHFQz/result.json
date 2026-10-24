@@ -1,0 +1,100 @@
+{
+  "id": "ecff2f5d-2b16-4095-8736-b359beef4265",
+  "task_name": "sl/broken-env",
+  "trial_name": "broken-env__3eaHFQz",
+  "trial_uri": "file:///work/hjobs/oracle-small/broken-env__3eaHFQz",
+  "task_id": {
+    "path": "htasks/broken-env"
+  },
+  "source": "htasks",
+  "task_checksum": "f112efff35f290211582b7de10b86a17fc01314fecee74e3c5839cbbe14dfb14",
+  "config": {
+    "task": {
+      "path": "htasks/broken-env",
+      "git_url": null,
+      "git_commit_id": null,
+      "name": null,
+      "ref": null,
+      "overwrite": false,
+      "download_dir": null,
+      "source": "htasks"
+    },
+    "trial_name": "broken-env__3eaHFQz",
+    "trials_dir": "hjobs/oracle-small",
+    "install_only": false,
+    "timeout_multiplier": 1.0,
+    "agent_timeout_multiplier": null,
+    "verifier_timeout_multiplier": null,
+    "agent_setup_timeout_multiplier": null,
+    "environment_build_timeout_multiplier": null,
+    "agent": {
+      "name": "oracle",
+      "import_path": null,
+      "model_name": null,
+      "n_concurrent": null,
+      "concurrency_group": null,
+      "skills": [],
+      "override_timeout_sec": null,
+      "override_setup_timeout_sec": null,
+      "max_timeout_sec": null,
+      "resume_trajectory": false,
+      "load_trajectory": null,
+      "extra_allowed_hosts": [],
+      "kwargs": {},
+      "mcp_servers": []
+    },
+    "user_agent": null,
+    "environment": {
+      "type": "docker",
+      "import_path": null,
+      "force_build": false,
+      "delete": true,
+      "stream": false,
+      "cpu_enforcement_policy": "auto",
+      "memory_enforcement_policy": "auto",
+      "override_cpus": null,
+      "override_memory_mb": null,
+      "override_storage_mb": null,
+      "override_gpus": null,
+      "override_tpu": null,
+      "mounts": null,
+      "extra_docker_compose": [],
+      "kwargs": {},
+      "extra_allowed_hosts": []
+    },
+    "verifier": {
+      "override_timeout_sec": null,
+      "max_timeout_sec": null,
+      "disable": false
+    },
+    "artifacts": [],
+    "extra_instruction_paths": [],
+    "extra_instructions": [],
+    "job_id": "ce47c1b9-8a31-4a62-81fb-73b52530ac16",
+    "source_trial": null
+  },
+  "agent_info": {
+    "name": "oracle",
+    "version": "1.0.0",
+    "model_info": null
+  },
+  "agent_result": null,
+  "verifier_result": null,
+  "verifier_environment_mode": "shared",
+  "exception_info": {
+    "exception_type": "RuntimeError",
+    "exception_message": "Docker compose command failed for environment broken-env. Command: docker compose --project-name broken-env__3eahfqz__env --project-directory /work/htasks/broken-env/environment -f /private/var/folders/qj/wgm_4v4n43x55qw__wq7x1vw0000gn/T/tmpydyarqtg/broken-env__3eaHFQz__env-docker-compose-resources.json -f /work/venv/lib/python3.12/site-packages/harbor/environments/docker/docker-compose-build.yaml -f /private/var/folders/qj/wgm_4v4n43x55qw__wq7x1vw0000gn/T/tmpj_cvtft2/docker-compose-environment.json -f /private/var/folders/qj/wgm_4v4n43x55qw__wq7x1vw0000gn/T/tmp0kvj2s29/docker-compose-mounts.json build. Return code: 1. Stdout:  Image broken-env__3eahfqz__env-main Building \n#1 [internal] load local bake definitions\n#1 reading from stdin 576B done\n#1 DONE 0.0s\n\n#2 [internal] load build definition from Dockerfile\n#2 transferring dockerfile: 79B done\n#2 DONE 0.0s\n\n#3 [internal] load metadata for docker.io/library/ubuntu:24.04\n#3 DONE 0.0s\n\n#4 [internal] load .dockerignore\n#4 transferring context: 2B done\n#4 DONE 0.1s\n\n#5 [1/2] FROM docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55\n#5 resolve docker.io/library/ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55 0.0s done\n#5 CACHED\n\n#6 [2/3] RUN exit 3\n#6 ERROR: process \"/bin/sh -c exit 3\" did not complete successfully: exit code: 3\n------\n > [2/3] RUN exit 3:\n------\nDockerfile:2\n\n--------------------\n\n   1 |     FROM ubuntu:24.04\n\n   2 | >>> RUN exit 3\n\n   3 |     WORKDIR /app\n\n   4 |     \n\n--------------------\n\nfailed to solve: process \"/bin/sh -c exit 3\" did not complete successfully: exit code: 3\n\n. Stderr: None. ",
+    "exception_traceback": "(trimmed)",
+    "occurred_at": "2026-10-22T16:48:49.426473Z"
+  },
+  "started_at": "2026-10-22T16:48:48.126933Z",
+  "finished_at": "2026-10-22T16:48:51.045503Z",
+  "environment_setup": {
+    "started_at": "2026-10-22T16:48:48.158544Z",
+    "finished_at": "2026-10-22T16:48:49.420162Z"
+  },
+  "agent_setup": null,
+  "agent_execution": null,
+  "verifier": null,
+  "step_results": null
+}

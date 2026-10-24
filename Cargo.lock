@@ -9308,6 +9308,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
 
 [[package]]
+name = "seamlessh-runs"
+version = "0.2.121"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13656,6 +13664,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "same-file",
+ "seamlessh-runs",
  "semver",
  "serde",
  "serde_json",
@@ -13974,6 +13983,7 @@ dependencies = [
  "reqwest",
  "roxmltree 0.21.1",
  "rust-embed",
+ "seamlessh-runs",
  "serde",
  "serde_json",
  "sha2",

@@ -1,0 +1,9 @@
+{
+  "task": {
+    "path": "htasks/broken-env",
+    "source": "htasks"
+  },
+  "trial_name": "broken-env__3eaHFQz",
+  "trials_dir": "hjobs/oracle-small",
+  "job_id": "ce47c1b9-8a31-4a62-81fb-73b52530ac16"
+}

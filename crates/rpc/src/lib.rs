@@ -55,6 +55,11 @@ pub mod methods {
     /// (`{enabled, cloud}`; set with `{enabled}`).
     pub const GET_COMMIT_CREDIT: &str = "GetCommitCredit";
     pub const SET_COMMIT_CREDIT: &str = "SetCommitCredit";
+    /// The eval runs in a folder on the target device, for the Research view
+    /// (`{cwd}` → `{runs}`).
+    pub const LIST_RESEARCH_RUNS: &str = "ListResearchRuns";
+    /// One rollout of a run as a readable document (`{cwd, run, rollout}`).
+    pub const GET_RESEARCH_DOCUMENT: &str = "GetResearchDocument";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_SKILLS: &str = "ListSkills";

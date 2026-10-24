@@ -1,0 +1,57 @@
+{
+  "id": "ce47c1b9-8a31-4a62-81fb-73b52530ac16",
+  "started_at": "2026-10-22T22:18:48.045776",
+  "updated_at": "2026-10-22T22:19:17.500251",
+  "finished_at": "2026-10-22T22:19:17.500251",
+  "n_total_trials": 6,
+  "stats": {
+    "n_completed_trials": 6,
+    "n_errored_trials": 2,
+    "n_running_trials": 0,
+    "n_pending_trials": 0,
+    "n_cancelled_trials": 0,
+    "n_retries": 0,
+    "evals": {
+      "oracle__htasks": {
+        "n_trials": 4,
+        "n_errors": 2,
+        "metrics": [
+          {
+            "reward": 0.3333333333333333,
+            "style": 0.16666666666666666
+          }
+        ],
+        "pass_at_k": {},
+        "reward_stats": {
+          "reward": {
+            "1": [
+              "write-file__Gm5rL9f",
+              "write-file__6fBnNtH"
+            ],
+            "0.0": [
+              "wrong-answer__DWmyxBy",
+              "wrong-answer__uFiDH5F"
+            ]
+          },
+          "style": {
+            "0.5": [
+              "write-file__Gm5rL9f",
+              "write-file__6fBnNtH"
+            ]
+          }
+        },
+        "exception_stats": {
+          "RuntimeError": [
+            "broken-env__3eaHFQz",
+            "broken-env__57KRXab"
+          ]
+        }
+      }
+    },
+    "n_input_tokens": null,
+    "n_cache_tokens": null,
+    "n_output_tokens": null,
+    "cost_usd": null
+  },
+  "trial_results": []
+}

@@ -395,9 +395,12 @@ impl Shell {
         // header over the empty canvas was noise); the bar keeps its height,
         // drag region, and buttons. Where a session runs, and its side-chat
         // and project actions, live in the session card.
+        // Research draws its own header under the bar, so the session's title
+        // would sit over Research's sidebar.
+        let on_research = matches!(self.route, Route::Research);
         let (title, harness, on_canvas): (SharedString, Option<zeron_proto::HarnessId>, bool) = {
             let state = self.state.read(cx);
-            match state.selected_chat_row() {
+            match state.selected_chat_row().filter(|_| !on_research) {
                 Some(chat) => (
                     SharedString::from(transcript::single_line(
                         &chat.title.clone().unwrap_or_else(|| "New session".into()),

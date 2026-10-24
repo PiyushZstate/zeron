@@ -2034,6 +2034,8 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_TITLE_SETTINGS
             | methods::GET_COMMIT_CREDIT
             | methods::SET_COMMIT_CREDIT
+            | methods::LIST_RESEARCH_RUNS
+            | methods::GET_RESEARCH_DOCUMENT
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_SKILLS
@@ -2521,6 +2523,39 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({}))
             }
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
+            methods::LIST_RESEARCH_RUNS => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    cwd: String,
+                }
+                let p: Params = parse_params(params)?;
+                // A large traces.jsonl takes a while; keep it off the runtime.
+                let runs = tokio::task::spawn_blocking(move || {
+                    crate::research::runs(
+                        std::path::Path::new(&p.cwd),
+                        std::time::SystemTime::now(),
+                    )
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&crate::research::ResearchRuns { runs })
+            }
+            methods::GET_RESEARCH_DOCUMENT => {
+                #[derive(serde::Deserialize)]
+                struct Params {
+                    cwd: String,
+                    run: String,
+                    rollout: String,
+                }
+                let p: Params = parse_params(params)?;
+                let document = tokio::task::spawn_blocking(move || {
+                    crate::research::document(std::path::Path::new(&p.cwd), &p.run, &p.rollout)
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .map_err(RpcError::Failed)?;
+                RpcReply::value(&document)
+            }
             methods::GET_COMMIT_CREDIT => match self.registry.commit_credit() {
                 Some(credit) => RpcReply::value(&credit.status()),
                 None => Err(RpcError::Failed(

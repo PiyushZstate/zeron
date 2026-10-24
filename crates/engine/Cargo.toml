@@ -10,6 +10,7 @@ publish.workspace = true
 alacritty_terminal.workspace = true
 zeron-preview.workspace = true
 zeron-proto.workspace = true
+seamlessh-runs.workspace = true
 zeron-doc.workspace = true
 zeron-sync.workspace = true
 zeron-harness.workspace = true

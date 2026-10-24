@@ -717,6 +717,8 @@ fn settings_open_route(route: &str, remembered: SettingsSection) -> Option<Setti
 pub enum Route {
     Chat,
     PullRequests,
+    /// The Research screen: eval runs in every folder (`crate::research`).
+    Research,
     Settings(SettingsSection),
 }
 
@@ -873,6 +875,7 @@ pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
     PullRequests,
+    Research,
     /// One pull request's detail view over the board, and the device whose
     /// `gh` reads it (`None` = this device).
     PullRequest {
@@ -2114,6 +2117,8 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     pull_requests_page: Option<Entity<PullRequestsPage>>,
+    /// Made on first visit and kept, so its choices survive leaving it.
+    research_page: Option<Entity<crate::research::ResearchView>>,
     /// Opened pull requests, as tabs in a pane beside the board.
     pull_request_pane: pull_request_pane::PullRequestPane,
     /// A detail view a history step landed on, opened by the next render
@@ -2529,6 +2534,7 @@ impl Shell {
         let open_route = std::env::var("ZERON_OPEN_ROUTE").ok();
         let route = match open_route.as_deref() {
             Some("pull-requests") => Route::PullRequests,
+            Some("research" | "research/runs") => Route::Research,
             Some(route) if route == "settings" || route.starts_with("settings/") => {
                 match settings_open_route(route, settings.settings_section) {
                     Some(section) => {
@@ -2579,6 +2585,7 @@ impl Shell {
         let nav = NavHistory::new(match route {
             Route::Chat => NavEntry::Chat(String::new()),
             Route::PullRequests => NavEntry::PullRequests,
+            Route::Research => NavEntry::Research,
             Route::Settings(section) => NavEntry::Settings(section),
         });
         // Parent notifications carry presentation changes (session status,
@@ -2666,6 +2673,7 @@ impl Shell {
             settings_return_route: Route::Chat,
             nav,
             pull_requests_page: None,
+            research_page: None,
             pull_request_pane: Default::default(),
             pending_pull_request: None,
             pull_request_cache: Default::default(),
@@ -5601,6 +5609,19 @@ impl Shell {
         }
     }
 
+    /// The Research entry: the eval runs of every folder.
+    fn open_research(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.route, Route::Research) {
+            self.set_route(Route::Research, cx);
+            self.close_user_menu(cx);
+            self.close_chat_menu(cx);
+        }
+        if self.nav.current() != &NavEntry::Research {
+            self.nav.push(NavEntry::Research);
+        }
+        cx.notify();
+    }
+
     /// The Pull requests entry: from elsewhere, return to the board as it
     /// was left, its pane included; on the board already, show it alone.
     fn open_pull_requests(&mut self, cx: &mut Context<Self>) {
@@ -5685,6 +5706,7 @@ impl Shell {
                 self.enter_pull_requests_route(cx);
                 self.dismiss_pull_request_detail(cx);
             }
+            NavEntry::Research => self.set_route(Route::Research, cx),
             NavEntry::PullRequest { url, device } => {
                 self.enter_pull_requests_route(cx);
                 // The detail view needs the window; the next render opens it.
@@ -10491,6 +10513,53 @@ impl Shell {
             .into_any_element()
     }
 
+    fn render_research_button(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("open-research")
+            .role(gpui::Role::Button)
+            .aria_label("Research")
+            .tab_index(0)
+            .debug_selector(|| "open-research".into())
+            .focus_visible(|style| style.border_2().border_color(theme.accent))
+            .size(px(SIDEBAR_FOOTER_ACTION_SIZE))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.0))
+            .text_color(if matches!(self.route, Route::Research) {
+                theme.text
+            } else {
+                theme.text_muted
+            })
+            .bg(if matches!(self.route, Route::Research) {
+                theme.glass_hover()
+            } else {
+                motion::hover_blend(
+                    "open-research",
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover(),
+                )
+            })
+            .on_hover(motion::hover_listener("open-research"))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                // Leaving Settings through its own footer is a plain route
+                // change; nothing there should grab focus on the way out.
+                this.settings_focus_pending = false;
+                this.open_research(cx);
+            }))
+            .tooltip(crate::settings::widgets::text_tooltip("Research"))
+            .child(icon(icons::SPLIT_COLUMNS).size(px(15.0)).text_color(
+                if matches!(self.route, Route::Research) {
+                    theme.text
+                } else {
+                    motion::hover_blend("open-research", theme.text_muted, theme.text)
+                },
+            ))
+            .into_any_element()
+    }
+
     fn render_sidebar_footer(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (user_line, menu_identity) = {
             let state = self.state.read(cx);
@@ -10508,6 +10577,7 @@ impl Shell {
     ) -> AnyElement {
         // Pull requests sits just left of Settings, in the same action group.
         let pull_requests = self.render_pull_requests_button(theme, cx);
+        let research = self.render_research_button(theme, cx);
         let theme = &theme.for_popup();
         let open = self.user_menu.is_open();
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
@@ -10724,6 +10794,7 @@ impl Shell {
                     .items_center()
                     .gap(px(2.0))
                     .children(voice_trigger)
+                    .child(research)
                     .child(pull_requests)
                     .child(
                         div()
@@ -11393,6 +11464,25 @@ impl Shell {
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
+
+        if matches!(self.route, Route::Research) {
+            if self.research_page.is_none() {
+                self.research_page =
+                    Some(cx.new(|cx| crate::research::ResearchView::new(self.state.clone(), cx)));
+            }
+            let outlet = self
+                .research_page
+                .as_ref()
+                .cloned()
+                .map(IntoElement::into_any_element)
+                .unwrap_or_else(|| Empty.into_any_element());
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(outlet)
+                .into_any_element();
+        }
 
         if matches!(self.route, Route::PullRequests) {
             if self.pull_requests_page.is_none() {

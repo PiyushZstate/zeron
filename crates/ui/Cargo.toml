@@ -73,6 +73,7 @@ zeron-proto.workspace = true
 similar.workspace = true
 zeron-doc.workspace = true
 zeron-engine.workspace = true
+seamlessh-runs.workspace = true
 zeron-harness.workspace = true
 zeron-rpc.workspace = true
 zeron-update.workspace = true
