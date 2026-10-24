@@ -13759,6 +13759,7 @@ dependencies = [
  "zeron-orb",
  "zeron-proto",
  "zeron-syntax",
+ "zeron-term",
  "zeron-text",
  "zeron-veil",
  "zeron-visual",
@@ -13896,6 +13897,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeron-term"
+version = "0.2.121"
+dependencies = [
+ "alacritty_terminal",
+]
+
+[[package]]
 name = "zeron-text"
 version = "0.2.121"
 dependencies = [
@@ -13998,6 +14006,7 @@ dependencies = [
  "zeron-proto",
  "zeron-rpc",
  "zeron-syntax",
+ "zeron-term",
  "zeron-theme",
  "zeron-update",
  "zeron-veil",
