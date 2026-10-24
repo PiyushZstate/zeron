@@ -292,6 +292,7 @@ impl RemoteTerminals {
         target: &str,
         terminal_id: &str,
         after_seq: u64,
+        host_replies: bool,
     ) -> Result<BoxStream<'static, serde_json::Value>, RpcError> {
         let key = (target.to_owned(), terminal_id.to_owned());
         let mut first = None;
@@ -318,7 +319,8 @@ impl RemoteTerminals {
         let first = match first {
             Some(source) => source,
             None => Source::Relay(
-                relay_subscribe(relay.as_ref(), target, terminal_id, after_seq).await?,
+                relay_subscribe(relay.as_ref(), target, terminal_id, after_seq, host_replies)
+                    .await?,
             ),
         };
         let (out, events) = mpsc::unbounded_channel();
@@ -336,6 +338,7 @@ impl RemoteTerminals {
                 direct,
                 out,
                 last_seq: after_seq,
+                host_replies,
             }
             .run(first),
         );
@@ -357,11 +360,14 @@ async fn attach_direct(
     link::attach(io, after_seq, client).await
 }
 
+/// A direct link always leaves queries to the host (only engines with host
+/// replies open one); over the relay the viewer's choice travels along.
 async fn relay_subscribe(
     relay: &dyn Relay,
     target: &str,
     terminal_id: &str,
     after_seq: u64,
+    host_replies: bool,
 ) -> Result<BoxStream<'static, serde_json::Value>, RpcError> {
     relay
         .subscribe(
@@ -371,6 +377,7 @@ async fn relay_subscribe(
                 "terminalId": terminal_id,
                 "afterSeq": after_seq,
                 "targetDeviceId": target,
+                "hostReplies": host_replies,
             }),
         )
         .await
@@ -471,6 +478,8 @@ struct Pump {
     direct: Option<Arc<dyn Direct>>,
     out: mpsc::UnboundedSender<serde_json::Value>,
     last_seq: u64,
+    /// Carried to relay subscriptions (a direct link implies it).
+    host_replies: bool,
 }
 
 impl Pump {
@@ -488,8 +497,14 @@ impl Pump {
                     // pause; resuming on the relay right away keeps typing
                     // alive through a network change.
                     let (target, terminal_id) = &self.key;
-                    match relay_subscribe(self.relay.as_ref(), target, terminal_id, self.last_seq)
-                        .await
+                    match relay_subscribe(
+                        self.relay.as_ref(),
+                        target,
+                        terminal_id,
+                        self.last_seq,
+                        self.host_replies,
+                    )
+                    .await
                     {
                         Ok(stream) => {
                             self.hub.replay(&self.key, &self.relay);
@@ -750,6 +765,7 @@ mod tests {
                     "host",
                     &session.id,
                     0,
+                    true,
                 )
                 .await
                 .unwrap();

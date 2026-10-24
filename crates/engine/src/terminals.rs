@@ -32,6 +32,7 @@ use zeron_proto::{TerminalActivity, TerminalEvent, TerminalSession};
 
 pub mod link;
 mod program_status;
+mod replies;
 use program_status::{ProgramTracker, SUPPORT_REPLY};
 
 use crate::{EngineError, new_id};
@@ -57,7 +58,11 @@ struct LiveTerminal {
     reader_thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
     cleanup: Option<Arc<windows::Cleanup>>,
-    subscribers: Vec<mpsc::UnboundedSender<TerminalEvent>>,
+    /// Live streams, each flagged when its viewer answers terminal queries
+    /// itself (an app from before host replies).
+    subscribers: Vec<(mpsc::UnboundedSender<TerminalEvent>, bool)>,
+    /// Answers terminal queries from beside the PTY ([`replies`]).
+    replies: replies::HostReplies,
     replay: VecDeque<TerminalEvent>,
     replay_bytes: usize,
     seq: u64,
@@ -101,12 +106,22 @@ impl LiveTerminal {
                 };
             }
         }
-        self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+        self.subscribers
+            .retain(|(tx, _)| tx.send(event.clone()).is_ok());
         if matches!(event, TerminalEvent::Exit { .. }) {
             self.initial_script.take();
             self.exited = true;
             self.subscribers.clear();
         }
+    }
+
+    /// The host answers queries unless a viewer that answers them itself is
+    /// attached (two answers would read as typed input).
+    fn host_answers(&self) -> bool {
+        !self
+            .subscribers
+            .iter()
+            .any(|(_, answers_itself)| *answers_itself)
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -420,6 +435,10 @@ impl Terminals {
             #[cfg(windows)]
             cleanup: None,
             subscribers: Vec::new(),
+            replies: replies::HostReplies::new(
+                clamp_size(cols, rows).cols,
+                clamp_size(cols, rows).rows,
+            ),
             replay: VecDeque::new(),
             replay_bytes: 0,
             seq: 0,
@@ -487,6 +506,7 @@ impl Terminals {
             id,
             cwd: cwd.to_string(),
             shell: shell_name,
+            host_replies: true,
         })
     }
 
@@ -504,6 +524,18 @@ impl Terminals {
         terminal_id: &str,
         after_seq: Option<u64>,
     ) -> Result<mpsc::UnboundedReceiver<TerminalEvent>, EngineError> {
+        self.subscribe_viewer(terminal_id, after_seq, false)
+    }
+
+    /// [`Self::subscribe`] for a viewer; `answers_itself` marks an app from
+    /// before host replies, which answers terminal queries from its own
+    /// emulator — while one is attached the host stays silent.
+    pub fn subscribe_viewer(
+        &self,
+        terminal_id: &str,
+        after_seq: Option<u64>,
+        answers_itself: bool,
+    ) -> Result<mpsc::UnboundedReceiver<TerminalEvent>, EngineError> {
         let session = self.session(terminal_id)?;
         let mut session = lock(&session);
         session.last_active_at = std::time::Instant::now();
@@ -518,7 +550,7 @@ impl Terminals {
             }
         }
         if !session.exited {
-            session.subscribers.push(tx);
+            session.subscribers.push((tx, answers_itself));
         }
         // On an exited session `tx` drops here: the stream ends after the replay.
         Ok(rx)
@@ -591,11 +623,13 @@ impl Terminals {
         if session.exited {
             return Ok(());
         }
+        let size = clamp_size(cols, rows);
+        session.replies.resize(size.cols, size.rows);
         let Some(master) = session.master.as_ref() else {
             return Ok(());
         };
         master
-            .resize(clamp_size(cols, rows))
+            .resize(size)
             .map_err(|e| EngineError::Other(format!("Terminal resize failed: {e}")))
     }
 
@@ -690,6 +724,16 @@ async fn pump_output(
         };
         let mut session = lock(&session);
         let update = session.programs.feed(&buffer);
+        // Answer terminal queries now, beside the PTY: a viewer's answer
+        // could arrive after the program stopped waiting.
+        let answers = session.replies.feed(&buffer);
+        if !answers.is_empty()
+            && session.host_answers()
+            && let Some(writer) = session.writer.as_mut()
+            && let Err(error) = writer.write_all(&answers).and_then(|_| writer.flush())
+        {
+            tracing::debug!(%error, "terminal query answer failed");
+        }
         // Answer from the PTY owner, not a viewport: detection must work while
         // detached and must not be replayed when another viewer attaches.
         // At most one per batch and a few per window: the write goes to the

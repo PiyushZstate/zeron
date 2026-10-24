@@ -416,6 +416,10 @@ struct SubscribeTerminalParams {
     terminal_id: String,
     #[serde(default)]
     after_seq: Option<u64>,
+    /// The viewer leaves terminal queries to the host
+    /// (`TerminalSession::host_replies`); older viewers answer them itself.
+    #[serde(default)]
+    host_replies: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1565,6 +1569,7 @@ impl EngineRpc {
                         target,
                         &p.terminal_id,
                         p.after_seq.unwrap_or(0),
+                        p.host_replies,
                     )
                     .await?;
                 Ok(RpcReply::Stream(stream))
@@ -4337,7 +4342,7 @@ impl RpcService for EngineRpc {
                 let p: SubscribeTerminalParams = parse_params(params)?;
                 let rx = self
                     .terminals
-                    .subscribe(&p.terminal_id, p.after_seq)
+                    .subscribe_viewer(&p.terminal_id, p.after_seq, !p.host_replies)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let stream = futures::stream::unfold(rx, |mut rx| async move {
                     let event = rx.recv().await?;

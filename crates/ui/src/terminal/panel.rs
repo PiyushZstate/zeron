@@ -303,6 +303,9 @@ struct TerminalTab {
     sync_task: Option<Task<()>>,
     /// Input-method composition in progress.
     marked_text: Option<String>,
+    /// The host answers terminal queries itself; this emulator's answers
+    /// would arrive second (and late, across a network) and read as input.
+    host_replies: bool,
     resize_task: Option<Task<()>>,
     /// Open + subscribe/reconnect lifecycle; dropping it cancels the stream.
     _run: Option<Task<()>>,
@@ -558,6 +561,7 @@ impl TerminalPanel {
             predict_task: None,
             sync_task: None,
             marked_text: None,
+            host_replies: false,
             resize_task: None,
             _run: None,
         });
@@ -758,6 +762,8 @@ impl TerminalPanel {
                 })
                 .unwrap_or((80, 24));
 
+            // A PTY someone else opened has whatever size they gave it.
+            let opened_elsewhere = existing_session.is_some();
             let session = match existing_session {
                 Some(session) => session,
                 None => {
@@ -795,18 +801,42 @@ impl TerminalPanel {
             let terminal_id = session.id.clone();
             let attached = this
                 .update(cx, |panel, cx| {
-                    if let Some(tab) = panel.tab_mut(&chat, key) {
-                        tab.terminal_id = Some(terminal_id.clone());
-                        tab.target_device_id = target.clone();
-                        // Keys typed while the PTY was still opening.
-                        panel.pump_input(&chat, key, cx);
-                        cx.notify();
-                        true
-                    } else {
-                        false
-                    }
+                    let tab = panel.tab_mut(&chat, key)?;
+                    tab.terminal_id = Some(terminal_id.clone());
+                    tab.target_device_id = target.clone();
+                    tab.host_replies = session.host_replies;
+                    let size = (tab.emulator.cols() as u16, tab.emulator.rows() as u16);
+                    // Keys typed while the PTY was still opening.
+                    panel.pump_input(&chat, key, cx);
+                    cx.notify();
+                    Some(size)
                 })
-                .unwrap_or(false);
+                .ok()
+                .flatten();
+            // The grid may have been measured (or resized) while the open was
+            // in flight — a remote open easily outlasts the resize debounce,
+            // which has no terminal to address yet and gives up. Tell the PTY
+            // the size actually on screen, or the shell wraps at the wrong
+            // column (zsh's `%` end-of-line marker is the first casualty).
+            if let Some((now_cols, now_rows)) = attached
+                && (opened_elsewhere || (now_cols, now_rows) != (cols, rows))
+            {
+                let _ = engine
+                    .client()
+                    .call(
+                        methods::RESIZE_TERMINAL,
+                        with_target(
+                            serde_json::json!({
+                                "terminalId": terminal_id,
+                                "cols": now_cols,
+                                "rows": now_rows,
+                            }),
+                            &target,
+                        ),
+                    )
+                    .await;
+            }
+            let attached = attached.is_some();
             if !attached {
                 // Tab was closed before the open completed — release the PTY.
                 let _ = engine
@@ -824,19 +854,25 @@ impl TerminalPanel {
 
             let mut attempt: u32 = 0;
             loop {
-                let Ok(after_seq) = this.update(cx, |panel, _| {
-                    panel.tab_mut(&chat, key).map(|t| t.last_seq)
+                let Ok(resume) = this.update(cx, |panel, _| {
+                    panel
+                        .tab_mut(&chat, key)
+                        .map(|t| (t.last_seq, t.host_replies))
                 }) else {
                     return; // entity released
                 };
-                let Some(after_seq) = after_seq else { return }; // tab closed
+                let Some((after_seq, host_replies)) = resume else { return }; // tab closed
 
                 let subscribed = engine
                     .client()
                     .subscribe(
                         methods::SUBSCRIBE_TERMINAL,
                         with_target(
-                            serde_json::json!({ "terminalId": terminal_id, "afterSeq": after_seq }),
+                            serde_json::json!({
+                                "terminalId": terminal_id,
+                                "afterSeq": after_seq,
+                                "hostReplies": host_replies,
+                            }),
                             &target,
                         ),
                     )
@@ -908,9 +944,10 @@ impl TerminalPanel {
                 }
                 tab.predictor.output(&tab.emulator, Instant::now());
                 let sync_deadline = tab.emulator.sync_deadline();
-                if !responses.is_empty() {
+                if !responses.is_empty() && !tab.host_replies {
                     // Query responses (DSR etc.) share the key queue, so they
-                    // reach the PTY in order with what was typed.
+                    // reach the PTY in order with what was typed. Hosts that
+                    // answer queries themselves get none from here.
                     tab.input.push(&responses);
                     self.pump_input(chat, key, cx);
                 }
@@ -1169,7 +1206,7 @@ impl TerminalPanel {
                     .is_some_and(|due| due <= std::time::Instant::now())
                 {
                     let responses = tab.emulator.finish_sync();
-                    if !responses.is_empty() {
+                    if !responses.is_empty() && !tab.host_replies {
                         tab.input.push(&responses);
                         panel.pump_input(&chat, key, cx);
                     }
