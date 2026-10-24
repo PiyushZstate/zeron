@@ -14,6 +14,8 @@ final class TerminalTab: TerminalListener, @unchecked Sendable {
     /// The phase as last seen on main (drives the session's chips).
     private(set) var phase: TerminalPhase = .connecting
     private(set) var title: String?
+    /// Riding a direct link to its host (else the relay).
+    private(set) var direct = false
     var onPhaseChange: (() -> Void)?
 
     init(chatId: String, session: TerminalSession, ordinal: Int) {
@@ -70,9 +72,11 @@ final class TerminalTab: TerminalListener, @unchecked Sendable {
             lock.unlock()
             let phase = session.phase()
             let title = session.title()
-            if phase != self.phase || title != self.title {
+            let direct = session.isDirect()
+            if phase != self.phase || title != self.title || direct != self.direct {
                 self.phase = phase
                 self.title = title
+                self.direct = direct
                 onPhaseChange?()
             }
             observers.values.forEach { $0() }

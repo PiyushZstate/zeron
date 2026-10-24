@@ -1131,6 +1131,12 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
     func movePin(chatId: String, after: String?, before: String?) throws 
     
     /**
+     * The OS network path changed (another interface or route): direct
+     * connections re-pair now; terminals ride the relay meanwhile.
+     */
+    func networkPathChanged() 
+    
+    /**
      * App is backgrounding: persist now; pause time-driven work.
      */
     func onBackground() 
@@ -1257,6 +1263,12 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
     func uploadAttachment(deviceId: String, name: String, data: Data, progress: UploadProgress?) async throws  -> String
     
     func userId()  -> String
+    
+    /**
+     * Start pairing with the computer hosting `chat_id` (a terminal is
+     * about to open there), so it starts on the direct link.
+     */
+    func warmDirect(chatId: String) 
     
     /**
      * The whole derived workspace.
@@ -1826,6 +1838,18 @@ open func movePin(chatId: String, after: String?, before: String?)throws   {try 
 }
     
     /**
+     * The OS network path changed (another interface or route): direct
+     * connections re-pair now; terminals ride the relay meanwhile.
+     */
+open func networkPathChanged()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_coreclient_network_path_changed(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+    
+    /**
      * App is backgrounding: persist now; pause time-driven work.
      */
 open func onBackground()  {try! rustCall() {
@@ -2251,6 +2275,19 @@ open func userId() -> String  {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * Start pairing with the computer hosting `chat_id` (a terminal is
+     * about to open there), so it starts on the direct link.
+     */
+open func warmDirect(chatId: String)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_coreclient_warm_direct(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(chatId),uniffiCallStatus
+    )
+}
 }
     
     /**
@@ -4656,6 +4693,11 @@ public protocol TerminalSessionProtocol: AnyObject, Sendable {
     
     func info()  -> TerminalRef
     
+    /**
+     * Riding a direct link to the host right now.
+     */
+    func isDirect()  -> Bool
+    
     func paste(text: String) 
     
     func phase()  -> TerminalPhase
@@ -4838,6 +4880,18 @@ open func info() -> TerminalRef  {
     return try!  FfiConverterTypeTerminalRef_lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_zeron_mobile_fn_method_terminalsession_info(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Riding a direct link to the host right now.
+     */
+open func isDirect() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_terminalsession_is_direct(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
@@ -12621,6 +12675,10 @@ public struct TerminalFrame: Equatable, Hashable {
      */
     public var mouse: Bool
     public var phase: TerminalPhase
+    /**
+     * The terminal rides a direct link to its host (not the relay).
+     */
+    public var direct: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -12643,7 +12701,10 @@ public struct TerminalFrame: Equatable, Hashable {
          */title: String?, altScreen: Bool, 
         /**
          * The program takes touches as pointer events.
-         */mouse: Bool, phase: TerminalPhase) {
+         */mouse: Bool, phase: TerminalPhase, 
+        /**
+         * The terminal rides a direct link to its host (not the relay).
+         */direct: Bool) {
         self.revision = revision
         self.cols = cols
         self.rows = rows
@@ -12658,6 +12719,7 @@ public struct TerminalFrame: Equatable, Hashable {
         self.altScreen = altScreen
         self.mouse = mouse
         self.phase = phase
+        self.direct = direct
     }
 
     
@@ -12689,7 +12751,8 @@ public struct FfiConverterTypeTerminalFrame: FfiConverterRustBuffer {
                 title: FfiConverterOptionString.read(from: &buf), 
                 altScreen: FfiConverterBool.read(from: &buf), 
                 mouse: FfiConverterBool.read(from: &buf), 
-                phase: FfiConverterTypeTerminalPhase.read(from: &buf)
+                phase: FfiConverterTypeTerminalPhase.read(from: &buf), 
+                direct: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -12708,6 +12771,7 @@ public struct FfiConverterTypeTerminalFrame: FfiConverterRustBuffer {
         FfiConverterBool.write(value.altScreen, into: &buf)
         FfiConverterBool.write(value.mouse, into: &buf)
         FfiConverterTypeTerminalPhase.write(value.phase, into: &buf)
+        FfiConverterBool.write(value.direct, into: &buf)
     }
 }
 
@@ -21849,6 +21913,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zeron_mobile_checksum_method_coreclient_move_pin() != 26081) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_network_path_changed() != 38164) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_zeron_mobile_checksum_method_coreclient_on_background() != 34188) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -21949,6 +22016,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_user_id() != 27711) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_warm_direct() != 53016) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_workspace() != 42501) {
@@ -22267,6 +22337,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_terminalsession_info() != 8072) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_terminalsession_is_direct() != 18472) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_terminalsession_paste() != 28012) {
