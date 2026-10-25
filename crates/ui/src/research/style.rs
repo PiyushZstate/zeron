@@ -3,8 +3,8 @@
 //! screen reads the same numbers as its boards. Only what the Research screen
 //! draws is here; the rest of Zeron keeps its own theme.
 //!
-//! The rules they keep: greys carry the interface and the blue is only the primary
-//! button and a selected row's tint on a panel; a status is a dot and a word, never a
+//! The rules they keep: greys carry the interface, a selected row included, and the
+//! blue is only the primary button and charts; a status is a dot and a word, never a
 //! filled pill; labels are sentence case in the quiet grey; monospace is for names,
 //! numbers and code; cards are flat and never nest.
 
@@ -39,7 +39,7 @@ pub const WORKING: u32 = 0x00bc7d;
 pub const EMBER: u32 = 0xfb2c36;
 /// An improvement against a baseline.
 pub const ADDED: u32 = 0x56a482;
-/// The one primary action, and a selected row's tint. White on it measures 5.2:1.
+/// The one primary action, and charts. White on it measures 5.2:1.
 pub const ACCENT: u32 = 0x155dfc;
 const ON_PLATE: u32 = 0xffffff;
 /// How a plate answers the pointer.
@@ -62,11 +62,10 @@ pub fn white(alpha: f32) -> Hsla {
     hsla(0., 0., 1., alpha)
 }
 
-/// A selected row in a list on a panel: the accent, faint.
-pub fn accent_tint() -> Hsla {
-    let mut tint: Hsla = rgb(ACCENT).into();
-    tint.a = 0.12;
-    tint
+/// A selected row in a list on a panel: a grey a step above a hovered row's. The
+/// blue is kept for the primary action and charts (owner, 2026-10-25).
+pub fn selected_row() -> Hsla {
+    white(0.06)
 }
 
 pub fn row_hover() -> Hsla {

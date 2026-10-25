@@ -16,8 +16,8 @@ use super::ResearchView;
 use super::style::{self as theme, DIM, EMBER, INK, INK_2, MONO, SOFT, white};
 
 use super::screen::{
-    TABLE_PAD, accent_edge, aside, aside_actions, aside_head, aside_section, body, button,
-    dot_note, fact_grid, page_head, quiet, section_head,
+    TABLE_PAD, aside, aside_actions, aside_head, aside_section, body, button, dot_note, fact_grid,
+    page_head, quiet, section_head,
 };
 use super::{RunKey, count, outcome_status, reward};
 
@@ -390,7 +390,7 @@ impl ResearchView {
             .py(px(12.))
             .border_t_1()
             .border_color(white(0.06))
-            .when(chosen, |d| d.bg(theme::accent_tint()).child(accent_edge()))
+            .when(chosen, |d| d.bg(theme::selected_row()))
             .when(!chosen, |d| d.hover(|s| s.bg(theme::row_hover())))
             .when(fold, |d| d.cursor_pointer())
             .child(

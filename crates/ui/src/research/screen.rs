@@ -163,26 +163,13 @@ pub(super) fn table_row(id: impl Into<gpui::ElementId>, chosen: bool) -> Statefu
         .border_t_1()
         .border_color(white(0.06))
         .cursor_pointer()
-        .when(chosen, |r| r.bg(theme::accent_tint()).child(accent_edge()))
+        .when(chosen, |r| r.bg(theme::selected_row()))
         .when(!chosen, |r| r.hover(|s| s.bg(theme::row_hover())))
 }
 
 /// A name in a table's first column: monospace, the brightest ink.
 pub(super) fn name_cell(text: impl Into<SharedString>) -> Div {
     body(text, INK).font_family(MONO).truncate()
-}
-
-/// The locked design's selection edge: 2 px of the accent down a chosen row's left
-/// side. It is its own strip, since a GPUI border takes one colour on every side and
-/// would turn the row's rule above accent too. The row must be `relative`.
-pub(super) fn accent_edge() -> Div {
-    div()
-        .absolute()
-        .left_0()
-        .top_0()
-        .bottom_0()
-        .w(px(2.))
-        .bg(rgb(theme::ACCENT))
 }
 
 /// The detail column: split off the panel by a hairline on its left.
